@@ -148,6 +148,17 @@ pub fn preview(cron_expr: &str, calendar_ids: &[String], after: DateTime<Utc>, n
         .collect())
 }
 
+/// The first run of `expr` (a cron expression or `schedule:<id>`) at or
+/// after `from` that does not fall on a day off of the schedule's calendars.
+/// Looks ahead a few hundred runs, so a long holiday block is still passed.
+pub fn first_run_on_or_after(expr: &str, from: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let (schedule, _, named) = resolve(expr).ok()?;
+    let start = from - chrono::Duration::seconds(1);
+    schedule.after(&start).take(400).find(|t| registry().run_blocked(named.as_deref(), &[], *t).is_none())
+}
+
+pub mod upcoming;
+
 /// Persistence for the registry.
 #[derive(Clone)]
 pub struct ScheduleLibrary {

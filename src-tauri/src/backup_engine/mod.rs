@@ -20,7 +20,9 @@ pub mod drives;
 pub mod hardening;
 pub mod hooks;
 pub mod logs;
-pub mod notify;
+/// The channel dispatcher is shared with sync and automation (`crate::notify_hub`).
+pub use crate::notify_hub as notify;
+mod profile_store;
 pub mod policy;
 pub mod portability;
 pub mod runs;
@@ -32,6 +34,7 @@ pub mod secrets;
 pub mod shutdown;
 pub mod templates;
 pub mod stores;
+pub mod trigger;
 pub mod versions;
 
 use crate::connectors::ConnectionManager;
@@ -794,6 +797,47 @@ pub struct BackupRun {
     pub summary: String,
     pub report: serde_json::Value,
     pub log: Vec<LogLine>,
+    /// What started the run (manual, scheduled, api…).
+    #[serde(default)]
+    pub trigger: ufop_core::run_trigger::RunTrigger,
+}
+
+/// One replica's result in one replication (`backup_replica_runs`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicaRun {
+    pub id: String,
+    /// The `backup_runs` row of the backup or replication that did it.
+    pub run_id: String,
+    pub job_id: String,
+    pub replica_id: String,
+    pub replica_name: String,
+    /// `success` or `error`.
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub files: u64,
+    pub bytes: u64,
+    pub error: Option<String>,
+    pub trigger: ufop_core::run_trigger::RunTrigger,
+}
+
+/// What [`BackupManager::replica_history`] keeps; dates are RFC 3339 instants.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplicaHistoryFilter {
+    pub job_id: Option<String>,
+    pub replica_id: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// The per-replica entries of a run report: a replication's own
+/// `replica_runs`, or those of the replications a backup ran after itself.
+fn replica_run_entries(report: &serde_json::Value) -> Vec<serde_json::Value> {
+    let own = report.get("replica_runs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let after = report.get("replication").and_then(|v| v.as_array()).into_iter().flatten().flat_map(|r| r.get("replica_runs").and_then(|v| v.as_array()).cloned().unwrap_or_default());
+    own.into_iter().chain(after).collect()
 }
 
 /// A `backup_runs` row (columns as selected by the run history queries).
@@ -808,6 +852,7 @@ fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BackupRun> {
         summary: r.get(6)?,
         report: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
         log: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+        trigger: ufop_core::run_trigger::RunTrigger::from_str_lossy(&r.get::<_, String>(9)?),
     })
 }
 
@@ -855,6 +900,8 @@ struct Inner {
     secrets: std::sync::OnceLock<SettingsStore>,
     notifier: std::sync::OnceLock<Notifier>,
     run_listener: std::sync::OnceLock<RunListener>,
+    /// Sync pairs and automation rules that name notification profiles (set by the desktop app).
+    profile_users: std::sync::OnceLock<std::sync::Arc<dyn crate::notify_hub::run::ProfileUsers>>,
     secret_cache: secrets::SecretCache,
     /// Console-delivered (`central:`) secrets when no secure store exists:
     /// kept in memory only and re-delivered by the agent after a restart.
@@ -945,6 +992,7 @@ impl BackupManager {
                 secrets: std::sync::OnceLock::new(),
                 notifier: std::sync::OnceLock::new(),
                 run_listener: std::sync::OnceLock::new(),
+                profile_users: std::sync::OnceLock::new(),
                 volatile_secrets: Mutex::new(HashMap::new()),
                 secret_cache: secrets::SecretCache::default(),
                 volume_cache: Mutex::new(None),
@@ -1102,6 +1150,102 @@ impl BackupManager {
         self.persist(&job).await?;
         self.inner.jobs.write().await.insert(job.id.clone(), job.clone());
         Ok(job)
+    }
+
+    /// Copy a job's definition as a new job: "<name> (copy)", a new id, no
+    /// history or statistics, every schedule (backup, maintenance, replica
+    /// timers) off. Stored secrets (passphrase, notification and report
+    /// credentials, cloud destination credentials)
+    /// are copied under the new job's own ids, so editing one job's secret
+    /// never changes the other's. Point the copy at its own destination
+    /// before turning its schedule on.
+    pub async fn duplicate_job(&self, id: &str) -> Result<BackupJob, AppError> {
+        let original = self.get_job(id).await?;
+        let mut copy = original.clone();
+        copy.id = String::new();
+        copy.name = format!("{} (copy)", original.name);
+        copy.stats = JobStats::default();
+        copy.legal_hold = None;
+        // The schedules may come from policy templates: take the resolved
+        // ones as the copy's own settings, turned off, so no template turns
+        // them back on. Every other setting resolves as before.
+        let resolved = self.resolve_job(&original).await?.job;
+        let mut own = templates::explicit_paths(&original)?;
+        own.extend(["schedule".to_string(), "maintenance".to_string()]);
+        copy.overrides = Some(own.into_iter().collect());
+        copy.schedule = resolved.schedule;
+        copy.maintenance = resolved.maintenance;
+        copy.schedule.enabled = false;
+        if let Some(s) = copy.maintenance.compact.as_mut() {
+            s.enabled = false;
+        }
+        if let Some(v) = copy.maintenance.verify.as_mut() {
+            v.schedule.enabled = false;
+        }
+        if let Some(s) = copy.maintenance.retention.as_mut() {
+            s.enabled = false;
+        }
+        self.copy_destination_secret(&mut copy.destination).await?;
+        for r in copy.replicas.iter_mut() {
+            r.id.clear();
+            r.last_run = None;
+            r.last_result = None;
+            if matches!(r.schedule, ReplicaSchedule::Interval { .. }) {
+                r.schedule = ReplicaSchedule::Manual;
+            }
+            self.copy_destination_secret(&mut r.destination).await?;
+        }
+        for n in copy.notifications.iter_mut() {
+            self.copy_secret_ref(&mut n.credential_id).await?;
+            if let notify::Channel::Webhook { headers, .. } = &mut n.channel {
+                for h in headers.iter_mut().filter(|h| h.secret) {
+                    self.copy_secret_ref(&mut h.credential_id).await?;
+                }
+            }
+        }
+        for h in copy.reports.headers.iter_mut().filter(|h| h.secret) {
+            self.copy_secret_ref(&mut h.credential_id).await?;
+        }
+        let passphrase = self.store_get(&format!("{PASS_KEY_PREFIX}{id}")).await?;
+        self.save_job(copy, passphrase).await
+    }
+
+    /// A cloud destination's stored credential, copied under a new id (a
+    /// credential this machine does not store itself, such as a centrally
+    /// managed one, is left as it is).
+    async fn copy_destination_secret(&self, dest: &mut BackupDestination) -> Result<(), AppError> {
+        if let BackupDestination::Cloud { credential_id, .. } = dest {
+            self.copy_secret_ref(credential_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Point `credential_id` at a copy of its stored secret. A reference to
+    /// a secret this machine does not store (a centrally managed one) is
+    /// kept as it is rather than dropped.
+    async fn copy_secret_ref(&self, credential_id: &mut String) -> Result<(), AppError> {
+        let copied = self.copy_secret(credential_id).await?;
+        if !copied.is_empty() {
+            *credential_id = copied;
+        }
+        Ok(())
+    }
+
+    /// Store a copy of the secret kept under `credential_id` (as written,
+    /// provider references unresolved); returns the copy's id, or "" when
+    /// there is no secret.
+    async fn copy_secret(&self, credential_id: &str) -> Result<String, AppError> {
+        if credential_id.trim().is_empty() {
+            return Ok(String::new());
+        }
+        match self.store_get(&format!("{DEST_KEY_PREFIX}{credential_id}")).await? {
+            Some(secret) => {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                self.set_destination_secret(&new_id, &secret).await?;
+                Ok(new_id)
+            }
+            None => Ok(String::new()),
+        }
     }
 
     /// Passphrases go to the OS keychain when one is available, otherwise to
@@ -1516,6 +1660,12 @@ impl BackupManager {
         let _ = self.inner.notifier.set(n);
     }
 
+    /// Tell the profile store where sync pairs and automation rules keep
+    /// their notification profile (set by the desktop app).
+    pub fn set_profile_users(&self, u: std::sync::Arc<dyn crate::notify_hub::run::ProfileUsers>) {
+        let _ = self.inner.profile_users.set(u);
+    }
+
     /// Receive every finished operation (set once, by the fleet agent).
     pub fn set_run_listener(&self, l: RunListener) {
         let _ = self.inner.run_listener.set(l);
@@ -1626,8 +1776,12 @@ impl BackupManager {
                 let conns = self.inner.conns.as_ref().ok_or_else(|| AppError::state("Connections are unavailable", "Restart the app."))?;
                 let id = uuid::Uuid::parse_str(connection_id).map_err(|_| AppError::validation("Invalid connection id"))?;
                 let profile = conns.get_connection(id).await?.ok_or_else(|| AppError::not_found("The destination connection no longer exists"))?;
-                let secret = conns.get_password(id).await.unwrap_or(None);
-                let mut b = connector_backend::ConnectorBackend::connect(&profile, secret, remote_path).await?;
+                // Backups reconnect on their own: a connection whose
+                // credentials were rejected is skipped, not retried.
+                let secrets = conns.background_secrets(id, &profile.name).await?;
+                let connected = connector_backend::ConnectorBackend::connect_with_secrets(&profile, secrets, remote_path).await;
+                conns.record_connect_outcome(id, &connected).await;
+                let mut b = connected?;
                 b.set_timeout((timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs)));
                 b.set_list_parallelism(parallel);
                 Box::new(b)
@@ -1718,10 +1872,16 @@ impl BackupManager {
         let primary = self.build_backend(job).await?;
         let mut targets = Vec::new();
         let mut errors = Vec::new();
+        // One entry per replica tried, for the replica's own history.
+        let mut replica_runs = Vec::new();
         for r in picked {
+            let began = Utc::now();
             match Box::pin(self.backend_with_timeout(&r.destination, r.throttle, job.retry, None, BackendOpts { read_only: false, ..BackendOpts::of(job) })).await {
                 Ok(b) => targets.push((r, b)),
-                Err(e) => errors.push(format!("{}: {}", r.name, e.user_message())),
+                Err(e) => {
+                    errors.push(format!("{}: {}", r.name, e.user_message()));
+                    replica_runs.push(replica_run_entry(&r, "error", began, Utc::now(), 0, 0, Some(e.user_message())));
+                }
             }
         }
         let prefix = job.options.prefix.clone();
@@ -1731,9 +1891,10 @@ impl BackupManager {
             Ok(targets
                 .into_iter()
                 .map(|(r, b)| {
+                    let began = Utc::now();
                     let o = ufop_core::backup::mirror::MirrorOptions { delete_extraneous: r.delete_extraneous, verify: r.verify, ..Default::default() };
                     let res = ufop_core::backup::mirror::mirror_locked(primary.as_ref(), b.as_ref(), &prefix, &o, &lo, &ctx2);
-                    (r, res)
+                    (r, res, began, Utc::now())
                 })
                 .collect::<Vec<_>>())
         })
@@ -1741,17 +1902,19 @@ impl BackupManager {
         let now = Utc::now().to_rfc3339();
         let mut out = Vec::new();
         let mut outcome: HashMap<String, String> = HashMap::new();
-        for (r, res) in results {
+        for (r, res, began, ended) in results {
             match res {
                 Ok(rep) => {
                     let status = if rep.errors.is_empty() { "success" } else { "error" };
                     errors.extend(rep.errors.iter().map(|e| format!("{}: {e}", r.name)));
                     outcome.insert(r.id.clone(), status.into());
+                    replica_runs.push(replica_run_entry(&r, status, began, ended, rep.copied as u64, rep.bytes_copied, rep.errors.first().cloned()));
                     out.push(serde_json::json!({ "id": r.id, "name": r.name, "report": rep }));
                 }
                 Err(e) => {
                     errors.push(format!("{}: {}", r.name, e.user_message()));
                     outcome.insert(r.id.clone(), "error".into());
+                    replica_runs.push(replica_run_entry(&r, "error", began, ended, 0, 0, Some(e.user_message())));
                 }
             }
         }
@@ -1770,7 +1933,7 @@ impl BackupManager {
         if let Some(j) = snapshot {
             let _ = self.persist(&j).await;
         }
-        Ok(serde_json::json!({ "replicas": out, "errors": errors }))
+        Ok(serde_json::json!({ "replicas": out, "errors": errors, "replica_runs": replica_runs }))
     }
 
     /// Replicas whose interval has elapsed: (job id, replica id).
@@ -1801,12 +1964,13 @@ impl BackupManager {
         let span = op_span(&job, op.name(), &task_id);
         let me = self.clone();
         let tid = task_id.clone();
+        let started_by = trigger::current();
         tokio::spawn(
-            async move {
+            trigger::scoped(started_by, async move {
                 if let Err(e) = me.run_registered(job, op, tid.clone(), cancel, progress).await {
                     tracing::warn!("task {tid} failed: {e}");
                 }
-            }
+            })
             .instrument(span),
         );
         Ok(task_id)
@@ -1814,7 +1978,7 @@ impl BackupManager {
 
     // ── Shared settings: global defaults and destination library ──
 
-    async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
+    pub(crate) async fn config_get(&self, key: &'static str) -> Result<Option<String>, AppError> {
         self.inner.pool.execute(move |c| Ok(c.query_row("SELECT value FROM config WHERE key = ?1", [key], |r| r.get(0)).ok())).await
     }
 
@@ -2136,12 +2300,13 @@ impl BackupManager {
         let span = op_span(&job, "backup", &task_id);
         let me = self.clone();
         let tid = task_id.clone();
+        let started_by = trigger::current();
         tokio::spawn(
-            async move {
+            trigger::scoped(started_by, async move {
                 if let Err(e) = me.run_registered(job, BackupOperation::Backup { dry_run }, tid.clone(), cancel, progress).await {
                     tracing::warn!("backup task {tid} failed: {e}");
                 }
-            }
+            })
             .instrument(span),
         );
         Ok(task_id)
@@ -2438,8 +2603,12 @@ impl BackupManager {
             summary: summary.clone(),
             report: report.clone(),
             log: log.clone(),
+            trigger: trigger::current(),
         };
         self.insert_run(&run).await?;
+        if let Err(e) = self.insert_replica_runs(&run).await {
+            tracing::warn!("Could not store the replica results of run {}: {}", run.id, e.user_message());
+        }
         let previous_result = self.inner.jobs.read().await.get(&job.id).and_then(|j| j.stats.last_result.clone());
         self.refresh_stats(&job.id, Some((&run, err.clone(), (finished - started).num_milliseconds().max(0) as u64))).await;
 
@@ -2550,24 +2719,93 @@ impl BackupManager {
             .pool
             .execute(move |c| {
                 c.execute(
-                    "INSERT INTO backup_runs(id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![r.id, r.job_id, r.operation, r.status, r.started_at, r.finished_at, r.summary, report, log],
+                    "INSERT INTO backup_runs(id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json, run_trigger)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![r.id, r.job_id, r.operation, r.status, r.started_at, r.finished_at, r.summary, report, log, r.trigger.as_str()],
                 )?;
                 Ok(())
             })
             .await
     }
 
-    pub async fn run_history(&self, job_id: Option<String>, limit: u32) -> Result<Vec<BackupRun>, AppError> {
+    /// Store one `backup_replica_runs` row per replica the run replicated to
+    /// (from its report's `replica_runs`, or, after a backup, from the
+    /// `replication` reports it carries).
+    async fn insert_replica_runs(&self, run: &BackupRun) -> Result<(), AppError> {
+        let entries: Vec<serde_json::Value> = replica_run_entries(&run.report);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (run_id, job_id, trigger) = (run.id.clone(), run.job_id.clone(), run.trigger.as_str());
+        self.inner
+            .pool
+            .execute(move |c| {
+                let tx = c.unchecked_transaction()?;
+                for e in &entries {
+                    let text = |k: &str| e.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                    let num = |k: &str| e.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+                    let started = text("started_at").unwrap_or_default();
+                    tx.execute(
+                        "INSERT INTO backup_replica_runs(id, run_id, job_id, replica_id, replica_name, status, started_at, finished_at, files, bytes, error, run_trigger)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![uuid::Uuid::new_v4().to_string(), run_id, job_id, text("id").unwrap_or_default(), text("name").unwrap_or_default(), text("status").unwrap_or_else(|| "error".into()), started, text("finished_at"), num("files"), num("bytes"), text("error"), trigger],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Every replication result, newest first: one row per replica per run
+    /// (optionally for one job or replica, started in `[from, to]`).
+    pub async fn replica_history(&self, filter: ReplicaHistoryFilter) -> Result<Vec<ReplicaRun>, AppError> {
         self.inner
             .pool
             .execute(move |c| {
                 let mut st = c.prepare(
-                    "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json FROM backup_runs
-                     WHERE (?1 IS NULL OR job_id = ?1) ORDER BY started_at DESC LIMIT ?2",
+                    "SELECT id, run_id, job_id, replica_id, replica_name, status, started_at, finished_at, files, bytes, error, run_trigger FROM backup_replica_runs
+                     WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR replica_id = ?2) AND (?3 IS NULL OR started_at >= ?3) AND (?4 IS NULL OR started_at <= ?4)
+                     ORDER BY started_at DESC, rowid DESC LIMIT ?5",
                 )?;
-                let v = st.query_map(params![job_id, limit.clamp(1, 1000)], run_row)?.collect::<Result<Vec<_>, _>>()?;
+                let rows = st
+                    .query_map(params![filter.job_id, filter.replica_id, filter.from, filter.to, filter.limit.unwrap_or(100).clamp(1, 1000)], |r| {
+                        Ok(ReplicaRun {
+                            id: r.get(0)?,
+                            run_id: r.get(1)?,
+                            job_id: r.get(2)?,
+                            replica_id: r.get(3)?,
+                            replica_name: r.get(4)?,
+                            status: r.get(5)?,
+                            started_at: r.get(6)?,
+                            finished_at: r.get(7)?,
+                            files: r.get::<_, i64>(8)?.max(0) as u64,
+                            bytes: r.get::<_, i64>(9)?.max(0) as u64,
+                            error: r.get(10)?,
+                            trigger: ufop_core::run_trigger::RunTrigger::from_str_lossy(&r.get::<_, String>(11)?),
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
+    pub async fn run_history(&self, job_id: Option<String>, limit: u32) -> Result<Vec<BackupRun>, AppError> {
+        self.run_history_between(job_id, limit, None, None).await
+    }
+
+    /// [`Self::run_history`] for runs that started in `[from, to]` (RFC 3339 instants).
+    pub async fn run_history_between(&self, job_id: Option<String>, limit: u32, from: Option<String>, to: Option<String>) -> Result<Vec<BackupRun>, AppError> {
+        self.inner
+            .pool
+            .execute(move |c| {
+                let mut st = c.prepare(
+                    "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json, run_trigger FROM backup_runs
+                     WHERE (?1 IS NULL OR job_id = ?1) AND (?3 IS NULL OR started_at >= ?3) AND (?4 IS NULL OR started_at <= ?4)
+                     ORDER BY started_at DESC LIMIT ?2",
+                )?;
+                let v = st.query_map(params![job_id, limit.clamp(1, 1000), from, to], run_row)?.collect::<Result<Vec<_>, _>>()?;
                 Ok(v)
             })
             .await
@@ -2577,8 +2815,20 @@ impl BackupManager {
     /// [`paging::RUN_SORT_FIELDS`] column, newest first by default, text
     /// filter on the summary and operation) when `page` is given.
     pub async fn run_history_listing(&self, job_id: Option<String>, limit: u32, page: Option<paging::PageRequest>) -> Result<paging::Listing<BackupRun>, AppError> {
+        self.run_history_listing_between(job_id, limit, page, None, None).await
+    }
+
+    /// [`Self::run_history_listing`] for runs that started in `[from, to]`.
+    pub async fn run_history_listing_between(
+        &self,
+        job_id: Option<String>,
+        limit: u32,
+        page: Option<paging::PageRequest>,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<paging::Listing<BackupRun>, AppError> {
         let Some(page) = page else {
-            return Ok(paging::Listing::All(self.run_history(job_id, limit).await?));
+            return Ok(paging::Listing::All(self.run_history_between(job_id, limit, from, to).await?));
         };
         page.check_sort(paging::RUN_SORT_FIELDS)?;
         self.inner
@@ -2588,14 +2838,14 @@ impl BackupManager {
                 let col = paging::RUN_SORT_FIELDS.iter().find(|f| page.sort.as_deref() == Some(**f)).copied().unwrap_or("started_at");
                 let dir = if page.sort.is_none() || page.descending { "DESC" } else { "ASC" };
                 let like = page.needle().map(|n| format!("%{}%", n.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
-                let filter = "(?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR lower(summary) LIKE ?2 ESCAPE '\\' OR lower(operation) LIKE ?2 ESCAPE '\\')";
-                let total: i64 = c.query_row(&format!("SELECT COUNT(*) FROM backup_runs WHERE {filter}"), params![job_id, like], |r| r.get(0))?;
+                let filter = "(?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR lower(summary) LIKE ?2 ESCAPE '\\' OR lower(operation) LIKE ?2 ESCAPE '\\') AND (?3 IS NULL OR started_at >= ?3) AND (?4 IS NULL OR started_at <= ?4)";
+                let total: i64 = c.query_row(&format!("SELECT COUNT(*) FROM backup_runs WHERE {filter}"), params![job_id, like, from, to], |r| r.get(0))?;
                 let take = page.take();
                 let mut st = c.prepare(&format!(
-                    "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json FROM backup_runs
-                     WHERE {filter} ORDER BY {col} {dir}, started_at DESC, id LIMIT ?3 OFFSET ?4"
+                    "SELECT id, job_id, operation, status, started_at, finished_at, summary, report_json, log_json, run_trigger FROM backup_runs
+                     WHERE {filter} ORDER BY {col} {dir}, started_at DESC, id LIMIT ?5 OFFSET ?6"
                 ))?;
-                let items = st.query_map(params![job_id, like, take as i64, page.offset as i64], run_row)?.collect::<Result<Vec<_>, _>>()?;
+                let items = st.query_map(params![job_id, like, from, to, take as i64, page.offset as i64], run_row)?.collect::<Result<Vec<_>, _>>()?;
                 Ok(paging::Listing::Page(paging::Page { items, total: total.max(0) as usize, offset: page.offset, limit: take }))
             })
             .await
@@ -2808,7 +3058,7 @@ impl BackupManager {
                         P::Sftp => (22, false),
                         P::Ftp => (21, false),
                         P::Ftps => (990, false),
-                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::AdlsGen2 | P::AzureFiles | P::Swift => (443, true),
+                        P::WebDav | P::S3 | P::GoogleDrive | P::Dropbox | P::OneDrive | P::AzureBlob | P::AdlsGen2 | P::AzureFiles | P::Swift | P::B2 => (443, true),
                         P::Smb => (445, false),
                         P::Nfs => (2049, false),
                         P::Local | P::Rclone => return None,
@@ -3095,8 +3345,13 @@ impl BackupManager {
         started
     }
 
-    /// One scheduler pass: start every due job.
+    /// One scheduler pass: start every due job. The runs it starts are
+    /// recorded as scheduled.
     pub async fn tick(&self) -> usize {
+        trigger::scoped(ufop_core::run_trigger::RunTrigger::Scheduled, self.tick_due()).await
+    }
+
+    async fn tick_due(&self) -> usize {
         if self.is_shutting_down() {
             return 0;
         }
@@ -3176,6 +3431,21 @@ fn op_span(job: &BackupJob, op: &str, task_id: &str) -> tracing::Span {
         backup.result = tracing::field::Empty,
         backup.error = tracing::field::Empty,
     )
+}
+
+/// One replica's outcome in a replication report (`replica_runs`), kept in
+/// `backup_replica_runs` so a replica has a history, not only a last result.
+fn replica_run_entry(r: &Replica, status: &str, started: DateTime<Utc>, finished: DateTime<Utc>, files: u64, bytes: u64, error: Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "name": r.name,
+        "status": status,
+        "started_at": started.to_rfc3339(),
+        "finished_at": finished.to_rfc3339(),
+        "files": files,
+        "bytes": bytes,
+        "error": error,
+    })
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -3403,3 +3673,5 @@ fn dispatch(
 mod tests;
 #[cfg(test)]
 mod tests_policy;
+#[cfg(test)]
+mod tests_history;

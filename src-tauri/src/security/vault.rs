@@ -17,10 +17,15 @@
 //!     encrypted-file-3.enc
 //! ```
 //!
-//! # Cryptomator compatibility
-//! Read/write support for Cryptomator v8 vaults is provided through the
-//! `CryptomatorVault` struct. This enables interoperability with Cryptomator
-//! clients on other platforms.
+//! # Cryptomator
+//! There is no Cryptomator support: vaults are always written and read in
+//! the format above (AES-256-GCM files with `.enc` names, plain folder and
+//! file names, `.vault-meta.json` for the key parameters), which Cryptomator
+//! cannot open and which cannot open Cryptomator vaults. The
+//! `cryptomator_compat` field is only a flag stored in the metadata (kept so
+//! existing vault files still load); it changes nothing about how files are
+//! encrypted. For encrypted cloud folders other tools can read, use an
+//! rclone crypt remote (see `rclone_engine::crypt`).
 //!
 //! # Enterprise encryption policies
 //! Policies can be configured per connector/destination, enabling requirements
@@ -82,7 +87,8 @@ pub struct VaultMetadata {
     pub created_at: DateTime<Utc>,
     /// When the vault was last accessed.
     pub last_accessed: Option<DateTime<Utc>>,
-    /// Whether this vault uses Cryptomator compatibility mode.
+    /// Stored flag only (older vaults may have it set); no Cryptomator
+    /// format is implemented, see the module docs.
     pub cryptomator_compat: bool,
     /// Optional enterprise policy ID that governs this vault.
     pub policy_id: Option<String>,
@@ -107,7 +113,7 @@ pub struct VaultInfo {
     pub created_at: DateTime<Utc>,
     /// When the vault was last accessed.
     pub last_accessed: Option<DateTime<Utc>>,
-    /// Whether Cryptomator compatibility is enabled.
+    /// The stored `cryptomator_compat` flag (no effect; see the module docs).
     pub cryptomator_compat: bool,
     /// Encryption patterns.
     pub encrypt_patterns: Vec<String>,

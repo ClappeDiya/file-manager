@@ -173,6 +173,21 @@ fn all_migrations() -> Vec<Migration> {
             description: "ufop-server accounts, per-job access rules, token owners",
             sql: V31_SCHEMA,
         },
+        Migration {
+            version: 32,
+            description: "Starred connections and the credentials-rejected flag",
+            sql: V32_SCHEMA,
+        },
+        Migration {
+            version: 33,
+            description: "Two-way sync baselines and user-saved filter presets",
+            sql: V33_SCHEMA,
+        },
+        Migration {
+            version: 34,
+            description: "Run history detail - run triggers, per-run changed items, per-replica backup results",
+            sql: V34_SCHEMA,
+        },
     ]
 }
 
@@ -188,6 +203,74 @@ fn rust_step(version: u32) -> Option<RustStep> {
         _ => None,
     }
 }
+
+/// Schema v34: run history detail. What started each sync and backup run
+/// (`run_trigger`: manual, scheduled, watcher, api, automation; existing rows
+/// read as manual), the files each sync run changed (`sync_run_items`, at
+/// most 10 000 per run; `items_truncated` says some were left out), and one
+/// row per replica per replication (`backup_replica_runs`) so a replica's
+/// history is more than its last result.
+const V34_SCHEMA: &str = r#"
+ALTER TABLE sync_runs ADD COLUMN run_trigger TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE sync_runs ADD COLUMN items_truncated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE backup_runs ADD COLUMN run_trigger TEXT NOT NULL DEFAULT 'manual';
+CREATE TABLE IF NOT EXISTS sync_run_items (
+    run_id   TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    rel_path TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    bytes    INTEGER NOT NULL DEFAULT 0,
+    error    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sync_run_items_run ON sync_run_items(run_id);
+CREATE TABLE IF NOT EXISTS backup_replica_runs (
+    id           TEXT PRIMARY KEY NOT NULL,
+    run_id       TEXT NOT NULL REFERENCES backup_runs(id) ON DELETE CASCADE,
+    job_id       TEXT NOT NULL,
+    replica_id   TEXT NOT NULL,
+    replica_name TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    files        INTEGER NOT NULL DEFAULT 0,
+    bytes        INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    run_trigger  TEXT NOT NULL DEFAULT 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_backup_replica_runs_job ON backup_replica_runs(job_id, replica_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_backup_replica_runs_run ON backup_replica_runs(run_id);
+"#;
+
+/// Schema v33: two-way sync baselines — what both sides of a pair looked
+/// like after its last successful run (`sync_baseline_runs` per pair, one
+/// `sync_baseline` row per file, mtimes in nanoseconds) — and user-saved
+/// filter presets (ordered include/exclude rules as JSON), shared by sync
+/// pairs and backup jobs; and the copy options each sync pair sets itself
+/// over the global sync defaults (`option_overrides_json`, NULL = all).
+const V33_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_baseline_runs (
+    pair_id     TEXT PRIMARY KEY NOT NULL,
+    run_id      TEXT,
+    source_root TEXT NOT NULL,
+    dest_root   TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_baseline (
+    pair_id         TEXT NOT NULL REFERENCES sync_baseline_runs(pair_id) ON DELETE CASCADE,
+    rel_path        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    source_mtime_ns INTEGER,
+    dest_mtime_ns   INTEGER,
+    hash            TEXT,
+    PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS user_filter_presets (
+    id         TEXT PRIMARY KEY NOT NULL,
+    name       TEXT NOT NULL,
+    rules_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+ALTER TABLE sync_pairs ADD COLUMN option_overrides_json TEXT;
+"#;
 
 /// Schema v21: profile fields with no column (upload modes, FTP tuning,
 /// symlink policy, connector extras) as JSON; previously never saved.
@@ -217,6 +300,16 @@ CREATE TABLE IF NOT EXISTS server_acl (
 );
 ALTER TABLE server_tokens ADD COLUMN subject TEXT NOT NULL DEFAULT 'admin';
 ALTER TABLE server_api_tokens ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin';
+"#;
+
+/// Schema v32: `starred` connections (listed first) and the
+/// credentials-rejected flag: set when a service refuses the sign-in, so
+/// background reconnects stop retrying until the user edits the connection
+/// or clicks Retry.
+const V32_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE connections ADD COLUMN credentials_rejected_at TEXT;
+ALTER TABLE connections ADD COLUMN credentials_rejected_reason TEXT;
 "#;
 
 /// Schema v30: `ufop-server` API tokens limited to some jobs (`job_ids`,
@@ -1086,7 +1179,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 31);
+        assert_eq!(applied, 34);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -1114,14 +1207,49 @@ mod tests {
         for t in ["file_tag_defs", "file_tag_links", "file_labels", "file_metadata", "smart_folders"] {
             assert!(tables.contains(&t.to_string()), "missing {t}");
         }
+        for t in ["sync_baseline_runs", "sync_baseline", "user_filter_presets"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
         assert!(tables.contains(&"_migrations".to_string()));
+    }
+
+    #[test]
+    fn v34_adds_run_history_detail_and_old_runs_read_as_manual() {
+        let conn = test_conn();
+        run_migrations_up_to(&conn, 33).unwrap();
+        conn.execute(
+            "INSERT INTO sync_runs (id, pair_id, pair_name, status, started_at, ended_at, report_json) VALUES ('r1', 'p', 'Pair', 'success', '2026-01-01T00:00:00+00:00', '2026-01-01T00:01:00+00:00', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO backup_runs (id, job_id, operation, status, started_at) VALUES ('b1', 'j', 'backup', 'success', '2026-01-01T00:00:00+00:00')", []).unwrap();
+
+        assert_eq!(run_migrations(&conn).unwrap(), 1);
+
+        let trig: String = conn.query_row("SELECT run_trigger FROM sync_runs WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+        let trunc: i64 = conn.query_row("SELECT items_truncated FROM sync_runs WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+        let btrig: String = conn.query_row("SELECT run_trigger FROM backup_runs WHERE id = 'b1'", [], |r| r.get(0)).unwrap();
+        assert_eq!((trig.as_str(), trunc, btrig.as_str()), ("manual", 0, "manual"));
+
+        // Items and replica rows follow their run when it is deleted.
+        conn.execute("INSERT INTO sync_run_items (run_id, rel_path, action, bytes) VALUES ('r1', 'a.txt', 'copied', 3)", []).unwrap();
+        conn.execute(
+            "INSERT INTO backup_replica_runs (id, run_id, job_id, replica_id, replica_name, status, started_at) VALUES ('x', 'b1', 'j', 'rep', 'Replica', 'success', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM sync_runs WHERE id = 'r1'", []).unwrap();
+        conn.execute("DELETE FROM backup_runs WHERE id = 'b1'", []).unwrap();
+        let items: i64 = conn.query_row("SELECT COUNT(*) FROM sync_run_items", [], |r| r.get(0)).unwrap();
+        let reps: i64 = conn.query_row("SELECT COUNT(*) FROM backup_replica_runs", [], |r| r.get(0)).unwrap();
+        assert_eq!((items, reps), (0, 0));
     }
 
     #[test]
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 31);
+        assert_eq!(first, 34);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -1134,7 +1262,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 31);
+        assert_eq!(current_version(&conn).unwrap(), 34);
     }
 
     #[test]

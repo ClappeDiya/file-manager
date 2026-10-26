@@ -366,63 +366,11 @@ pub struct Throttle {
     pub download_bps: u64,
 }
 
+/// The shared limiter and the machine-wide caps live in `crate::throttle`
+/// (also used by sync and file transfers, and driven by the bandwidth timetable).
+pub use crate::throttle::{SharedRate, GLOBAL_DOWNLOAD, GLOBAL_UPLOAD};
+
 /// Wraps a backend with retry/backoff and throttling.
-/// One machine-wide rate shared by every backend (all jobs together):
-/// each transfer reserves its share of the time line, so the sum of
-/// concurrent transfers stays at or below the rate.
-pub struct SharedRate {
-    bps: std::sync::atomic::AtomicU64,
-    next: std::sync::Mutex<Option<Instant>>,
-}
-
-impl SharedRate {
-    pub const fn new() -> Self {
-        Self { bps: std::sync::atomic::AtomicU64::new(0), next: std::sync::Mutex::new(None) }
-    }
-
-    /// Bytes per second; 0 = unlimited.
-    pub fn set(&self, bps: u64) {
-        self.bps.store(bps, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn get(&self) -> u64 {
-        self.bps.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// How long a transfer of `bytes` that started at `started` must still
-    /// wait; reserves its slot.
-    pub fn reserve(&self, bytes: usize, started: Instant) -> Duration {
-        let bps = self.get();
-        if bps == 0 {
-            return Duration::ZERO;
-        }
-        let now = Instant::now();
-        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        // Idle time is not banked: a slot starts no earlier than this transfer did.
-        let start = next.map_or(started, |n| n.max(started));
-        let end = start + Duration::from_secs_f64(bytes as f64 / bps as f64);
-        *next = Some(end);
-        end.saturating_duration_since(now)
-    }
-
-    fn wait(&self, bytes: usize, started: Instant) {
-        let d = self.reserve(bytes, started);
-        if !d.is_zero() {
-            std::thread::sleep(d);
-        }
-    }
-}
-
-impl Default for SharedRate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Machine-wide upload and download caps (on top of each job's own throttle).
-pub static GLOBAL_UPLOAD: SharedRate = SharedRate::new();
-pub static GLOBAL_DOWNLOAD: SharedRate = SharedRate::new();
-
 pub struct RetryingBackend<B: Backend> {
     inner: B,
     policy: RetryPolicy,
@@ -453,13 +401,10 @@ impl<B: Backend> RetryingBackend<B> {
     }
 }
 
+/// Validation, passphrase, local-filesystem and rejected-credential
+/// problems never get better by retrying; network failures often do.
 fn is_retryable(e: &AppError) -> bool {
-    // Validation, passphrase and local-filesystem problems never get better
-    // by retrying; network (connection/transfer) failures often do.
-    !matches!(
-        e,
-        AppError::Encryption { .. } | AppError::PermissionDenied { .. } | AppError::Configuration { .. } | AppError::FileOperation { .. }
-    )
+    crate::retry::is_retryable(e)
 }
 
 impl<B: Backend> Backend for RetryingBackend<B> {
@@ -482,7 +427,8 @@ impl<B: Backend> Backend for RetryingBackend<B> {
         let t = Instant::now();
         self.retry("put", || self.inner.put(name, data))?;
         Self::pace(self.throttle.upload_bps, data.len(), t);
-        GLOBAL_UPLOAD.wait(data.len(), t);
+        // The machine-wide cap, and the timetable's share with sync and transfers.
+        crate::throttle::wait_all(&[&GLOBAL_UPLOAD, &crate::throttle::TIMETABLE_UPLOAD], data.len(), t);
         Ok(())
     }
     fn get(&self, name: &str) -> Result<Vec<u8>, AppError> {
@@ -780,6 +726,48 @@ mod tests {
         let t = Instant::now();
         assert!(b.list().is_err());
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Fails every call with the error `make` builds, counting attempts.
+    struct Failing {
+        calls: std::sync::atomic::AtomicU32,
+        make: fn() -> AppError,
+    }
+
+    impl Backend for Failing {
+        fn describe(&self) -> String {
+            "failing".into()
+        }
+        fn list(&self) -> Result<Vec<RemoteFile>, AppError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err((self.make)())
+        }
+        fn put(&self, _: &str, _: &[u8]) -> Result<(), AppError> {
+            self.list().map(|_| ())
+        }
+        fn get(&self, _: &str) -> Result<Vec<u8>, AppError> {
+            self.list().map(|_| Vec::new())
+        }
+        fn delete(&self, _: &str) -> Result<(), AppError> {
+            self.list().map(|_| ())
+        }
+        fn create_folder(&self) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// Regression: a 401/403 (rejected credentials) was retried with
+    /// backoff like a network error, hammering the account.
+    #[test]
+    fn rejected_credentials_are_not_retried() {
+        let policy = RetryPolicy { retries: 3, delay_ms: 1, exponential: false, max_delay_ms: 1 };
+        let b = RetryingBackend::new(Failing { calls: Default::default(), make: || AppError::auth("HTTP 401", "check the key") }, policy, Throttle::default());
+        assert!(b.list().unwrap_err().is_auth_failure());
+        assert_eq!(b.inner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Network failures still are.
+        let b = RetryingBackend::new(Failing { calls: Default::default(), make: || AppError::connection("reset", "retry") }, policy, Throttle::default());
+        assert!(b.list().is_err());
+        assert_eq!(b.inner.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[test]

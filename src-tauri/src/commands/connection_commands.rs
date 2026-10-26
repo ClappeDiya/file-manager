@@ -95,6 +95,8 @@ pub async fn save_connection(
     default_dir_mode: Option<String>,
     // Connector-specific settings (role assumption, preset, rclone remote)
     extras: Option<crate::core::types::ConnectionExtras>,
+    // SFTP private-key passphrase: None = unchanged, "" = remove.
+    key_passphrase: Option<String>,
     manager: State<'_, ConnectionManager>,
     master_pw: State<'_, MasterPasswordManager>,
     repo: State<'_, Repository>,
@@ -143,7 +145,7 @@ pub async fn save_connection(
     };
 
     let conn_name = profile.name.clone();
-    let result = manager.save_connection(profile, password).await;
+    let result = manager.save_connection_with_secrets(profile, password, key_passphrase).await;
     if result.is_ok() {
         SecurityAudit::log_connection_change(repo.inner(), "save", &conn_name).await;
     }
@@ -181,6 +183,41 @@ pub async fn get_connection(
         p.proxy_password = decrypt_proxy_password(p.proxy_password.take(), master_pw.inner()).await;
     }
     Ok(profile)
+}
+
+fn parse_connection_id(connection_id: &str) -> Result<Uuid, AppError> {
+    Uuid::parse_str(connection_id).map_err(|_| AppError::Connection {
+        message: format!("Invalid connection ID: {connection_id}"),
+        advice: "Provide a valid UUID.".to_string(),
+    })
+}
+
+/// Star or unstar a connection; starred connections are listed first.
+#[tauri::command]
+pub async fn set_connection_starred(
+    connection_id: String,
+    starred: bool,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AppError> {
+    manager.set_starred(parse_connection_id(&connection_id)?, starred).await
+}
+
+/// Starred and credentials-rejected flags of every saved connection.
+#[tauri::command]
+pub async fn list_connection_status(
+    manager: State<'_, ConnectionManager>,
+) -> Result<Vec<crate::core::types::ConnectionStatus>, AppError> {
+    manager.list_status().await
+}
+
+/// Clear a connection's credentials-rejected flag (the Retry button), so
+/// automatic reconnects try it again.
+#[tauri::command]
+pub async fn clear_connection_credentials_rejected(
+    connection_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AppError> {
+    manager.clear_credentials_rejected(parse_connection_id(&connection_id)?).await
 }
 
 /// Delete a connection.

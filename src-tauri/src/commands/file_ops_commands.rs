@@ -353,15 +353,17 @@ pub async fn count_affected_files(paths: Vec<String>) -> Result<AffectedFiles, A
 /// Shared by copy (which only needs it on a name collision) and duplicate
 /// (which always renames, since it writes beside the original).
 fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError> {
-    let stem = src
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let ext = src
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
+    let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+    next_copy_name(&name, |candidate| dir.join(candidate).exists()).map(|n| dir.join(n))
+}
+
+/// First `"<stem> (copy)"` / `"<stem> (copy N)"` variant of `name` that
+/// `taken` does not claim. The naming of every keep-both copy (local copy,
+/// duplicate, and pane transfers to and from connections).
+pub(crate) fn next_copy_name(name: &str, taken: impl Fn(&str) -> bool) -> Result<String, AppError> {
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
     for counter in 1..=1000 {
         let new_name = if counter == 1 {
@@ -369,9 +371,8 @@ fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError>
         } else {
             format!("{stem} (copy {counter}){ext}")
         };
-        let candidate = dir.join(&new_name);
-        if !candidate.exists() {
-            return Ok(candidate);
+        if !taken(&new_name) {
+            return Ok(new_name);
         }
     }
 
@@ -1016,7 +1017,10 @@ pub async fn undo_file_operation_inner(
             }
         }
         "create_folder" | "create_file" => {
-            // Undo create = delete
+            // Undo create = delete, deepest first: a folder created inside
+            // another must go before it, whatever order the ledger kept.
+            let mut dest_paths = dest_paths;
+            dest_paths.sort_by_key(|p| std::cmp::Reverse(Path::new(p).components().count()));
             for dest in &dest_paths {
                 let p = Path::new(dest);
                 if p.exists() {
@@ -1200,10 +1204,15 @@ pub async fn get_file_metadata(path: String) -> Result<FileEntry, AppError> {
 /// - **onedrive**: DELETE `/me/drive/items/{id}` which moves to OneDrive Recycle Bin.
 /// - **dropbox**: `files/delete_v2` which soft-deletes (recoverable for retention period).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cloud_delete_to_trash(
     protocol: String,
     file_id: String,
     connection_id: String,
+    connections: tauri::State<'_, crate::connectors::ConnectionManager>,
+    gdrive: tauri::State<'_, Arc<crate::connectors::GoogleDriveConnector>>,
+    onedrive: tauri::State<'_, Arc<crate::connectors::OneDriveConnector>>,
+    dropbox: tauri::State<'_, Arc<crate::connectors::DropboxConnector>>,
 ) -> Result<(), AppError> {
     tracing::info!(
         "cloud_delete_to_trash: protocol={}, file_id={}, connection_id={}",
@@ -1213,24 +1222,39 @@ pub async fn cloud_delete_to_trash(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: move to trash (permanent=false)
-            let connector = crate::connectors::google_drive::GoogleDriveConnector::new();
-            connector.delete_file(&file_id, false).await
+            cloud_instance(&gdrive, &connections, &connection_id, crate::connectors::GoogleDriveConnector::fresh).await?
+                .delete_file(&file_id, false).await
         }
         "onedrive" => {
             // OneDrive: DELETE moves to recycle bin by default
-            let connector = crate::connectors::onedrive::OneDriveConnector::new();
-            connector.delete_item(&file_id).await
+            cloud_instance(&onedrive, &connections, &connection_id, crate::connectors::OneDriveConnector::fresh).await?
+                .delete_item(&file_id).await
         }
         "dropbox" => {
             // Dropbox: delete_v2 is a soft delete (recoverable)
-            let connector = crate::connectors::dropbox::DropboxConnector::new();
-            connector.delete(&file_id).await
+            cloud_instance(&dropbox, &connections, &connection_id, crate::connectors::DropboxConnector::fresh).await?
+                .delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for trash deletion: {other}"),
             advice: "Supported protocols: google_drive, onedrive, dropbox.".to_string(),
         }),
     }
+}
+
+/// The cloud connector signed in as the saved connection: the shared one
+/// when it already is, else a fresh instance (the shared one, which the
+/// Connections panel browses, is not re-signed as another account). These
+/// commands used to create a never-signed-in connector, so every call
+/// failed with "Not connected".
+async fn cloud_instance<C: crate::connectors::Connector + 'static>(
+    connector: &Arc<C>,
+    connections: &crate::connectors::ConnectionManager,
+    connection_id: &str,
+    fresh: fn(&C) -> C,
+) -> Result<Arc<C>, AppError> {
+    use super::connector_commands::{instance_for, Caller};
+    instance_for(connector.clone(), |c| Some(Arc::new(fresh(c))), connections, connection_id, Caller::User).await
 }
 
 /// Permanently delete a cloud file/folder, bypassing the trash/recycle bin.
@@ -1240,10 +1264,15 @@ pub async fn cloud_delete_to_trash(
 /// - **onedrive**: DELETE + permanentDelete (removes from recycle bin too).
 /// - **dropbox**: `files/permanently_delete` endpoint (immediate permanent removal).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cloud_delete_permanently(
     protocol: String,
     file_id: String,
     connection_id: String,
+    connections: tauri::State<'_, crate::connectors::ConnectionManager>,
+    gdrive: tauri::State<'_, Arc<crate::connectors::GoogleDriveConnector>>,
+    onedrive: tauri::State<'_, Arc<crate::connectors::OneDriveConnector>>,
+    dropbox: tauri::State<'_, Arc<crate::connectors::DropboxConnector>>,
 ) -> Result<(), AppError> {
     tracing::info!(
         "cloud_delete_permanently: protocol={}, file_id={}, connection_id={}",
@@ -1253,18 +1282,18 @@ pub async fn cloud_delete_permanently(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: permanent delete (permanent=true)
-            let connector = crate::connectors::google_drive::GoogleDriveConnector::new();
-            connector.delete_file(&file_id, true).await
+            cloud_instance(&gdrive, &connections, &connection_id, crate::connectors::GoogleDriveConnector::fresh).await?
+                .delete_file(&file_id, true).await
         }
         "onedrive" => {
             // OneDrive: delete + purge from recycle bin
-            let connector = crate::connectors::onedrive::OneDriveConnector::new();
-            connector.delete_item_permanently(&file_id).await
+            cloud_instance(&onedrive, &connections, &connection_id, crate::connectors::OneDriveConnector::fresh).await?
+                .delete_item_permanently(&file_id).await
         }
         "dropbox" => {
             // Dropbox: permanent deletion endpoint
-            let connector = crate::connectors::dropbox::DropboxConnector::new();
-            connector.permanently_delete(&file_id).await
+            cloud_instance(&dropbox, &connections, &connection_id, crate::connectors::DropboxConnector::fresh).await?
+                .permanently_delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for permanent deletion: {other}"),
@@ -1363,16 +1392,20 @@ pub async fn resolve_path(
     sftp.realpath(&path).await
 }
 
-/// Open a file with the OS default application.
+/// Open a file or folder with the OS default application.
 #[tauri::command]
 pub async fn open_file_with_default(path: String) -> Result<(), AppError> {
-    let status = {
+    // tokio's process, so waiting for the opener never blocks the async runtime.
+    let status: std::io::Result<std::process::ExitStatus> = {
         #[cfg(target_os = "macos")]
-        { std::process::Command::new("open").arg(&path).status() }
+        { tokio::process::Command::new("open").arg(&path).status().await }
+        // Explorer opens the path itself: unlike `cmd /C start`, nothing in the name
+        // (`&`, `^`, `%`) is interpreted by a shell. It reports exit code 1 even when
+        // it worked, so only a failure to start it counts.
         #[cfg(target_os = "windows")]
-        { std::process::Command::new("cmd").args(["/C", "start", "", &path]).status() }
+        { tokio::process::Command::new("explorer.exe").arg(&path).status().await.map(|_| <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(0)) }
         #[cfg(target_os = "linux")]
-        { std::process::Command::new("xdg-open").arg(&path).status() }
+        { tokio::process::Command::new("xdg-open").arg(&path).status().await }
     };
     match status {
         Ok(s) if s.success() => Ok(()),
@@ -1509,7 +1542,31 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AppError> {
 }
 
 /// Move a file/directory to the OS trash.
-fn move_to_trash(path: &Path) -> Result<(), AppError> {
+/// Move `path` into the trash folder `trash_dir`; returns where it went.
+/// A name already in the trash gets a number (`notes 2.txt`), so trashing
+/// two files of the same name never overwrites the first.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn trash_into(trash_dir: &Path, path: &Path) -> Result<PathBuf, AppError> {
+    let file_name = path.file_name().unwrap_or_default();
+    let mut target = trash_dir.join(file_name);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 2;
+    while std::fs::symlink_metadata(&target).is_ok() {
+        target = trash_dir.join(format!("{stem} {n}{ext}"));
+        n += 1;
+    }
+    std::fs::rename(path, &target).map_err(|e| {
+        AppError::file_op(
+            format!("Failed to move to Trash: {e}"),
+            "Try permanent delete instead.",
+        )
+    })?;
+    Ok(target)
+}
+
+/// Move `path` to the OS trash (permanently deleted on Windows for now).
+pub(crate) fn move_to_trash(path: &Path) -> Result<(), AppError> {
     // Cross-platform trash implementation
     // On macOS: move to ~/.Trash/
     // On Linux: use ~/.local/share/Trash/ (freedesktop spec)
@@ -1530,34 +1587,7 @@ fn move_to_trash(path: &Path) -> Result<(), AppError> {
             })?;
         }
 
-        let file_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let mut target = trash_dir.join(&file_name);
-
-        // Handle name conflicts in trash
-        if target.exists() {
-            let stem = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let ext = path
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-            let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-            target = trash_dir.join(format!("{stem} {timestamp}{ext}"));
-        }
-
-        std::fs::rename(path, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move to Trash: {e}"),
-                "Try permanent delete instead.",
-            )
-        })?;
+        trash_into(&trash_dir, path)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -1575,15 +1605,7 @@ fn move_to_trash(path: &Path) -> Result<(), AppError> {
             })?;
         }
 
-        let file_name = path.file_name().unwrap_or_default();
-        let target = trash_dir.join(file_name);
-
-        std::fs::rename(path, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move to Trash: {e}"),
-                "Try permanent delete instead.",
-            )
-        })?;
+        trash_into(&trash_dir, path)?;
     }
 
     #[cfg(target_os = "windows")]
@@ -1711,6 +1733,29 @@ fn is_default_port(protocol: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: trashing a second file with the same name as one already
+    /// in the trash renamed it over the first, destroying it (Linux and macOS
+    /// both trash through `trash_into`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn trash_keeps_files_that_share_a_name() {
+        let base = tempfile::tempdir().unwrap();
+        let trash = base.path().join("Trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        for (dir, body) in [("one", "first"), ("two", "second")] {
+            let d = base.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("notes.txt"), body).unwrap();
+            super::trash_into(&trash, &d.join("notes.txt")).unwrap();
+        }
+        let mut kept: Vec<String> = std::fs::read_dir(&trash)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["first", "second"]);
+    }
+
     #[test]
     fn cross_device_fallback_moves_file_and_dir() {
         let tmp = tempfile::tempdir().unwrap();

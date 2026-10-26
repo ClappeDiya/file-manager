@@ -69,7 +69,28 @@ pub fn system_info(agent_kind: &str) -> Value {
         "retention": crate::logging::Retention::load(&crate::logging::log_dir()),
         "proxy": { "mode": proxy.mode, "managed": proxy.managed, "bypassRules": proxy.no_proxy.len() },
         "filenamePolicyActive": !ufop_core::policy::active().is_empty(),
+        "rclone": rclone_info(&crate::rclone_engine::resolver::status_blocking()),
         "createdAt": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// The rclone engine in use (via the resolver): path with the home folder
+/// shortened to `~`, version, minimum check; "not installed" when absent.
+pub fn rclone_info(s: &crate::rclone_engine::RcloneStatus) -> Value {
+    let home = |p: &str| match dirs::home_dir().map(|h| h.to_string_lossy().to_string()).filter(|h| h.len() > 1) {
+        Some(h) => p.replace(&h, "~"),
+        None => p.to_string(),
+    };
+    json!({
+        "installed": s.version.is_some(),
+        "path": home(&s.path),
+        "source": s.source,
+        "version": s.version.clone().unwrap_or_else(|| "not installed".into()),
+        "meetsMinimum": s.meets_minimum,
+        "minVersion": s.min_version,
+        "managed": s.managed,
+        "configPath": s.config_path.as_deref().map(home),
+        "error": s.error.as_deref().map(home),
     })
 }
 
@@ -87,6 +108,12 @@ fn read_tail(path: &Path, limit: u64) -> std::io::Result<(String, bool)> {
 /// Build a bundle from the log files in `log_dir` (newest first, up to
 /// `max_log_bytes`) plus `system.json`.
 pub fn build(log_dir: &Path, system: &Value, max_log_bytes: u64) -> Result<Bundle, AppError> {
+    build_with(log_dir, system, max_log_bytes, &[])
+}
+
+/// [`build`] with extra top-level files (name, text) in the zip, such as the
+/// `feedback.json` of a feedback report.
+pub fn build_with(log_dir: &Path, system: &Value, max_log_bytes: u64, extra: &[(String, String)]) -> Result<Bundle, AppError> {
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut b = Bundle { file_name: format!("ufop-diagnostics-{}.zip", chrono::Utc::now().format("%Y%m%d-%H%M%S")), ..Default::default() };
@@ -97,6 +124,9 @@ pub fn build(log_dir: &Path, system: &Value, max_log_bytes: u64) -> Result<Bundl
         Ok(())
     };
 
+    for (name, text) in extra {
+        add(&mut zip, name.clone(), text)?;
+    }
     add(&mut zip, "system.json".into(), &serde_json::to_string_pretty(system)?)?;
     let mut budget = max_log_bytes;
     for (path, size, _) in crate::logging::log_files(log_dir) {
@@ -171,6 +201,35 @@ mod tests {
     }
 
     #[test]
+    fn rclone_engine_info_says_not_installed_and_hides_home() {
+        use crate::rclone_engine::resolver::{status_of, BinarySource, RcloneVersion, Resolved, Semver};
+        let missing = status_of(&Resolved { path: "rclone".into(), source: BinarySource::None, found: false, config: None }, Err("Could not start rclone".into()));
+        let v = rclone_info(&missing);
+        assert_eq!((v["installed"].as_bool(), v["version"].as_str(), v["error"].as_str()), (Some(false), Some("not installed"), Some("rclone is not installed")));
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        let found = status_of(
+            &Resolved { path: format!("{home}/bin/rclone"), source: BinarySource::Settings, found: true, config: Some(format!("{home}/.config/rclone/rclone.conf")) },
+            Ok(RcloneVersion { raw: "v1.69.1".into(), semver: Semver { major: 1, minor: 69, patch: 1 } }),
+        );
+        let v = rclone_info(&found);
+        assert_eq!((v["installed"].as_bool(), v["version"].as_str(), v["meetsMinimum"].as_bool(), v["source"].as_str()), (Some(true), Some("v1.69.1"), Some(true), Some("settings")));
+        if home.len() > 1 {
+            assert_eq!(v["path"], "~/bin/rclone");
+            assert_eq!(v["configPath"], "~/.config/rclone/rclone.conf");
+        }
+        // A broken binary's error names its path: the home folder is hidden there too.
+        let broken = status_of(
+            &Resolved { path: format!("{home}/bin/rclone"), source: BinarySource::Settings, found: true, config: None },
+            Err(format!("{home}/bin/rclone did not report an rclone version")),
+        );
+        let v = rclone_info(&broken);
+        if home.len() > 1 {
+            assert_eq!(v["error"], "~/bin/rclone did not report an rclone version");
+            assert!(!v.to_string().contains(&home), "home folder leaked: {v}");
+        }
+    }
+
+    #[test]
     fn bundle_has_system_info_and_scrubbed_logs_within_budget() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("ufop.2026-10-21.log"), "old line\n".repeat(50)).unwrap();
@@ -202,6 +261,7 @@ mod tests {
     fn system_info_reports_versions_without_secrets() {
         let v = system_info("desktop");
         assert_eq!(v["app"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["rclone"]["version"].as_str().is_some_and(|s| !s.is_empty()), "rclone engine reported: {}", v["rclone"]);
         assert!(v["os"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(v["proxy"].get("username").is_none() && v["proxy"].get("url").is_none());
     }

@@ -106,6 +106,17 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionProfile
     })
 }
 
+fn row_to_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionStatus> {
+    Ok(ConnectionStatus {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+        starred: row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+        credentials_rejected_at: row
+            .get::<_, Option<String>>(2)?
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        credentials_rejected_reason: row.get(3)?,
+    })
+}
 
 /// Repository wrapping a database pool.
 #[derive(Clone, Debug)]
@@ -189,6 +200,12 @@ impl Repository {
                 Ok(())
             })
             .await
+    }
+
+    /// Remove a setting (its default applies again). `true` if it was set.
+    pub async fn delete_config(&self, key: &str) -> Result<bool, AppError> {
+        let key = key.to_string();
+        self.pool.execute(move |conn| Ok(conn.execute("DELETE FROM config WHERE key = ?1", rusqlite::params![key])? > 0)).await
     }
 
     // ── Bookmark operations ──
@@ -344,6 +361,7 @@ impl Repository {
             dest_checksum: row.get(18)?,
             speed_bps: row.get::<_, Option<i64>>(19)?.unwrap_or(0) as u64,
             eta_seconds: row.get::<_, Option<i64>>(20)?.map(|e| e as u64),
+            external: false,
         })
     }
 
@@ -412,7 +430,7 @@ impl Repository {
         self.pool
             .execute(|conn| {
                 let mut stmt = conn.prepare(
-                    &format!("SELECT {CONNECTION_COLUMNS} FROM connections ORDER BY name"),
+                    &format!("SELECT {CONNECTION_COLUMNS} FROM connections ORDER BY starred DESC, name"),
                 )?;
                 let connections = stmt
                     .query_map([], |row| {
@@ -449,6 +467,50 @@ impl Repository {
                     })
                     .ok();
                 Ok(result)
+            })
+            .await
+    }
+
+    /// Star or unstar a connection (starred ones are listed first).
+    pub async fn set_connection_starred(&self, id: Uuid, starred: bool) -> Result<bool, AppError> {
+        self.pool
+            .execute(move |conn| {
+                let n = conn.execute("UPDATE connections SET starred = ?2 WHERE id = ?1", rusqlite::params![id.to_string(), starred])?;
+                Ok(n > 0)
+            })
+            .await
+    }
+
+    /// Flag (`Some(reason)`) or clear (`None`) a connection's rejected credentials.
+    pub async fn set_credentials_rejected(&self, id: Uuid, reason: Option<String>) -> Result<(), AppError> {
+        self.pool
+            .execute(move |conn| {
+                let at = reason.as_ref().map(|_| Utc::now().to_rfc3339());
+                conn.execute(
+                    "UPDATE connections SET credentials_rejected_at = ?2, credentials_rejected_reason = ?3 WHERE id = ?1",
+                    rusqlite::params![id.to_string(), at, reason],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Starred and credentials-rejected flags of every connection.
+    pub async fn list_connection_status(&self) -> Result<Vec<ConnectionStatus>, AppError> {
+        self.pool
+            .execute(|conn| {
+                let mut stmt = conn.prepare("SELECT id, starred, credentials_rejected_at, credentials_rejected_reason FROM connections ORDER BY starred DESC, name")?;
+                let rows = stmt.query_map([], row_to_status)?.filter_map(|r| r.ok()).collect();
+                Ok(rows)
+            })
+            .await
+    }
+
+    pub async fn get_connection_status(&self, id: Uuid) -> Result<Option<ConnectionStatus>, AppError> {
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare("SELECT id, starred, credentials_rejected_at, credentials_rejected_reason FROM connections WHERE id = ?1")?;
+                Ok(stmt.query_row([id.to_string()], row_to_status).ok())
             })
             .await
     }
@@ -739,7 +801,7 @@ impl StorageOperations for Repository {
                                 checksum_algorithm, source_checksum, dest_checksum,
                                 speed_bps, eta_seconds
                          FROM transfer_history
-                         WHERE status IN ('queued', 'active', 'paused')
+                         WHERE status IN ('queued', 'active', 'paused', 'failed')
                          ORDER BY
                             CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 ELSE 1 END,
                             sort_order ASC,
@@ -749,7 +811,9 @@ impl StorageOperations for Repository {
                         .query_map([], Self::row_to_transfer_job)?
                         .filter_map(|r| r.ok())
                         .map(|mut job| {
-                            // Active transfers that were interrupted should be re-queued
+                            // Active transfers that were interrupted should be re-queued.
+                            // Failed ones stay failed: listed with their error, retried
+                            // only when the user says so.
                             if job.status == TransferStatus::Active {
                                 job.status = TransferStatus::Queued;
                             }
@@ -789,7 +853,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(version, 31);
+        assert_eq!(version, 34);
     }
 
     #[tokio::test]
@@ -905,6 +969,7 @@ mod tests {
                 dest_checksum: None,
                 speed_bps: 0,
                 eta_seconds: None,
+                external: false,
             },
             TransferJob {
                 id: Uuid::new_v4(),
@@ -928,6 +993,7 @@ mod tests {
                 dest_checksum: None,
                 speed_bps: 0,
                 eta_seconds: None,
+                external: false,
             },
         ];
 
@@ -950,6 +1016,50 @@ mod tests {
         let paused_job = loaded.iter().find(|j| j.id == jobs[0].id).unwrap();
         assert_eq!(paused_job.status, TransferStatus::Paused);
         assert_eq!(paused_job.transferred_bytes, 500);
+    }
+
+    /// Row 93: a failed job used to vanish on restart (the restore query
+    /// skipped it), taking its error and its retry with it.
+    #[tokio::test]
+    async fn failed_transfers_come_back_after_a_restart_and_stay_failed() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        let job = |status: TransferStatus, name: &str, error: Option<&str>| TransferJob {
+            id: Uuid::new_v4(),
+            source_path: format!("/src/{name}"),
+            dest_path: format!("/dst/{name}"),
+            total_bytes: 1000,
+            transferred_bytes: 400,
+            status,
+            priority: TransferPriority::Normal,
+            sort_order: 0,
+            created_at: now,
+            updated_at: now,
+            error_message: error.map(String::from),
+            retry_count: 2,
+            partial_checksum: None,
+            conflict_policy: None,
+            connection_id: None,
+            verify_checksum: false,
+            checksum_algorithm: None,
+            source_checksum: None,
+            dest_checksum: None,
+            speed_bps: 0,
+            eta_seconds: None,
+            external: false,
+        };
+        let failed = job(TransferStatus::Failed, "failed.bin", Some("disk full"));
+        let done = job(TransferStatus::Completed, "done.bin", None);
+        let gone = job(TransferStatus::Cancelled, "gone.bin", None);
+        StorageOperations::save_transfer_queue(&repo, &[failed.clone(), done, gone]).await.unwrap();
+
+        let loaded = StorageOperations::load_transfer_queue(&repo).await.unwrap();
+
+        let back = loaded.iter().find(|j| j.id == failed.id).expect("the failed job is restored");
+        assert_eq!(back.status, TransferStatus::Failed, "restored as failed, not queued for an automatic retry");
+        assert_eq!(back.error_message.as_deref(), Some("disk full"));
+        assert_eq!((back.retry_count, back.transferred_bytes), (2, 400));
+        assert_eq!(loaded.len(), 1, "finished and cancelled jobs are not restored");
     }
 
     #[tokio::test]

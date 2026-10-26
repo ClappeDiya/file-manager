@@ -70,6 +70,18 @@ impl Loopback {
         Ok(Self { listener, redirect_uri: format!("http://127.0.0.1:{port}{CALLBACK_PATH}") })
     }
 
+    /// Listen on `port` (0 = any free port) and name the redirect URI with
+    /// `host` (`localhost` for providers that register it by name, e.g.
+    /// Dropbox, whose registered redirect URIs must match exactly).
+    pub async fn bind_on(port: u16, host: &str) -> Result<Self, AppError> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| AppError::State {
+            message: format!("Cannot listen for the sign-in on port {port}: {e}"),
+            advice: "Another sign-in may be in progress, or another app uses the port; finish or cancel it and try again.".into(),
+        })?;
+        let port = listener.local_addr()?.port();
+        Ok(Self { listener, redirect_uri: format!("http://{host}:{port}{CALLBACK_PATH}") })
+    }
+
     /// Wait for the redirect carrying `state`; returns its `code`. Other
     /// requests (favicon, stray probes) are answered and ignored.
     pub async fn wait_for_code(self, state: &str, timeout: Duration) -> Result<String, AppError> {
@@ -94,13 +106,13 @@ impl Loopback {
                 if let Some(err) = q.get("error") {
                     let _ = sock.write_all(page("Sign-in cancelled", "You can close this tab and return to UFOP.").as_bytes()).await;
                     return Err(AppError::PermissionDenied {
-                        message: if err == "access_denied" { "The sign-in was denied in the browser".into() } else { format!("The console returned an error: {err}") },
-                        advice: "Start the sign-in again from Settings, or use a registration link.".into(),
+                        message: if err == "access_denied" { "The sign-in was denied in the browser".into() } else { format!("The sign-in page returned an error: {err}") },
+                        advice: "Start the sign-in again.".into(),
                     });
                 }
                 let Some(code) = q.get("code").filter(|c| !c.is_empty()).cloned() else {
-                    let _ = sock.write_all(page("Sign-in incomplete", "The console did not return a code. Return to the app and try again.").as_bytes()).await;
-                    return Err(AppError::validation("The console did not return a sign-in code"));
+                    let _ = sock.write_all(page("Sign-in incomplete", "No sign-in code came back. Return to the app and try again.").as_bytes()).await;
+                    return Err(AppError::validation("The sign-in page did not return a code"));
                 };
                 let _ = sock.write_all(page("UFOP is connecting", "You can close this tab and return to UFOP.").as_bytes()).await;
                 return Ok::<String, AppError>(code);

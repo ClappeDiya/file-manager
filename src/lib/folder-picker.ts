@@ -13,12 +13,13 @@ export function setFolderPickerImpl(fn: FolderPickerImpl | null) {
  * This avoids z-order and focus issues that occur when the JS dialog plugin
  * tries to open a native sheet behind a CSS modal overlay.
  */
-export async function pickFolder(title?: string): Promise<string | null> {
+export async function pickFolder(title?: string, defaultPath?: string | null): Promise<string | null> {
   if (customPicker) return customPicker(title ?? "Select Folder");
   if (isTauriAvailable()) {
     try {
       const result = await tauriInvoke<string | null>("pick_folder", {
         title: title ?? "Select Folder",
+        defaultPath: defaultPath ?? null,
       });
       return result ?? null;
     } catch (err) {
@@ -33,11 +34,12 @@ export async function pickFolder(title?: string): Promise<string | null> {
   return path && path.trim() ? path.trim() : null;
 }
 
-/** Native multi-file picker; returns [] when cancelled or outside Tauri. */
-export async function pickFiles(title?: string): Promise<string[]> {
+/** Native multi-file picker; returns [] when cancelled or outside Tauri.
+ *  `defaultPath` is the folder it opens in (when it exists). */
+export async function pickFiles(title?: string, defaultPath?: string | null): Promise<string[]> {
   if (!isTauriAvailable()) return [];
   try {
-    return (await tauriInvoke<string[]>("pick_files", { title: title ?? "Select Files" })) ?? [];
+    return (await tauriInvoke<string[]>("pick_files", { title: title ?? "Select Files", defaultPath: defaultPath ?? null })) ?? [];
   } catch (err) {
     console.error("File picker IPC failed:", err);
     return [];

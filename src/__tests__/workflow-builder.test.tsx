@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke
 
 import { WorkflowBuilder } from "@/components/workflow-builder";
 import { AutomationRuleEditor } from "@/components/automation-rule-editor";
-import { useAutomationStore, type AutomationRule, type Workflow } from "@/stores/automation-store";
+import { useAutomationStore, type AutomationRule, type RuleAction, type Workflow } from "@/stores/automation-store";
 import { useUIStore } from "@/stores/ui-store";
 import { linearSteps } from "@/lib/automation-rule-model";
 
@@ -180,5 +180,35 @@ describe("rule editor with a workflow", () => {
     fireEvent.click(within(history).getByText("Restore"));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("automation_restore_revision", { ruleId: "r1", revision: 1 }));
     await waitFor(() => expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Before"));
+  });
+});
+
+describe("WorkflowBuilder results and risk", () => {
+  const wf: Workflow = {
+    nodes: [
+      { id: "n1", kind: "action", action: { type: "list_files", path: "/a", output: "/o.csv", format: "csv", recursive: true, include_dirs: false, overwrite: true }, label: "", x: 0, y: 0, output_as: "listing" },
+      { id: "n2", kind: "action", action: { type: "purge", path: "/tmp/x", max_files: null }, label: "", x: 0, y: 120 },
+    ],
+    edges: [{ from: "n1", to: "n2", on: "success" }],
+  };
+
+  it("badges each step with its risk and names a step's result along the edges", () => {
+    const changes = vi.fn();
+    const riskOf = (a: RuleAction) => (a.type === "purge" ? { level: "high" as const, reason: "Removes a folder and everything in it" } : { level: "low" as const, reason: "Writes a file listing" });
+    function Wf() {
+      const [w, setW] = useState(wf);
+      return <WorkflowBuilder workflow={w} onChange={(x) => { changes(x); setW(x); }} riskOf={riskOf} />;
+    }
+    render(<Wf />);
+    const list = screen.getByLabelText("Workflow steps");
+    expect(within(list).getAllByTestId("risk-badge").map((b) => b.getAttribute("data-risk"))).toEqual(["low", "high"]);
+    // The second step sees the first step's result name.
+    fireEvent.click(screen.getByLabelText(/^Step n2:/));
+    expect(screen.getByLabelText("Selected step")).toHaveTextContent("available here: listing");
+    fireEvent.change(screen.getByLabelText("Result name"), { target: { value: "purged" } });
+    expect((changes.mock.calls.at(-1)![0] as Workflow).nodes[1]).toMatchObject({ id: "n2", output_as: "purged" });
+    // The first step sees none (nothing upstream).
+    fireEvent.click(screen.getByLabelText(/^Step n1:/));
+    expect(screen.getByLabelText("Selected step")).not.toHaveTextContent("available here");
   });
 });

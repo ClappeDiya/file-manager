@@ -17,7 +17,8 @@
 //! A linear rule (`action` + `steps`) converts to a workflow with
 //! [`Workflow::from_rule`].
 
-use super::executor::{action_kind, dispatch, hands_on_path, is_transient, ExecEnv};
+use super::executor::{action_kind, dispatch_step, hands_on_path, is_transient, ExecEnv};
+use super::outputs::StepOutput;
 use super::{AutomationRule, ConditionNode, RuleAction, StepResult};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,10 @@ pub struct WorkflowNode {
     pub kind: NodeKind,
     #[serde(default)]
     pub label: String,
+    /// Name under which an action step's result is saved for the steps
+    /// downstream of it (`{steps.<name>.path}`…).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_as: Option<String>,
     /// Canvas position (the editor's; ignored by the engine).
     #[serde(default)]
     pub x: f64,
@@ -115,10 +120,11 @@ impl Workflow {
     /// following the previous on success (always when it may continue on error).
     pub fn from_rule(rule: &AutomationRule) -> Self {
         let steps = rule.all_steps();
+        let outputs: Vec<Option<String>> = std::iter::once(rule.output_as.clone()).chain(rule.steps.iter().map(|s| s.output_as.clone())).collect();
         let nodes: Vec<WorkflowNode> = steps
             .iter()
             .enumerate()
-            .map(|(i, (a, _))| WorkflowNode { id: format!("n{}", i + 1), kind: NodeKind::Action { action: Box::new((*a).clone()) }, label: String::new(), x: 0.0, y: i as f64 * 120.0 })
+            .map(|(i, (a, _))| WorkflowNode { id: format!("n{}", i + 1), kind: NodeKind::Action { action: Box::new((*a).clone()) }, label: String::new(), output_as: outputs[i].clone(), x: 0.0, y: i as f64 * 120.0 })
             .collect();
         let edges = steps
             .windows(2)
@@ -164,6 +170,21 @@ impl Workflow {
             }
         }
         self.order().map(|_| ())
+    }
+
+    /// Ids of every step upstream of `id`: the steps it receives files or
+    /// results from, directly or through other steps.
+    pub fn ancestors(&self, id: &str) -> HashSet<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![id.to_string()];
+        while let Some(cur) = stack.pop() {
+            for e in self.edges.iter().filter(|e| e.to == cur) {
+                if seen.insert(e.from.clone()) {
+                    stack.push(e.from.clone());
+                }
+            }
+        }
+        seen
     }
 
     /// Topological order (Kahn), or an error naming a cycle member.
@@ -293,22 +314,23 @@ async fn run_node(n: &WorkflowNode, files: &[String], rule: &AutomationRule, env
         }
         NodeKind::Action { action } => {
             let targets: Vec<Option<String>> = if files.is_empty() { vec![None] } else { files.iter().cloned().map(Some).collect() };
-            let (mut ok, mut out, mut results) = (true, Vec::new(), Vec::new());
+            let (mut ok, mut out, mut results, mut produced) = (true, Vec::new(), Vec::new(), Vec::new());
             for file in targets {
                 let retried = ufop_core::retry::retry_async(
                     &rule.options.retry,
-                    |_| dispatch(action, file.as_deref(), env),
+                    |_| dispatch_step(action, file.as_deref(), env),
                     |e: &String| is_transient(action, e),
                     |attempt, e, d| tracing::warn!("Workflow '{}' step {} failed (attempt {}), retrying in {d:?}: {e}", rule.name, n.id, attempt + 1),
                 )
                 .await;
                 match retried.result {
-                    Ok(paths) => {
-                        if hands_on_path(action) && !paths.is_empty() {
-                            out.extend(paths);
+                    Ok(step) => {
+                        if hands_on_path(action) && !step.paths.is_empty() {
+                            out.extend(step.paths.iter().cloned());
                         } else if let Some(f) = &file {
                             out.push(f.clone());
                         }
+                        produced.push(step.into_output());
                         results.push(res(file, true, retried.attempts, None));
                     }
                     Err(e) => {
@@ -319,6 +341,10 @@ async fn run_node(n: &WorkflowNode, files: &[String], rule: &AutomationRule, env
                         results.push(res(file, false, retried.attempts, Some(e)));
                     }
                 }
+            }
+            // The step's result for the steps downstream of it.
+            if let Some(name) = n.output_as.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+                env.outputs.set(name, StepOutput::merge(produced));
             }
             (NodeState::Done { ok, out, yes: vec![], no: vec![] }, results)
         }
@@ -350,6 +376,9 @@ async fn run_node(n: &WorkflowNode, files: &[String], rule: &AutomationRule, env
                 results.push(res(file, sub_ok, o.attempts, Some(o.error.unwrap_or_else(|| format!("ran '{}'", sub.name)))));
             }
             out.dedup();
+            if let Some(name) = n.output_as.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+                env.outputs.set(name, StepOutput::from_paths(&out));
+            }
             (NodeState::Done { ok, out, yes: vec![], no: vec![] }, results)
         }
     }
@@ -361,7 +390,7 @@ mod tests {
     use crate::automation_engine::{RuleCondition, RuleTrigger};
 
     fn node(id: &str, kind: NodeKind) -> WorkflowNode {
-        WorkflowNode { id: id.into(), kind, label: String::new(), x: 0.0, y: 0.0 }
+        WorkflowNode { id: id.into(), kind, label: String::new(), output_as: None, x: 0.0, y: 0.0 }
     }
     fn edge(from: &str, to: &str, on: EdgeOn) -> WorkflowEdge {
         WorkflowEdge { from: from.into(), to: to.into(), on }
@@ -385,8 +414,8 @@ mod tests {
 
         let mut rule = AutomationRule::new("r".into(), RuleTrigger::Manual, RuleAction::CreateFolder { path: "/1".into() });
         rule.steps = vec![
-            crate::automation_engine::ActionStep { action: RuleAction::CreateFolder { path: "/2".into() }, continue_on_error: true },
-            crate::automation_engine::ActionStep { action: RuleAction::CreateFolder { path: "/3".into() }, continue_on_error: false },
+            crate::automation_engine::ActionStep { action: RuleAction::CreateFolder { path: "/2".into() }, continue_on_error: true, output_as: None },
+            crate::automation_engine::ActionStep { action: RuleAction::CreateFolder { path: "/3".into() }, continue_on_error: false, output_as: None },
         ];
         let wf = Workflow::from_rule(&rule);
         assert_eq!(wf.nodes.len(), 3);

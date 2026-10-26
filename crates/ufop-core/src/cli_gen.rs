@@ -9,6 +9,7 @@
 //! the Linux and Homebrew packages install their output.
 
 use clap::{Arg, ArgAction, Command, ValueHint};
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// Shells with completion scripts.
@@ -76,6 +77,8 @@ struct Opt {
     help: String,
     values: Values,
     repeatable: bool,
+    /// Declared `global` on a parent: listed once at the top, not per command.
+    global: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +147,7 @@ fn collect(cmd: &Command, path: Vec<String>, out: &mut Vec<Node>) {
             continue;
         }
         let repeatable = matches!(a.get_action(), ArgAction::Count | ArgAction::Append);
-        node.opts.push(Opt { longs, shorts, help, values: values_of(a), repeatable });
+        node.opts.push(Opt { longs, shorts, help, values: values_of(a), repeatable, global: a.is_global_set() });
     }
     let subs: Vec<&Command> = cmd.get_subcommands().filter(|s| !s.is_hide_set()).collect();
     for s in &subs {
@@ -173,6 +176,82 @@ fn nodes(cmd: &Command) -> Vec<Node> {
     let mut out = Vec::new();
     collect(&c, vec![c.get_name().to_string()], &mut out);
     out
+}
+
+// ── Command help for the desktop terminal's help drawer ────────────────
+
+/// One command of a CLI as the terminal's help drawer lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandHelp {
+    /// The words after the program: `["backup", "run"]`.
+    pub path: Vec<String>,
+    /// One line on what the command does.
+    pub about: String,
+    /// The words to type, with its arguments as placeholders:
+    /// `backup run <JOB> [OPTIONS]`.
+    pub usage: String,
+    /// Has subcommands of its own, so typing it alone only starts a command.
+    pub has_subcommands: bool,
+    pub options: Vec<OptionHelp>,
+}
+
+/// One option of a [`CommandHelp`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionHelp {
+    /// `--dry-run`, `-v`…
+    pub flags: Vec<String>,
+    pub help: String,
+    /// Takes a value (`--limit 1M`) rather than being a switch.
+    pub takes_value: bool,
+}
+
+/// Every visible command below the root of `cmd` (not the root itself),
+/// parents before their subcommands, in the order the CLI lists them.
+pub fn describe(cmd: &Command) -> Vec<CommandHelp> {
+    nodes(cmd)
+        .into_iter()
+        .filter(|n| n.path.len() > 1)
+        .map(|n| {
+            let words: Vec<String> = n.path[1..].to_vec();
+            let mut usage = words.join(" ");
+            for (name, _, _, required, multiple) in &n.positionals {
+                let dots = if *multiple { "..." } else { "" };
+                let _ = if *required { write!(usage, " <{name}>{dots}") } else { write!(usage, " [{name}]{dots}") };
+            }
+            if !n.subs.is_empty() {
+                usage.push_str(" <COMMAND>");
+            }
+            if !n.opts.is_empty() {
+                usage.push_str(" [OPTIONS]");
+            }
+            CommandHelp {
+                path: words,
+                about: n.about,
+                usage,
+                has_subcommands: !n.subs.is_empty(),
+                // Global options (--json, --profile…) work everywhere; listing them
+                // under every command would bury the command's own.
+                options: n
+                    .opts
+                    .iter()
+                    .filter(|o| !o.global || n.path.len() == 1)
+                    .map(|o| OptionHelp { flags: opt_words(o), help: o.help.clone(), takes_value: o.values != Values::None })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// `describe` as the JSON `ufop help-json` prints and the bundled snapshot holds.
+pub fn describe_json(cmd: &Command) -> String {
+    serde_json::to_string(&describe(cmd)).unwrap_or_else(|_| "[]".into())
+}
+
+/// The `ufop` commands as of this build, from the snapshot the `ufop` CLI's
+/// own tests keep current (`scripts/gen-cli-help.sh` rewrites it). The
+/// desktop app lists these without needing the CLI installed.
+pub fn bundled_ufop_help() -> Vec<CommandHelp> {
+    serde_json::from_str(include_str!("../data/ufop-cli-help.json")).unwrap_or_default()
 }
 
 /// Identifier-safe form of a binary name (`ufop-server` → `ufop_server`).

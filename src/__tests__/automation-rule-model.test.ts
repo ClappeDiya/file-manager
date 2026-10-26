@@ -11,6 +11,7 @@ import {
   commandLines,
   conditionsSummary,
   defaultAction,
+  earlierResults,
   formFromRule,
   newRuleForm,
   portableRule,
@@ -208,8 +209,14 @@ describe("presets", () => {
         },
         { action: { type: "ai_task", instruction: "Classify {filename}", dest_path: "/ai", suffix: "class.txt", max_chars: 5000 }, continue_on_error: true },
         { action: { type: "scan_for_malware", quarantine_path: "/quarantine/{yyyy}", notify: false }, continue_on_error: false },
+        { action: { type: "list_files", path: "/in", output: "/reports/files-{yyyy}.json", format: "json", recursive: true, include_dirs: true, overwrite: false }, continue_on_error: false, output_as: "listing" },
+        { action: { type: "verify_pair", sync_pair_id: "pair-1", full: true }, continue_on_error: true },
+        { action: { type: "remove_empty_dirs", path: "/in", remove_root: true }, continue_on_error: false },
+        { action: { type: "purge", path: "/in/tmp", max_files: 500 }, continue_on_error: false },
+        { action: { type: "download_url", url: "https://example.com/a.bin", dest_path: "", file_name: "a.bin", overwrite: false, max_mb: 10, sha256: null, allow_private: false, destination_connection_id: "conn-1", destination_protocol: "sftp", remote_path: "/in/{yyyy}" }, continue_on_error: false },
+        { action: { type: "notify", title: "{steps.listing.count} files", body: "{steps.listing.path}" }, continue_on_error: true },
       ],
-      options: { ...newRuleForm().options, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
+      options: { ...newRuleForm().options, notify_profile_id: "profile-1", notify_on: ["warning", "error"], min_bytes: 1048576, source: { path: "/inbox", recursive: true, newest: 5, include_dirs: false }, priority: -1 },
     })), rules.length));
     // A workflow rule: every node kind and edge kind the builder emits.
     rules.push(normalize(ruleFromForm(form({
@@ -234,5 +241,51 @@ describe("presets", () => {
     const json = JSON.stringify(rules, null, 2) + "\n";
     if (process.env.UPDATE_FIXTURES) writeFileSync(FIXTURE, json);
     expect(json).toBe(readFileSync(FIXTURE, "utf8"));
+  });
+});
+
+describe("result names and the new steps", () => {
+  const manual = (steps: RuleForm["steps"]) => form({ trigger: { type: "manual" }, steps });
+  const notify = { type: "notify" as const, title: "{steps.listing.count}", body: "" };
+
+  it("round-trips output_as on the first and later steps, leaving unnamed steps as before", () => {
+    const rule = ruleFromForm(manual([
+      { action: { type: "create_folder", path: "/a" }, continue_on_error: false, output_as: " made " },
+      { action: notify, continue_on_error: true, output_as: "" },
+      { action: { type: "create_folder", path: "/b" }, continue_on_error: false, output_as: "second" },
+    ]));
+    expect(rule.output_as).toBe("made");
+    expect(rule.steps).toEqual([{ action: notify, continue_on_error: true }, { action: { type: "create_folder", path: "/b" }, continue_on_error: false, output_as: "second" }]);
+    const back = formFromRule(rule);
+    expect(back.steps.map((s) => s.output_as ?? null)).toEqual(["made", null, "second"]);
+  });
+
+  it("refuses invalid and repeated result names", () => {
+    const named = (...names: string[]) => validateForm(manual(names.map((n) => ({ action: { type: "create_folder" as const, path: "/a" }, continue_on_error: false, output_as: n }))));
+    expect(named("ok_1", "also-ok")).toEqual([]);
+    expect(named("1bad")).toEqual(['"1bad" is not a valid result name: use letters, digits, _ and -, starting with a letter.']);
+    expect(named("a b")[0]).toContain("not a valid result name");
+    expect(named("same", "same")).toEqual(['The result name "same" is used by more than one step.']);
+  });
+
+  it("lists the earlier results a step can use", () => {
+    expect(earlierResults([{ output_as: "a" }, { output_as: " " }, { output_as: "c" }, { output_as: "d" }], 3)).toEqual(["a", "c"]);
+    expect(earlierResults([{ output_as: "a" }], 0)).toEqual([]);
+  });
+
+  it("validates verify_pair, list_files and purge, and a download to a remote", () => {
+    const one = (a: ReturnType<typeof defaultAction>) => validateForm(manual([{ action: a, continue_on_error: false }]));
+    const base = <T extends ReturnType<typeof defaultAction>["type"]>(t: T) => defaultAction(t) as Extract<ReturnType<typeof defaultAction>, { type: T }>;
+    expect(one(base("verify_pair"))).toEqual(["Action 1: choose a sync pair."]);
+    expect(one({ ...base("verify_pair"), sync_pair_id: "p" })).toEqual([]);
+    expect(one(base("list_files"))).toEqual(["Action 1: choose where to save the listing."]);
+    expect(one({ ...base("list_files"), output: "/o.csv" })).toEqual([]);
+    expect(one(base("purge"))).toEqual(["Action 1: choose the folder to purge."]);
+    expect(one({ ...base("purge"), path: "/x", max_files: 0 })).toEqual(["Action 1: the file limit must be at least 1."]);
+    expect(one({ ...base("purge"), path: "/x", max_files: 10 })).toEqual([]);
+    expect(one(base("remove_empty_dirs"))).toEqual([]);
+    const dl = { ...base("download_url"), url: "https://h/x" };
+    expect(one({ ...dl, destination_connection_id: "c", remote_path: " " })).toEqual(["Action 1: enter the remote folder to upload into."]);
+    expect(one({ ...dl, destination_connection_id: "c", remote_path: "/in", dest_path: "" })).toEqual([]);
   });
 });

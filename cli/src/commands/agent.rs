@@ -870,7 +870,9 @@ mod tests {
             json!({ "id": "c3", "kind": "rpc", "payload": { "command": "backup_diagnose", "args": {} } }),
         ];
         a.cycle().await.unwrap();
-        for _ in 0..200 {
+        // The backup runs in the background; on a loaded machine (the whole
+        // suite in parallel) it can take well over 5 s.
+        for _ in 0..2400 {
             if a.status().pending_reports > 0 {
                 break;
             }

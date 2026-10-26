@@ -28,9 +28,21 @@ impl RollbackManager {
         }
     }
 
-    /// Take a pre-destructive snapshot of a file before it is deleted or overwritten.
+    /// Take a pre-destructive snapshot of a destination file before it is
+    /// deleted or overwritten.
     pub fn snapshot_file(
         &mut self,
+        relative_path: &str,
+        original_path: &Path,
+    ) -> Result<(), AppError> {
+        self.snapshot_on(SyncSide::Dest, relative_path, original_path)
+    }
+
+    /// Take a pre-destructive snapshot of a file on either side of the pair
+    /// (two-way sync also overwrites and deletes source files).
+    pub fn snapshot_on(
+        &mut self,
+        side: SyncSide,
         relative_path: &str,
         original_path: &Path,
     ) -> Result<(), AppError> {
@@ -38,7 +50,10 @@ impl RollbackManager {
             return Ok(());
         }
 
-        let backup_path = self.rollback_dir.join(relative_path);
+        let backup_path = match side {
+            SyncSide::Dest => self.rollback_dir.join(relative_path),
+            SyncSide::Source => self.rollback_dir.join(SOURCE_SIDE_DIR).join(relative_path),
+        };
 
         // Ensure parent directory exists
         if let Some(parent) = backup_path.parent() {
@@ -79,6 +94,7 @@ impl RollbackManager {
             original_size,
             original_modified,
             created_at: Utc::now(),
+            side,
         });
 
         Ok(())
@@ -90,13 +106,27 @@ impl RollbackManager {
     }
 }
 
-/// Undo a sync run by restoring all snapshot files.
+/// Folder inside a run's rollback directory that holds source-side snapshots.
+pub const SOURCE_SIDE_DIR: &str = ".ufop-rollback-source";
+
+/// Undo a sync run by restoring its destination snapshots. Source-side
+/// snapshots (two-way runs) need [`rollback_pair_run`].
 pub fn rollback_sync_run(snapshots: &[SyncSnapshot], dest_root: &Path) -> Result<u64, AppError> {
+    let dest_only: Vec<SyncSnapshot> = snapshots.iter().filter(|s| s.side == SyncSide::Dest).cloned().collect();
+    rollback_pair_run(&dest_only, dest_root, dest_root)
+}
+
+/// Undo a sync run by restoring every snapshot to the side it was taken from.
+pub fn rollback_pair_run(snapshots: &[SyncSnapshot], source_root: &Path, dest_root: &Path) -> Result<u64, AppError> {
     let mut restored: u64 = 0;
 
     for snapshot in snapshots.iter().rev() {
         let backup = Path::new(&snapshot.backup_path);
-        let target = dest_root.join(&snapshot.relative_path);
+        let root = match snapshot.side {
+            SyncSide::Source => source_root,
+            SyncSide::Dest => dest_root,
+        };
+        let target = root.join(&snapshot.relative_path);
 
         if !backup.exists() {
             tracing::warn!(
@@ -121,6 +151,11 @@ pub fn rollback_sync_run(snapshots: &[SyncSnapshot], dest_root: &Path) -> Result
                 message: format!("Cannot restore {}: {}", snapshot.relative_path, e),
                 advice: "Check permissions and disk space.".to_string(),
             })?;
+            // Back as it was, time included: a restored file must not read
+            // as freshly edited to the next (two-way) run.
+            if let Some(modified) = snapshot.original_modified {
+                crate::sync::copier::set_mtime(&target, modified.into());
+            }
         }
 
         restored += 1;
@@ -226,6 +261,26 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Review: restored files got the time of the restore, so a two-way run
+    /// afterwards saw them as freshly edited.
+    #[test]
+    fn rollback_restores_the_original_modification_time() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("file.txt");
+        fs::write(&original, "original").unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 86_400);
+        crate::sync::copier::set_mtime(&original, then);
+        let mut mgr = RollbackManager::new(Uuid::new_v4(), Uuid::new_v4(), &dir.path().join("rollback"));
+        mgr.snapshot_on(SyncSide::Source, "file.txt", &original).unwrap();
+        fs::write(&original, "overwritten").unwrap();
+        assert_eq!(rollback_pair_run(&mgr.snapshots, &root, &dir.path().join("other")).unwrap(), 1);
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+        let restored = chrono::DateTime::<Utc>::from(fs::metadata(&original).unwrap().modified().unwrap());
+        assert_eq!(Some(restored), mgr.snapshots[0].original_modified);
+    }
+
     #[test]
     fn test_snapshot_file() {
         let dir = TempDir::new().unwrap();
@@ -309,6 +364,7 @@ mod tests {
             original_size: 100,
             original_modified: None,
             created_at: Utc::now(),
+            side: SyncSide::Dest,
         };
 
         assert!(is_rollback_valid(&[recent_snapshot]));

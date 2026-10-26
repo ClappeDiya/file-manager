@@ -4,16 +4,25 @@
  * verification (`Stripe-Signature: t=…,v1=HMAC-SHA256(secret, "t.payload")`,
  * 5-minute tolerance, constant-time compare).
  *
+ * A trial is started with `subscription_data[trial_period_days]` and no card up
+ * front (`payment_method_collection=if_required`); a trial that ends without a
+ * payment method is cancelled by Stripe, which returns the organization to the
+ * free plan through `customer.subscription.deleted`.
+ *
  * STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_API_BASE (tests/proxies).
  */
 import crypto from 'crypto';
-import { BillingError, type BillingEvent, type BillingProvider, type Invoice, type SubscriptionStatus } from './provider';
+import { BillingError, type BillingEvent, type BillingProvider, type Discount, type Invoice, type SubscriptionStatus } from './provider';
 
 const TOLERANCE_S = 300;
 
 type Obj = Record<string, unknown>;
 const str = (v: unknown) => (typeof v === 'string' ? v : null);
+const iso = (v: unknown) => (v ? new Date(Number(v) * 1000).toISOString() : null);
 const idOf = (v: unknown) => (typeof v === 'string' ? v : v && typeof v === 'object' ? (str((v as Obj).id) ?? '') : '');
+
+/** Whether a subscription or customer object has a default payment method (an id or an expanded object). */
+const hasDefaultPaymentMethod = (v: Obj) => !!(idOf(v.default_payment_method) || idOf(v.default_source));
 
 /** Stripe's form encoding for nested parameters. */
 function form(params: Record<string, string | number | undefined>): string {
@@ -21,6 +30,23 @@ function form(params: Record<string, string | number | undefined>): string {
     .filter(([, v]) => v !== undefined && v !== '')
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
     .join('&');
+}
+
+/** The coupon of a Stripe discount object, or null. */
+function discountOf(v: unknown): Discount | null {
+  if (!v || typeof v !== 'object') return null;
+  const d = v as Obj;
+  const c = (d.coupon ?? {}) as Obj;
+  if (!c || typeof c !== 'object' || !Object.keys(c).length) return null;
+  const dur = str(c.duration);
+  return {
+    name: str(c.name) ?? str(c.id) ?? 'Discount',
+    percentOff: typeof c.percent_off === 'number' ? c.percent_off : null,
+    amountOff: typeof c.amount_off === 'number' ? c.amount_off : null,
+    currency: str(c.currency)?.toUpperCase() ?? null,
+    duration: dur === 'once' || dur === 'repeating' || dur === 'forever' ? dur : null,
+    endsAt: iso(d.end),
+  };
 }
 
 export class StripeProvider implements BillingProvider {
@@ -62,10 +88,34 @@ export class StripeProvider implements BillingProvider {
       customer_email: o.customerId ? undefined : o.email,
       'subscription_data[metadata][org_id]': o.orgId,
       'metadata[org_id]': o.orgId,
+      allow_promotion_codes: o.allowPromotionCodes ? 'true' : undefined,
+      ...(o.trialDays && o.trialDays > 0
+        ? {
+            'subscription_data[trial_period_days]': o.trialDays,
+            payment_method_collection: 'if_required',
+            'subscription_data[trial_settings][end_behavior][missing_payment_method]': 'cancel',
+          }
+        : {}),
     });
     const url = str(s.url);
     if (!url) throw new BillingError('Stripe did not return a checkout URL');
-    return { url };
+    return { url, id: str(s.id) };
+  }
+
+  async expireCheckout(sessionId: string): Promise<void> {
+    await this.call('POST', `/v1/checkout/sessions/${encodeURIComponent(sessionId)}/expire`);
+  }
+
+  async retrieveCheckout(sessionId: string): Promise<{ status: 'open' | 'complete' | 'expired' }> {
+    const s = await this.call('GET', `/v1/checkout/sessions/${encodeURIComponent(sessionId)}`);
+    const status = str(s.status);
+    if (status !== 'open' && status !== 'complete' && status !== 'expired') throw new BillingError('Stripe returned an unknown checkout session state');
+    return { status };
+  }
+
+  async hasSubscriptions(customerId: string): Promise<boolean> {
+    const r = await this.call('GET', '/v1/subscriptions', { customer: customerId, status: 'all', limit: 1 });
+    return ((r.data as Obj[] | undefined) ?? []).length > 0;
   }
 
   async createPortal(o: { customerId: string; returnUrl: string }) {
@@ -115,7 +165,7 @@ export class StripeProvider implements BillingProvider {
     const meta = (obj.metadata ?? {}) as Obj;
     switch (type) {
       case 'checkout.session.completed':
-        return { kind: 'checkout_completed', id, orgId: str(obj.client_reference_id) ?? str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.subscription) || null };
+        return { kind: 'checkout_completed', id, orgId: str(obj.client_reference_id) ?? str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.subscription) || null, sessionId: str(obj.id) };
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
@@ -129,11 +179,19 @@ export class StripeProvider implements BillingProvider {
           status: (str(obj.status) ?? 'canceled') as SubscriptionStatus,
           priceId: idOf(item.price) || null,
           seats: Number(item.quantity ?? obj.quantity ?? 0),
-          periodEnd: obj.current_period_end ? new Date(Number(obj.current_period_end) * 1000).toISOString() : null,
+          // Newer API versions (a webhook endpoint follows the account's, not the 2024-06-20 of our own calls) move the period to the item and the single discount to discounts[].
+          periodEnd: iso(obj.current_period_end ?? item.current_period_end),
           cancelAtPeriodEnd: !!obj.cancel_at_period_end,
           deleted: type === 'customer.subscription.deleted',
+          trialEnd: iso(obj.trial_end),
+          discount: discountOf(obj.discount ?? ((obj.discounts as unknown[] | undefined) ?? []).find((d) => d && typeof d === 'object')),
+          hasPaymentMethod: hasDefaultPaymentMethod(obj),
         };
       }
+      case 'customer.subscription.trial_will_end':
+        return { kind: 'trial_will_end', id, orgId: str(meta.org_id), customerId: idOf(obj.customer), subscriptionId: idOf(obj.id), trialEnd: iso(obj.trial_end), hasPaymentMethod: hasDefaultPaymentMethod(obj) };
+      case 'customer.updated':
+        return { kind: 'customer', id, customerId: idOf(obj.id), hasPaymentMethod: hasDefaultPaymentMethod({ default_payment_method: (obj.invoice_settings as Obj | undefined)?.default_payment_method, default_source: obj.default_source }) };
       case 'invoice.paid':
       case 'invoice.payment_failed':
         return {

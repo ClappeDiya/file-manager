@@ -24,6 +24,8 @@ mcp = ["dep:base64", "dep:md-5", "dep:sha1"]
 doctext = ["dep:zip", "dep:flate2"]
 # Shell completions and man pages from a clap command tree (`cli_gen` module).
 cli-gen = ["dep:clap"]
+# Named server profiles in the `ufop` CLI's config file (`profiles` module), shared with the desktop app.
+profiles = ["dep:toml"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -58,6 +60,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 tokio = { version = "1", optional = true, features = ["time", "sync", "macros"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
 clap = { version = "4", optional = true, default-features = false, features = ["std", "help"] }
+toml = { version = "0.8", optional = true }
 
 # Backup metadata (xattrs, POSIX ACLs via system.* xattrs), advisory locks,
 # I/O priority and free-space checks.

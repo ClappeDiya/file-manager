@@ -127,7 +127,7 @@ pub fn convert_image(src: &Path, dest: &Path, spec: &ImageSpec) -> Result<(u32, 
 
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dest.with_file_name(format!(".{name}.{}.ufop-tmp", uuid::Uuid::new_v4().simple()));
+    let tmp = dest.with_file_name(crate::connectors::staging_name(&name, &format!(".{}.ufop-tmp", uuid::Uuid::new_v4().simple())));
     std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, dest)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("Cannot write {}: {e}", dest.display())
@@ -235,6 +235,15 @@ mod tests {
         let p = dir.join(name);
         image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x % 256) as u8, (y % 256) as u8, 90, if x < 4 { 0 } else { 255 }])).save(&p).unwrap();
         p
+    }
+
+    // Review (WS-Z2): the temporary name went past 255 bytes for a long name.
+    #[test]
+    fn a_long_name_is_written() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = d.path().join(format!("{}.png", "p".repeat(240)));
+        write_atomic(&dest, b"x").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"x");
     }
 
     #[test]

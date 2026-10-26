@@ -10,6 +10,7 @@ import { useEffect, useState } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useFleetAgentStore } from "@/stores/fleet-agent-store";
 import { DEFAULT_RETENTION, type LogRetention, type SavedBundle } from "@/lib/diagnostics";
+import { useFeedbackDialog } from "@/stores/feedback-store";
 
 const inputCls = "w-24 text-sm px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-transparent";
 const btnCls = "text-sm px-3 py-1.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50";
@@ -90,6 +91,13 @@ export function DiagnosticsSection() {
             </button>
           )}
         </div>
+      </div>
+
+      <div>
+        <label className="block text-xs font-medium mb-1">Feedback</label>
+        <button type="button" className={btnCls} onClick={() => useFeedbackDialog.getState().setOpen(true)}>
+          Send feedback…
+        </button>
       </div>
 
       {error && <p className="text-xs text-red-500">{error}</p>}

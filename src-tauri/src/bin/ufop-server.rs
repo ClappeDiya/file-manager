@@ -688,6 +688,7 @@ async fn run(argv: Vec<String>) {
             basic_auth: a.pushgateway_basic_auth.filter(|s| !s.is_empty()),
             bearer: a.pushgateway_token.filter(|s| !s.is_empty()),
         }),
+        embedded: false,
     };
     if !cfg.mcp_roots.is_empty() {
         let roots = ufop_core::confine::Roots::new(&cfg.mcp_roots).unwrap_or_else(|e| fail(format!("--mcp-root: {e}")));

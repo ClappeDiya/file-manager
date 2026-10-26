@@ -81,9 +81,14 @@ impl SyncTrigger {
     }
 }
 
-/// Selective sync filter configuration.
+/// Selective sync filter configuration. Ordered `rules` decide first; files
+/// no rule matches go through the lists below (see `sync::filter`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncFilter {
+    /// Ordered include/exclude rules, first match wins (the engine backup
+    /// jobs use: wildcard, regex, groups, rclone globs).
+    #[serde(default)]
+    pub rules: Vec<crate::filter_rules::FilterRule>,
     /// Glob patterns to include (empty = include all)
     pub include_patterns: Vec<String>,
     /// Glob patterns to exclude
@@ -114,6 +119,21 @@ pub enum SymlinkMode {
     /// Recreate the link itself at the destination (/SL). Unix only; falls
     /// back to `Follow` elsewhere.
     CopyLink,
+}
+
+/// How a file present on both sides is judged unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareMode {
+    /// Same size and modification time (with the /FFT, /DST tolerances).
+    #[default]
+    SizeMtime,
+    /// Same size and the same content hash (xxHash3, or the hash the
+    /// storage provides). Falls back to size and time, with a note in the
+    /// preview, when no hash is available.
+    Checksum,
+    /// Same size; times are ignored.
+    SizeOnly,
 }
 
 /// Robocopy-equivalent copy options for a sync pair.
@@ -158,6 +178,9 @@ pub struct CopyOptions {
     pub fat_time_tolerance: bool,
     /// Treat an exact 1-hour timestamp difference as equal (/DST).
     pub dst_tolerance: bool,
+    /// How files on both sides are compared (size and time, checksum,
+    /// size only).
+    pub compare_mode: CompareMode,
 
     // ── Destination cleanup ──
     /// Delete destination files that no longer exist in the source (/PURGE).
@@ -165,6 +188,10 @@ pub struct CopyOptions {
     pub purge: bool,
     /// Never delete extra destination files, even in mirror mode (/XX).
     pub exclude_extra: bool,
+    /// Two-way safety stop: refuse a run that would propagate deletions of
+    /// more than this percentage of the files tracked on one side (and of
+    /// everything, when one side looks empty). 0 = no limit.
+    pub two_way_max_delete_percent: u32,
 
     // ── Copy behaviour ──
     /// Preserve file modification times (/COPY:T). On by default.
@@ -243,8 +270,10 @@ impl Default for CopyOptions {
             include_same: false,
             fat_time_tolerance: false,
             dst_tolerance: false,
+            compare_mode: CompareMode::SizeMtime,
             purge: false,
             exclude_extra: false,
+            two_way_max_delete_percent: 50,
             copy_timestamps: true,
             copy_dir_timestamps: false,
             move_files: false,
@@ -398,6 +427,13 @@ pub struct SyncRunOptions {
     /// `{name}.v{num}.{ext}`.
     #[serde(default)]
     pub version_template: Option<String>,
+    /// Where the result of a run is reported (a notification profile).
+    #[serde(flatten)]
+    pub notify: crate::run_notify::RunNotify,
+    /// Versioned-backup mode: keep at most this many versions of each file
+    /// (the oldest go after each run). `None` = keep every version.
+    #[serde(default)]
+    pub keep_versions: Option<u32>,
 }
 
 /// Sync pair configuration (enhanced for T-039..T-042).
@@ -438,6 +474,81 @@ pub struct SyncPair {
     pub checksum_algorithm: SyncHashAlgorithm,
     #[serde(default)]
     pub run_options: SyncRunOptions,
+    /// Copy options the pair sets itself; every other option follows the
+    /// global sync defaults. `None` (pairs from before global defaults, the
+    /// CLI): all of `copy_options` is the pair's own.
+    #[serde(default)]
+    pub option_overrides: Option<Vec<String>>,
+}
+
+impl SyncPair {
+    /// The pair as it runs: its own options over the global `defaults`.
+    /// A two-way pair never inherits moving (/MOV, /MOVE) from the
+    /// defaults: it has no meaning there (see `copier::validate_for_mode`).
+    pub fn effective(&self, defaults: &CopyOptions) -> SyncPair {
+        match &self.option_overrides {
+            Some(own) => {
+                let mut copy_options = self.copy_options.layered_on(defaults, own);
+                if self.mode == SyncMode::TwoWay {
+                    let inherited = |name: &str| !own.iter().any(|n| n == name);
+                    if inherited("move_files") {
+                        copy_options.move_files = false;
+                    }
+                    if inherited("move_dirs") {
+                        copy_options.move_dirs = false;
+                    }
+                }
+                SyncPair { copy_options, ..self.clone() }
+            }
+            None => self.clone(),
+        }
+    }
+}
+
+impl CopyOptions {
+    /// Names of every option (the serialized field names).
+    pub fn field_names() -> Vec<String> {
+        match serde_json::to_value(CopyOptions::default()) {
+            Ok(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Refuse option names a pair claims to set itself
+    /// (`SyncPair::option_overrides`) that are not copy options.
+    pub fn validate_override_names(own: &[String]) -> Result<(), crate::error::AppError> {
+        let known = Self::field_names();
+        match own.iter().find(|n| !known.contains(n)) {
+            Some(bad) => Err(crate::error::AppError::Sync {
+                message: format!("\"{bad}\" is not a copy option."),
+                advice: "Save the pair again from the sync panel.".to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// `defaults`, with this value for every option named in `own`.
+    pub fn layered_on(&self, defaults: &CopyOptions, own: &[String]) -> CopyOptions {
+        let (Ok(serde_json::Value::Object(mut out)), Ok(serde_json::Value::Object(mine))) =
+            (serde_json::to_value(defaults), serde_json::to_value(self))
+        else {
+            return self.clone();
+        };
+        for name in own {
+            if let Some(v) = mine.get(name) {
+                out.insert(name.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| self.clone())
+    }
+
+    /// The options of `self` that differ from `defaults`.
+    pub fn differences_from(&self, defaults: &CopyOptions) -> Vec<String> {
+        let (Ok(serde_json::Value::Object(a)), Ok(serde_json::Value::Object(b))) = (serde_json::to_value(self), serde_json::to_value(defaults)) else {
+            return Vec::new();
+        };
+        a.iter().filter(|(k, v)| b.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect()
+    }
 }
 
 impl Default for SyncPair {
@@ -461,6 +572,7 @@ impl Default for SyncPair {
             dest_state: DestStateMode::Scan,
             checksum_algorithm: SyncHashAlgorithm::Xxh3,
             run_options: SyncRunOptions::default(),
+            option_overrides: None,
         }
     }
 }
@@ -500,6 +612,28 @@ pub enum SyncHealth {
     Gray,
 }
 
+/// Which side of a pair a planned action writes to. One-way, mirror and
+/// versioned modes only ever write to the destination; two-way sync also
+/// copies to, and deletes from, the source.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncDirection {
+    /// Copy from the source into the destination / delete at the destination.
+    #[default]
+    ToDest,
+    /// Copy from the destination into the source / delete at the source.
+    ToSource,
+}
+
+/// The side of a pair a rollback snapshot was taken from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncSide {
+    Source,
+    #[default]
+    Dest,
+}
+
 /// A single file action in a sync plan.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -524,6 +658,9 @@ pub struct SyncDiffEntry {
     pub reason: String,
     /// Path length warning if applicable
     pub path_length_warning: Option<String>,
+    /// Side the action writes to (two-way sync can write to the source).
+    #[serde(default)]
+    pub direction: SyncDirection,
 }
 
 /// Dry-run preview result (T-040).
@@ -556,13 +693,23 @@ pub struct SyncPreview {
     /// Directories to create at the destination (/E empty dirs, /CREATE).
     #[serde(default)]
     pub dirs_to_create: Vec<String>,
-    /// Extra destination directories to remove when purging (/PURGE, /MIR).
+    /// Destination directories to remove: extras when purging (/PURGE,
+    /// /MIR), and in two-way runs folders deleted in the source whose files
+    /// this run deletes.
     #[serde(default)]
     pub dirs_to_remove: Vec<String>,
+    /// Two-way: source directories to remove — folders deleted in the
+    /// destination whose files this run deletes from the source.
+    #[serde(default)]
+    pub source_dirs_to_remove: Vec<String>,
     /// Unchanged files whose timestamps or security get re-applied
     /// (/TIMFIX, /SECFIX).
     #[serde(default)]
     pub fixups: Vec<String>,
+    /// Plain-language notes about how the plan was made (e.g. "first
+    /// two-way run: nothing is deleted").
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// A conflict item for the ask-mode resolution UI (T-041).
@@ -608,6 +755,9 @@ pub struct SyncSnapshot {
     pub original_size: u64,
     pub original_modified: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Side of the pair the file was on (two-way sync also writes to the source).
+    #[serde(default)]
+    pub side: SyncSide,
 }
 
 /// Per-run sync report (T-042).
@@ -636,19 +786,323 @@ pub struct SyncReport {
     /// 2 = extra destination files, 4 = mismatches, 8 = failures, 16 = fatal.
     #[serde(default)]
     pub exit_code: u8,
+    /// Versioned-backup mode: old versions removed by `keep_versions`.
+    #[serde(default)]
+    pub versions_pruned: u64,
+    /// What started the run (set by the sync manager; the executor leaves it manual).
+    #[serde(default)]
+    pub trigger: crate::run_trigger::RunTrigger,
+    /// The run changed more items than [`MAX_RUN_ITEMS`]; `items` holds the
+    /// failures and conflicts first, then the earliest of the rest.
+    #[serde(default)]
+    pub items_truncated: bool,
+    /// What the run did to each file. Never serialized with the report (it
+    /// can hold thousands of rows): the manager stores it in `sync_run_items`
+    /// and hands it out on request.
+    #[serde(skip)]
+    pub items: Vec<SyncRunItem>,
 }
 
-/// Resumable sync state for crash recovery (T-042).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncResumeState {
-    pub run_id: Uuid,
+/// Most changed-item rows kept for one run.
+pub const MAX_RUN_ITEMS: usize = 10_000;
+
+/// What a run did to one file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncItemAction {
+    /// A new file was written.
+    Copied,
+    /// An existing file was overwritten (or a new version stored).
+    Updated,
+    Deleted,
+    /// Copied, then removed from the source (/MOV, /MOVE).
+    Moved,
+    /// Reserved for engines that detect renames; the sync engine reads a
+    /// rename as a delete plus a copy and never reports this.
+    Renamed,
+    Failed,
+    /// A conflict was resolved (or queued for the user).
+    Conflict,
+}
+
+impl SyncItemAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copied => "copied",
+            Self::Updated => "updated",
+            Self::Deleted => "deleted",
+            Self::Moved => "moved",
+            Self::Renamed => "renamed",
+            Self::Failed => "failed",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        [Self::Copied, Self::Updated, Self::Deleted, Self::Moved, Self::Renamed, Self::Failed, Self::Conflict]
+            .into_iter()
+            .find(|a| a.as_str() == s)
+            .unwrap_or(Self::Updated)
+    }
+}
+
+/// One row of a run's changed-items list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRunItem {
+    pub rel_path: String,
+    pub action: SyncItemAction,
+    pub bytes: u64,
+    pub error: Option<String>,
+}
+
+impl SyncRunItem {
+    pub fn done(rel_path: &str, action: SyncItemAction, bytes: u64) -> Self {
+        Self { rel_path: rel_path.to_string(), action, bytes, error: None }
+    }
+
+    pub fn failed(rel_path: &str, bytes: u64, error: String) -> Self {
+        Self { rel_path: rel_path.to_string(), action: SyncItemAction::Failed, bytes, error: Some(error) }
+    }
+}
+
+/// Keeps at most `cap` items: every failure and conflict first (they are
+/// what a reader looks for), then the rest in their original order. Returns
+/// whether anything was dropped.
+pub fn cap_run_items(items: &mut Vec<SyncRunItem>, cap: usize) -> bool {
+    if items.len() <= cap {
+        return false;
+    }
+    let important = |i: &SyncRunItem| matches!(i.action, SyncItemAction::Failed | SyncItemAction::Conflict);
+    let mut room = cap.saturating_sub(items.iter().filter(|i| important(i)).count());
+    let mut kept = Vec::with_capacity(cap);
+    for item in items.drain(..) {
+        if important(&item) {
+            if kept.len() < cap {
+                kept.push(item);
+            }
+        } else if room > 0 {
+            room -= 1;
+            kept.push(item);
+        }
+    }
+    *items = kept;
+    true
+}
+
+/// A step of a run that finished, recorded as it happens so a run that
+/// was interrupted (crash, power loss, cancel) can be resumed: the next run
+/// skips steps whose file is still exactly as it was when the step ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletedStep {
+    pub action: SyncAction,
+    #[serde(default)]
+    pub direction: SyncDirection,
+    /// Size and time of the file the step copied from (or deleted).
+    pub size: Option<u64>,
+    pub modified: Option<DateTime<Utc>>,
+    /// When the step finished: a copy made without kept timestamps got its
+    /// time while the interrupted run wrote it, never later.
+    #[serde(default)]
+    pub done_at: Option<DateTime<Utc>>,
+    /// Versioned backup: the version the step stored. The index is written
+    /// at the end of a run, so a resumed run records it from here.
+    #[serde(default)]
+    pub version: Option<crate::sync::versions::StoredVersion>,
+}
+
+/// The steps an interrupted run of a pair had finished (T-042 crash recovery).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncCheckpoint {
     pub pair_id: Uuid,
-    /// Index of last successfully synced file
-    pub last_completed_index: u64,
-    /// Total files in plan
-    pub total_files: u64,
-    /// Serialized plan state
-    pub plan_json: String,
-    pub started_at: DateTime<Utc>,
-    pub interrupted_at: DateTime<Utc>,
+    /// The run that started the checkpoint.
+    pub run_id: Uuid,
+    pub started_at: Option<DateTime<Utc>>,
+    /// The folders and mode the steps were done against: a checkpoint says
+    /// nothing about a pair that has since been pointed elsewhere.
+    #[serde(default)]
+    pub source_root: String,
+    #[serde(default)]
+    pub dest_root: String,
+    #[serde(default)]
+    pub mode: Option<SyncMode>,
+    pub completed: std::collections::BTreeMap<String, CompletedStep>,
+}
+
+impl SyncCheckpoint {
+    /// An empty checkpoint for a run of `pair` starting now.
+    pub fn for_pair(pair: &SyncPair, run_id: Uuid) -> Self {
+        Self {
+            pair_id: pair.id,
+            run_id,
+            started_at: Some(Utc::now()),
+            source_root: pair.source_path.clone(),
+            dest_root: pair.dest_path.clone(),
+            mode: Some(pair.mode),
+            completed: Default::default(),
+        }
+    }
+
+    /// Whether the checkpoint was written by a run of this pair against the
+    /// same folders in the same mode.
+    pub fn matches(&self, pair: &SyncPair) -> bool {
+        self.pair_id == pair.id && self.source_root == pair.source_path && self.dest_root == pair.dest_path && self.mode == Some(pair.mode)
+    }
+
+    /// Whether `entry` was already done by the interrupted run, against
+    /// files that have not changed since.
+    pub fn covers(&self, entry: &SyncDiffEntry) -> bool {
+        let Some(step) = self.completed.get(&entry.relative_path) else {
+            return false;
+        };
+        let (size, modified) = CompletedStep::origin(entry);
+        // A copy that finished before the crash is planned again as an
+        // overwrite ("modify"), so add and modify count as the same step.
+        let deletes = |a: &SyncAction| *a == SyncAction::Delete;
+        deletes(&step.action) == deletes(&entry.action)
+            && step.direction == entry.direction
+            && step.size == size
+            && step.modified == modified
+    }
+}
+
+impl CompletedStep {
+    /// The step that finishing `entry` records.
+    pub fn of(entry: &SyncDiffEntry) -> Self {
+        let (size, modified) = Self::origin(entry);
+        Self { action: entry.action.clone(), direction: entry.direction, size, modified, done_at: Some(Utc::now()), version: None }
+    }
+
+    /// Size and time of the side `entry` copies from (or deletes).
+    fn origin(entry: &SyncDiffEntry) -> (Option<u64>, Option<DateTime<Utc>>) {
+        let from_source = match entry.action {
+            SyncAction::Delete => entry.direction == SyncDirection::ToSource,
+            _ => entry.direction == SyncDirection::ToDest,
+        };
+        if from_source {
+            (entry.source_size, entry.source_modified)
+        } else {
+            (entry.dest_size, entry.dest_modified)
+        }
+    }
+}
+
+/// One file both sides of a two-way pair agreed on at the end of the last
+/// successful run, and what each side looked like then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaselineEntry {
+    pub size: u64,
+    pub source_modified: Option<DateTime<Utc>>,
+    pub dest_modified: Option<DateTime<Utc>>,
+    /// Content hash (checksum comparison), when one was computed.
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+/// What a two-way pair looked like after its last successful run. The
+/// planner compares each side against it: a file missing on one side but
+/// unchanged on the other was deleted (so the deletion is propagated), a
+/// file changed on both sides is a conflict. No baseline (first run) means
+/// a plain union that never deletes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncBaseline {
+    /// Roots the baseline was recorded for; one recorded for other folders
+    /// is never used.
+    pub source_root: String,
+    pub dest_root: String,
+    pub run_id: Option<Uuid>,
+    pub recorded_at: Option<DateTime<Utc>>,
+    pub entries: std::collections::BTreeMap<String, BaselineEntry>,
+}
+
+impl SyncBaseline {
+    /// An empty baseline for `pair`'s folders.
+    pub fn for_pair(pair: &SyncPair) -> Self {
+        Self { source_root: pair.source_path.clone(), dest_root: pair.dest_path.clone(), ..Default::default() }
+    }
+
+    /// Whether this baseline describes `pair`'s current folders.
+    pub fn matches(&self, pair: &SyncPair) -> bool {
+        self.source_root == pair.source_path && self.dest_root == pair.dest_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn options_layer_over_global_defaults() {
+        let defaults = CopyOptions { retries: 5, threads: 4, ..CopyOptions::default() };
+        let own = CopyOptions { threads: 16, exclude_hidden: true, ..CopyOptions::default() };
+        let layered = own.layered_on(&defaults, &["threads".to_string()]);
+        assert_eq!((layered.threads, layered.retries, layered.exclude_hidden), (16, 5, false));
+        // Pairs from before defaults keep everything they have.
+        let legacy = SyncPair { copy_options: own.clone(), ..Default::default() };
+        assert_eq!(legacy.effective(&defaults).copy_options, own);
+        let layered_pair = SyncPair { copy_options: own.clone(), option_overrides: Some(vec!["exclude_hidden".into()]), ..Default::default() };
+        let eff = layered_pair.effective(&defaults).copy_options;
+        assert_eq!((eff.threads, eff.retries, eff.exclude_hidden), (4, 5, true));
+        let mut diff = own.differences_from(&CopyOptions::default());
+        diff.sort();
+        assert_eq!(diff, vec!["exclude_hidden".to_string(), "threads".to_string()]);
+        assert!(CopyOptions::field_names().contains(&"compare_mode".to_string()));
+        // Old JSON without the field reads as "all its own".
+        let json = serde_json::to_value(SyncPair::default()).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("option_overrides");
+        let back: SyncPair = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert!(back.option_overrides.is_none());
+    }
+
+    /// Review: a two-way pair layered on global defaults with /MOV turned on
+    /// would move files and copy them back on the next run.
+    #[test]
+    fn two_way_pairs_never_inherit_move_from_the_defaults() {
+        let defaults = CopyOptions { move_files: true, move_dirs: true, retries: 7, ..CopyOptions::default() };
+        let two_way = SyncPair { mode: SyncMode::TwoWay, option_overrides: Some(vec!["threads".into()]), ..Default::default() };
+        let eff = two_way.effective(&defaults).copy_options;
+        assert!(!eff.move_files && !eff.move_dirs);
+        assert_eq!(eff.retries, 7, "other defaults still apply");
+        let one_way = SyncPair { mode: SyncMode::OneWay, ..two_way };
+        let eff = one_way.effective(&defaults).copy_options;
+        assert!(eff.move_files && eff.move_dirs);
+    }
+
+    fn item(path: &str, action: SyncItemAction) -> SyncRunItem {
+        SyncRunItem::done(path, action, 1)
+    }
+
+    #[test]
+    fn run_items_over_the_cap_keep_failures_and_conflicts_first() {
+        let mut items: Vec<SyncRunItem> = (0..10).map(|i| item(&format!("ok{i}"), SyncItemAction::Copied)).collect();
+        items.push(SyncRunItem::failed("bad", 0, "denied".into()));
+        items.push(item("clash", SyncItemAction::Conflict));
+        assert!(cap_run_items(&mut items, 5));
+        assert_eq!(items.len(), 5);
+        let paths: Vec<&str> = items.iter().map(|i| i.rel_path.as_str()).collect();
+        assert!(paths.contains(&"bad") && paths.contains(&"clash"), "{paths:?}");
+        // The rest are the earliest copies, in order.
+        assert_eq!(paths.iter().filter(|p| p.starts_with("ok")).copied().collect::<Vec<_>>(), vec!["ok0", "ok1", "ok2"]);
+    }
+
+    #[test]
+    fn run_items_under_the_cap_are_untouched() {
+        let mut items = vec![item("a", SyncItemAction::Copied)];
+        assert!(!cap_run_items(&mut items, 5));
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn run_items_of_only_failures_never_exceed_the_cap() {
+        let mut items: Vec<SyncRunItem> = (0..8).map(|i| SyncRunItem::failed(&format!("f{i}"), 0, "x".into())).collect();
+        assert!(cap_run_items(&mut items, 3));
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn item_actions_round_trip_through_their_stored_names() {
+        for a in [SyncItemAction::Copied, SyncItemAction::Updated, SyncItemAction::Deleted, SyncItemAction::Moved, SyncItemAction::Renamed, SyncItemAction::Failed, SyncItemAction::Conflict] {
+            assert_eq!(SyncItemAction::from_str_lossy(a.as_str()), a);
+        }
+    }
 }

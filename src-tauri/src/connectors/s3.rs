@@ -399,10 +399,7 @@ impl S3Connector {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AppError::Connection {
-                message: format!("S3 list buckets failed (HTTP {status}): {body}"),
-                advice: "Check your access key and permissions.".to_string(),
-            });
+            return Err(s3_status_error(format!("S3 list buckets failed (HTTP {status}): {body}"), status.as_u16(), &body, "Check your access key and permissions."));
         }
 
         let body = resp.text().await.map_err(|e| AppError::Connection {
@@ -513,10 +510,7 @@ impl S3Connector {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(AppError::Connection {
-                message: format!("S3 list objects failed (HTTP {status}): {body}"),
-                advice: "Check your bucket name and permissions.".to_string(),
-            });
+            return Err(s3_status_error(format!("S3 list objects failed (HTTP {status}): {body}"), status.as_u16(), &body, "Check your bucket name and permissions."));
         }
 
         let body = resp.text().await.map_err(|e| AppError::Connection {
@@ -2236,6 +2230,25 @@ impl S3Connector {
         key: &str,
         version_id: &str,
     ) -> Result<(), AppError> {
+        let copy_source = format!(
+            "/{bucket}/{}?versionId={}",
+            percent_encode_path(key),
+            percent_encoding::percent_encode(version_id.as_bytes(), S3_ENCODE_SET)
+        );
+        self.put_copy(bucket, key, &copy_source, "S3 version restore", "Check bucket permissions and versioning config.").await?;
+        tracing::info!("Restored s3://{bucket}/{key} to version {version_id}");
+        Ok(())
+    }
+
+    /// Server-side copy of `src_bucket/src_key` to `dst_bucket/dst_key`
+    /// (CopyObject; objects up to 5 GB).
+    pub async fn copy_object(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> Result<(), AppError> {
+        let copy_source = format!("/{src_bucket}/{}", percent_encode_path(src_key));
+        self.put_copy(dst_bucket, dst_key, &copy_source, "S3 copy", "Check you may read the source and write the destination.").await
+    }
+
+    /// PUT `bucket/key` with `x-amz-copy-source` (CopyObject).
+    async fn put_copy(&self, bucket: &str, key: &str, copy_source: &str, what: &str, advice: &str) -> Result<(), AppError> {
         let state = self.state.read().await;
         let state = state.as_ref().ok_or_else(|| AppError::Connection {
             message: "Not connected to S3".to_string(),
@@ -2256,11 +2269,6 @@ impl S3Connector {
             format!("/{encoded_key}")
         };
 
-        let copy_source = format!(
-            "/{bucket}/{encoded_key}?versionId={}",
-            percent_encoding::percent_encode(version_id.as_bytes(), S3_ENCODE_SET)
-        );
-
         let headers = self.sign_request(
             &state.credentials,
             "PUT",
@@ -2274,28 +2282,26 @@ impl S3Connector {
         for (k, v) in &headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        req = req.header("x-amz-copy-source", &copy_source);
+        req = req.header("x-amz-copy-source", copy_source);
         if !state.credentials.path_style {
             let host = self.bucket_host(&state.credentials, bucket);
             req = req.header("Host", &host);
         }
 
         let resp = req.send().await.map_err(|e| AppError::Transfer {
-            message: format!("S3 version restore failed: {e}"),
+            message: format!("{what} failed: {e}"),
             advice: "Check your network connection.".to_string(),
         })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
             return Err(AppError::Transfer {
-                message: format!("S3 version restore failed (HTTP {status}): {body}"),
-                advice: "Check bucket permissions and versioning config.".to_string(),
+                message: format!("{what} failed (HTTP {status}): {body}"),
+                advice: advice.to_string(),
             });
         }
-
-        tracing::info!("Restored s3://{bucket}/{key} to version {version_id}");
-        Ok(())
+        copy_reply_ok(&body).map_err(|reason| AppError::Transfer { message: format!("{what} failed: {reason}"), advice: advice.to_string() })
     }
 
     // ── Internal helpers ──
@@ -2697,6 +2703,20 @@ impl S3Connector {
     }
 }
 
+/// Whether a 2xx CopyObject reply reports a copy. S3 may answer 200 and
+/// still fail the copy, with an `<Error>` body; a successful copy always
+/// returns `<CopyObjectResult>`.
+fn copy_reply_ok(body: &str) -> Result<(), String> {
+    if body.contains("<Error>") {
+        let field = |tag: &str| body.split(&format!("<{tag}>")).nth(1).and_then(|r| r.split(&format!("</{tag}>")).next()).unwrap_or_default().to_string();
+        return Err(format!("S3 reported {} {}", field("Code"), field("Message")).trim_end().to_string());
+    }
+    if !body.contains("<CopyObjectResult") {
+        return Err("S3 did not confirm the copy".to_string());
+    }
+    Ok(())
+}
+
 impl Default for S3Connector {
     fn default() -> Self {
         Self::new()
@@ -2704,6 +2724,33 @@ impl Default for S3Connector {
 }
 
 impl Connector for S3Connector {
+    /// CopyObject between `/bucket/key` paths of this connection.
+    fn server_copy(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move {
+            let (sb, sk) = super::split_bucket_key(&from)?;
+            let (db, dk) = super::split_bucket_key(&to)?;
+            self.copy_object(&sb, &sk, &db, &dk).await.map(|()| true)
+        })
+    }
+
+    /// S3 has no rename: a file is copied on the server, then the original
+    /// deleted. Folders (prefixes) are moved file by file by the caller.
+    fn rename_entry(&self, from: &str, to: &str) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move {
+            if from.ends_with('/') {
+                return Err(AppError::validation("S3 folders are moved file by file"));
+            }
+            let (sb, sk) = super::split_bucket_key(&from)?;
+            let (db, dk) = super::split_bucket_key(&to)?;
+            self.copy_object(&sb, &sk, &db, &dk).await?;
+            // Delete the original only once the copy is there.
+            self.get_object_properties(&db, &dk).await.map_err(|e| AppError::transfer(format!("The copy of {from} could not be confirmed ({e}); the original was kept."), "Check the destination, then retry."))?;
+            self.delete_object(&sb, &sk).await
+        })
+    }
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
@@ -3528,6 +3575,30 @@ fn parse_object_versions_xml(xml: &str, key_filter: &str) -> Vec<S3ObjectVersion
     versions
 }
 
+/// An S3 error reply: rejected keys (401, or 403 with `InvalidAccessKeyId`,
+/// `SignatureDoesNotMatch`, `ExpiredToken`…) are authentication failures,
+/// which are not retried; a plain 403 (bucket policy) is not.
+pub(crate) fn s3_status_error(message: String, status: u16, body: &str, advice: &str) -> AppError {
+    const REJECTED: &[&str] = &["InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken", "InvalidToken", "TokenRefreshRequired", "InvalidClientTokenId"];
+    if status == 401 || (status == 403 && REJECTED.iter().any(|c| body.contains(&format!("<Code>{c}</Code>")))) {
+        AppError::auth(message, "Check the access key ID and secret (they were refused).")
+    } else {
+        AppError::connection(message, advice)
+    }
+}
+
+#[cfg(test)]
+mod auth_error_tests {
+    #[test]
+    fn rejected_keys_are_auth_failures_but_policy_denials_are_not() {
+        let e = super::s3_status_error("x".into(), 403, "<Error><Code>SignatureDoesNotMatch</Code></Error>", "a");
+        assert!(e.is_auth_failure());
+        assert!(super::s3_status_error("x".into(), 403, "<Error><Code>InvalidAccessKeyId</Code></Error>", "a").is_auth_failure());
+        assert!(!super::s3_status_error("x".into(), 403, "<Error><Code>AccessDenied</Code></Error>", "a").is_auth_failure());
+        assert!(!super::s3_status_error("x".into(), 500, "", "a").is_auth_failure());
+    }
+}
+
 #[cfg(test)]
 mod share_tests {
     use super::*;
@@ -3938,10 +4009,11 @@ mod tests {
                     m.as_str(), uri.path(), &[], &signed, "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", "s3",
                 );
                 log.lock().unwrap().push(format!("{} {}", uri.path(), h["x-amz-copy-source"].to_str().unwrap()));
+                // What S3 answers a CopyObject (an empty 200 is no copy).
                 if h["authorization"].to_str().unwrap() == expected {
-                    axum::http::StatusCode::OK
+                    (axum::http::StatusCode::OK, COPY_RESULT)
                 } else {
-                    axum::http::StatusCode::FORBIDDEN
+                    (axum::http::StatusCode::FORBIDDEN, "")
                 }
             }
         });
@@ -3954,5 +4026,73 @@ mod tests {
             seen.lock().unwrap()[0],
             "/bucket/dir/my%20file.txt /bucket/dir/my%20file.txt?versionId=v1"
         );
+    }
+
+    /// Pane copies inside one S3 connection run as CopyObject (signed like
+    /// the other requests); a rename is that copy, then a delete.
+    #[tokio::test]
+    async fn server_copy_and_rename_use_copy_object() {
+        use axum::http::{HeaderMap, Method, Uri};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let src = h.get("x-amz-copy-source").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                log.lock().unwrap().push(format!("{m} {} {src}", uri.path()));
+                (axum::http::StatusCode::OK, if src.is_empty() { "" } else { COPY_RESULT })
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = connected(base).await;
+        assert!(c.server_copy("/bucket/in/a b.txt", "/other/out/a b.txt").await.unwrap());
+        c.rename_entry("/bucket/in/x.txt", "/bucket/in/y.txt").await.unwrap();
+        assert!(c.rename_entry("/bucket/in/", "/bucket/out/").await.is_err());
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log[0], "PUT /other/out/a%20b.txt /bucket/in/a%20b.txt");
+        assert_eq!(log[1], "PUT /bucket/in/y.txt /bucket/in/x.txt");
+        assert!(log[2].starts_with("HEAD /bucket/in/y.txt"), "the copy is confirmed first: {log:?}");
+        assert!(log[3].starts_with("DELETE /bucket/in/x.txt"));
+    }
+
+    /// A CopyObject reply S3 sends on success.
+    const COPY_RESULT: &str = r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>"e"</ETag></CopyObjectResult>"#;
+
+    /// Regression (data loss): S3 can fail a CopyObject after answering
+    /// 200, with an `<Error>` body. The copy was taken as done, so a rename
+    /// (copy, then delete) deleted the only copy. Now the reply must report
+    /// the copy, and a rename confirms the copy before deleting the source.
+    #[tokio::test]
+    async fn a_copy_failed_inside_a_200_reply_never_deletes_the_source() {
+        use axum::http::{HeaderMap, Method, Uri};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |m: Method, uri: Uri, h: HeaderMap| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(format!("{m} {}", uri.path()));
+                match (m.as_str(), h.contains_key("x-amz-copy-source"), uri.path()) {
+                    ("PUT", true, p) if p.ends_with("err.txt") => (axum::http::StatusCode::OK, r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>"#),
+                    ("PUT", true, p) if p.ends_with("empty.txt") => (axum::http::StatusCode::OK, ""),
+                    ("PUT", true, _) => (axum::http::StatusCode::OK, COPY_RESULT),
+                    // The copy is not there after all.
+                    ("HEAD", _, _) => (axum::http::StatusCode::NOT_FOUND, ""),
+                    _ => (axum::http::StatusCode::OK, ""),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = connected(base).await;
+        let err = c.rename_entry("/bucket/in/x.txt", "/bucket/in/err.txt").await.unwrap_err();
+        assert!(err.to_string().contains("InternalError"), "{err}");
+        assert!(c.server_copy("/bucket/in/x.txt", "/bucket/in/err.txt").await.is_err());
+        assert!(c.rename_entry("/bucket/in/x.txt", "/bucket/in/empty.txt").await.is_err(), "no CopyObjectResult, no copy");
+        assert!(c.rename_entry("/bucket/in/x.txt", "/bucket/in/ok.txt").await.is_err(), "a copy HEAD cannot find is not confirmed");
+        let log = seen.lock().unwrap().clone();
+        assert!(!log.iter().any(|l| l.starts_with("DELETE")), "the source was never deleted: {log:?}");
     }
 }

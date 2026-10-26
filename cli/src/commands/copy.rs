@@ -129,6 +129,8 @@ async fn run_once(pair: &SyncPair, format: &OutputFormat, cancel: Arc<AtomicBool
         resume_from: None,
         quarantine_dir: Some(state_dir().join("quarantine")),
         rollback_dir: Some(state_dir().join("rollback").join(run_id.to_string())),
+        // `ufop copy` is a one-shot copy: no two-way baseline.
+        baseline: None,
     };
     let human = matches!(format, OutputFormat::Human);
     let bar = human.then(|| {
@@ -156,6 +158,8 @@ async fn run_once(pair: &SyncPair, format: &OutputFormat, cancel: Arc<AtomicBool
             }
         })),
         cancel: Some(cancel),
+        on_step: None,
+        on_file: None,
     };
 
     let result =

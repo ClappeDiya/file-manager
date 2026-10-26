@@ -298,7 +298,9 @@ impl AgentHost for BackupHost {
     }
 
     fn run_backup(&self, job_id: String) -> BoxFuture<'_, Result<Value, AppError>> {
-        Box::pin(async move { Ok(json!({ "taskId": self.mgr.start_backup(&job_id, false).await? })) })
+        Box::pin(crate::backup_engine::trigger::scoped(ufop_core::run_trigger::RunTrigger::Api, async move {
+            Ok(json!({ "taskId": self.mgr.start_backup(&job_id, false).await? }))
+        }))
     }
 
     fn store_credential(&self, credential_id: String, secret: Option<String>) -> BoxFuture<'_, Result<(), AppError>> {

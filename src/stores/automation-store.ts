@@ -7,6 +7,8 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import type { RunNotify } from "@/lib/run-notify";
+import { fetchUpcomingRuns, nextRunsById } from "@/lib/upcoming-runs";
 
 // ── Types (mirrors Rust enums) ──
 
@@ -79,6 +81,11 @@ export type RuleAction =
       max_mb: number;
       sha256: string | null;
       allow_private: boolean;
+      /** Send the download straight to a saved connection instead of a folder. */
+      destination_connection_id?: string | null;
+      destination_protocol?: string | null;
+      /** Remote folder (a template) the file is uploaded into. */
+      remote_path?: string | null;
     }
   /** Resize and/or change an image's format; the result (in `dest_path`, empty = same folder) is handed on. */
   | { type: "convert_image"; format: ImageFormat | null; max_width: number | null; max_height: number | null; quality: number | null; dest_path: string }
@@ -89,7 +96,17 @@ export type RuleAction =
   /** The local AI model applies `instruction` to the file's text; the answer is saved as `<name>.<suffix>`. */
   | { type: "ai_task"; instruction: string; dest_path: string; suffix: string; max_chars: number }
   /** Scan with ClamAV; an infected file is moved to `quarantine_path` and the step fails. */
-  | { type: "scan_for_malware"; quarantine_path: string; notify: boolean };
+  | { type: "scan_for_malware"; quarantine_path: string; notify: boolean }
+  /** Compare a sync pair's two sides; fails the step when files differ (`full`: contents, not just sizes). */
+  | { type: "verify_pair"; sync_pair_id: string; full: boolean }
+  /** Remove empty folders under `path` (empty = the triggering folder), deepest first. */
+  | { type: "remove_empty_dirs"; path: string; remove_root: boolean }
+  /** Write a CSV/JSON listing of the files under `path` to `output`. */
+  | { type: "list_files"; path: string; output: string; format: ListFormat; recursive: boolean; include_dirs: boolean; overwrite: boolean }
+  /** Remove a folder and everything in it. High risk; guarded by the safety interlock. */
+  | { type: "purge"; path: string; max_files: number | null };
+
+export type ListFormat = "csv" | "json";
 
 /** `validate::MemberRule`: files matching `pattern` must number `min..=max`, each at least `min_bytes`. */
 export interface MemberRule {
@@ -145,7 +162,9 @@ export interface SourceSelection {
   include_dirs: boolean;
 }
 
-export interface RuleOptions {
+export type { RunNotify, RunResult } from "@/lib/run-notify";
+
+export interface RuleOptions extends RunNotify {
   overwrite: OverwritePolicy;
   retry: RetryPolicy;
   priority: number;
@@ -160,6 +179,8 @@ export interface RuleOptions {
 export interface ActionStep {
   action: RuleAction;
   continue_on_error: boolean;
+  /** Name the step's result is saved under: later steps use {steps.<name>.files|count|bytes|path}. */
+  output_as?: string | null;
 }
 
 export interface AutomationRule {
@@ -169,6 +190,8 @@ export interface AutomationRule {
   trigger: RuleTrigger;
   conditions: RuleCondition[];
   action: RuleAction;
+  /** Result name of `action` (each further step names its own). */
+  output_as?: string | null;
   created_at: string;
   updated_at: string;
   last_triggered: string | null;
@@ -194,7 +217,7 @@ export type WorkflowNodeKind =
   | { kind: "join"; all: boolean }
   | { kind: "sub_rule"; rule_id: string };
 
-export type WorkflowNode = WorkflowNodeKind & { id: string; label: string; x: number; y: number };
+export type WorkflowNode = WorkflowNodeKind & { id: string; label: string; x: number; y: number; output_as?: string | null };
 
 export interface WorkflowEdge {
   from: string;
@@ -214,6 +237,13 @@ export interface RuleRevision {
   workflow: boolean;
   actions: number;
   rule: AutomationRule;
+}
+
+/** `automation_engine::risk::StepRisk`: how risky a step is, with the safety interlock's levels. */
+export type RiskLevel = "low" | "medium" | "high";
+export interface StepRisk {
+  level: RiskLevel;
+  reason: string;
 }
 
 export interface StepResult {
@@ -275,6 +305,8 @@ interface AutomationState {
   rules: AutomationRule[];
   logs: AutomationLog[];
   suggestions: QuickflowSuggestion[];
+  /** Next scheduled run of each scheduled rule, by rule id (RFC 3339). */
+  nextRuns: Record<string, string>;
   loading: boolean;
   nlParsing: boolean;
   editorRule: Partial<AutomationRule> | null;
@@ -287,6 +319,8 @@ interface AutomationState {
 
   // Data Actions
   loadRules: () => Promise<void>;
+  /** Refresh "Next run" for scheduled rules. */
+  loadNextRuns: () => Promise<void>;
   /** Resolve to the saved rule; reject with the backend's message. */
   createRule: (rule: AutomationRule) => Promise<AutomationRule>;
   updateRule: (rule: AutomationRule) => Promise<AutomationRule>;
@@ -335,6 +369,7 @@ export const useAutomationStore = create<AutomationState>()(
       rules: [],
       logs: [],
       suggestions: [],
+      nextRuns: {},
       loading: false,
       nlParsing: false,
       editorRule: null,
@@ -360,6 +395,10 @@ export const useAutomationStore = create<AutomationState>()(
           console.error("Failed to load automation rules:", e);
           set({ loading: false });
         }
+      },
+
+      loadNextRuns: async () => {
+        set({ nextRuns: nextRunsById(await fetchUpcomingRuns(), "automation") });
       },
 
       createRule: async (rule) => {

@@ -364,7 +364,7 @@ impl SftpConnector {
             SshAuthMethod::Password { password } => {
                 session
                     .userauth_password(username, password)
-                    .map_err(|e| AppError::Connection {
+                    .map_err(|e| AppError::Authentication {
                         message: format!("Password authentication failed: {e}"),
                         advice: "Check your username and password.".to_string(),
                     })?;
@@ -381,7 +381,7 @@ impl SftpConnector {
                         key_path,
                         passphrase.as_deref(),
                     )
-                    .map_err(|e| AppError::Connection {
+                    .map_err(|e| AppError::Authentication {
                         message: format!("Public key authentication failed: {e}"),
                         advice: "Check your SSH key path and passphrase.".to_string(),
                     })?;
@@ -1038,6 +1038,12 @@ impl Default for SftpConnector {
 // ── Connector trait implementation ──
 
 impl super::Connector for SftpConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.rename(&from, &to).await })
+    }
+
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
@@ -1231,16 +1237,26 @@ impl super::Connector for SftpConnector {
         profile: &ConnectionProfile,
         secret: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
+        self.connect_with_secrets(profile, super::ConnectionSecrets::new(secret))
+    }
+
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        secrets: super::ConnectionSecrets,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
         let profile = profile.clone();
         Box::pin(async move {
             {
                 let mut cfg = self.config.write().await;
                 // A stored secret that is an existing file is a private key
-                // (the connection form stores the picked key path there);
-                // anything else is a password; no secret means the SSH agent.
-                cfg.auth_method = match secret.filter(|s| !s.is_empty()) {
+                // (the connection form stores the picked key path there),
+                // unlocked with the stored passphrase; anything else is a
+                // password; no secret means the SSH agent.
+                let passphrase = secrets.key_passphrase.filter(|p| !p.is_empty());
+                cfg.auth_method = match secrets.secret.filter(|s| !s.is_empty()) {
                     Some(s) if Path::new(&s).is_file() => {
-                        SshAuthMethod::PublicKey { private_key_path: s, passphrase: None }
+                        SshAuthMethod::PublicKey { private_key_path: s, passphrase }
                     }
                     Some(s) => SshAuthMethod::Password { password: s },
                     None => SshAuthMethod::Agent,
@@ -2282,6 +2298,29 @@ mod tests {
             let json = serde_json::to_string(mode).unwrap();
             let _: HostKeyVerification = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    /// Regression: the key passphrase from the saved connection never
+    /// reached the SSH config (it was always `None`).
+    #[tokio::test]
+    async fn stored_key_passphrase_reaches_the_ssh_config() {
+        use super::super::{ConnectionSecrets, Connector};
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let key_path = key.path().to_string_lossy().to_string();
+        let c = SftpConnector::new();
+        // Port 1 on loopback refuses at once; only the config matters here.
+        let p = crate::connectors::live_tests::profile(ConnectionProtocol::Sftp, "127.0.0.1", Some(1), "u", "/");
+        let _ = c.connect_with_secrets(&p, ConnectionSecrets { secret: Some(key_path.clone()), key_passphrase: Some("correct horse".into()) }).await;
+        match &c.config.read().await.auth_method {
+            SshAuthMethod::PublicKey { private_key_path, passphrase } => {
+                assert_eq!(private_key_path, &key_path);
+                assert_eq!(passphrase.as_deref(), Some("correct horse"));
+            }
+            other => panic!("expected key auth, got {other:?}"),
+        }
+        // A password is still a password; the passphrase is not used.
+        let _ = c.connect_with_secrets(&p, ConnectionSecrets { secret: Some("pw".into()), key_passphrase: Some("x".into()) }).await;
+        assert!(matches!(&c.config.read().await.auth_method, SshAuthMethod::Password { password } if password == "pw"));
     }
 
     #[tokio::test]

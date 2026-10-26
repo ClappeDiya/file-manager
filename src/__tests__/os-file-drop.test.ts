@@ -52,4 +52,35 @@ describe("OS file drop", () => {
     expect(await handleOsDrop({ type: "drop", paths: ["/tmp/a"], position: { x: 500, y: 0 } }, 1)).toBeNull();
     expect(mockInvoke).not.toHaveBeenCalled();
   });
+
+  /** Regression: at the root folder a file's parent ("" before) never
+   *  matched "/", so dropping the pane's own files copied them onto
+   *  themselves. */
+  it("ignores the pane's own files at the root folder too", async () => {
+    pane.setAttribute(OS_DROP_ATTR, "/");
+    expect(await handleOsDrop({ type: "drop", paths: ["/self.txt"], position: { x: 10, y: 10 } }, 1)).toBeNull();
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it("uploads files dropped on a connection folder through the transfer queue", async () => {
+    const id = "6f1c2b0a-1111-4222-8333-944455556666";
+    pane.setAttribute(OS_DROP_ATTR, `conn://${id}/inbox`);
+    mockInvoke.mockImplementation(async (cmd: string) =>
+      cmd === "get_file_metadata"
+        ? { name: "a.txt", path: "/tmp/a.txt", is_dir: false, is_symlink: false, size: 4, modified: null, created: null, is_hidden: false, extension: "txt", permissions: null }
+        : cmd === "list_connections"
+          ? [{ id, name: "Work", protocol: "sftp", remote_path: "/" }]
+          : cmd === "enqueue_location_transfer"
+            ? { jobs: [], moved: [], folders_created: 0 }
+            : [],
+    );
+    await handleOsDrop({ type: "drop", paths: ["/tmp/a.txt"], position: { x: 10, y: 10 } }, 1);
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_location_transfer", {
+      items: [{ path: "/tmp/a.txt", name: "a.txt", is_dir: false, size: 4, extension: "txt" }],
+      destDir: `conn://${id}/inbox`,
+      mode: "copy",
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("copy_files", expect.anything());
+  });
 });
+

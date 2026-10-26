@@ -491,6 +491,20 @@ If the user wants to encrypt, set intent to "vault".{context_hint}"#
                 ],
                 related_docs: vec!["Connection Troubleshooting".to_string()],
             },
+            AppError::Authentication { message, advice } => ErrorExplanation {
+                original_error: message.clone(),
+                plain_language: format!("The service rejected the sign-in: {message}"),
+                possible_causes: vec![
+                    "The password, key or token is wrong or has been changed".to_string(),
+                    "The access was revoked or has expired".to_string(),
+                    "The account lacks permission for this location".to_string(),
+                ],
+                suggested_fixes: vec![
+                    advice.clone(),
+                    "Edit the connection and enter the current credentials, then click Retry".to_string(),
+                ],
+                related_docs: vec!["Connection Troubleshooting".to_string()],
+            },
             AppError::Transfer { message, advice } => ErrorExplanation {
                 original_error: message.clone(),
                 plain_language: format!("The file transfer was interrupted: {message}"),

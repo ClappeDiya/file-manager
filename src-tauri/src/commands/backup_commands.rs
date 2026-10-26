@@ -3,7 +3,7 @@
 
 use crate::backup_engine::{
     api, portability, BackupDestination, BackupJob, BackupManager, BackupOperation, BackupRun,
-    Fileset, OperationResult, SchedulerStatus,
+    Fileset, OperationResult, ReplicaHistoryFilter, ReplicaRun, SchedulerStatus,
 };
 use crate::backup_engine::defaults::{GlobalDefaults, SavedDestination};
 use crate::backup_engine::{DatabaseCleanupReport, DatabaseEntry};
@@ -42,6 +42,12 @@ pub async fn backup_get_job(id: String, mgr: State<'_, BackupManager>) -> Result
 #[tauri::command]
 pub async fn backup_save_job(job: BackupJob, passphrase: Option<String>, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
     mgr.save_job(job, passphrase).await
+}
+
+/// Copy a job as "<name> (copy)": new id, no history, schedules off.
+#[tauri::command]
+pub async fn duplicate_backup_job(id: String, mgr: State<'_, BackupManager>) -> Result<BackupJob, AppError> {
+    mgr.duplicate_job(&id).await
 }
 
 #[tauri::command]
@@ -211,9 +217,33 @@ pub async fn backup_set_version_metadata(
 }
 
 /// Most recent runs; with `page`, one page of the whole history plus the total.
+/// `date_from` / `date_to` (RFC 3339 instants) keep the runs that started in that range.
 #[tauri::command]
-pub async fn backup_run_history(job_id: Option<String>, limit: Option<u32>, page: Option<PageRequest>, mgr: State<'_, BackupManager>) -> Result<Listing<BackupRun>, AppError> {
-    mgr.run_history_listing(job_id, limit.unwrap_or(50), page).await
+pub async fn backup_run_history(
+    job_id: Option<String>,
+    limit: Option<u32>,
+    page: Option<PageRequest>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<Listing<BackupRun>, AppError> {
+    let (from, to) = crate::core::date_range::parse_range(date_from.as_deref(), date_to.as_deref())?;
+    mgr.run_history_listing_between(job_id, limit.unwrap_or(50), page, from.map(|d| d.to_rfc3339()), to.map(|d| d.to_rfc3339())).await
+}
+
+/// Every replication result, newest first: one row per replica per run, so
+/// a replica's history is more than its last result.
+#[tauri::command]
+pub async fn backup_replica_history(
+    job_id: Option<String>,
+    replica_id: Option<String>,
+    limit: Option<u32>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    mgr: State<'_, BackupManager>,
+) -> Result<Vec<ReplicaRun>, AppError> {
+    let (from, to) = crate::core::date_range::parse_range(date_from.as_deref(), date_to.as_deref())?;
+    mgr.replica_history(ReplicaHistoryFilter { job_id, replica_id, from: from.map(|d| d.to_rfc3339()), to: to.map(|d| d.to_rfc3339()), limit }).await
 }
 
 #[tauri::command]

@@ -2,9 +2,10 @@
  * Small shared primitives for the Backup panel (DRY form layout, buttons,
  * folder picker). Styled to match the Sync panel.
  */
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { inputCls } from "@/lib/backup-helpers";
 import { pickFolder } from "@/lib/folder-picker";
+import { RemoteFolderPicker } from "@/components/remote-folder-picker";
 
 export function Section({ title, children, hint }: { title: string; children: ReactNode; hint?: string }) {
   return (
@@ -98,8 +99,10 @@ export function Banner({ tone, children, onClose }: { tone: "error" | "info" | "
 }
 
 
-/** Text input with a "Browse…" folder picker button. */
+/** Text input with a "Browse…" folder picker button (native) and
+ *  "Pick…" (the in-app picker, which can also create the folder). */
 export function PathInput({ value, onChange, placeholder, testId }: { value: string; onChange: (v: string) => void; placeholder?: string; testId?: string }) {
+  const [picking, setPicking] = useState(false);
   return (
     <div className="flex gap-1">
       <input className={inputCls} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} data-testid={testId} />
@@ -111,6 +114,21 @@ export function PathInput({ value, onChange, placeholder, testId }: { value: str
       >
         Browse…
       </Btn>
+      <Btn onClick={() => setPicking(true)} testId={testId ? `${testId}-pick` : undefined} title="Pick a folder, or create one">
+        Pick…
+      </Btn>
+      {picking && (
+        <RemoteFolderPicker
+          title="Choose folder"
+          initialPath={value || null}
+          allowConnections={false}
+          onCancel={() => setPicking(false)}
+          onPick={(p) => {
+            setPicking(false);
+            onChange(p);
+          }}
+        />
+      )}
     </div>
   );
 }

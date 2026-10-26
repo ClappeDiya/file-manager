@@ -137,7 +137,7 @@ The snapshot policy (`off`, `auto`, `on`, `required`) works as before. *Auto* fa
 | App | **Estimate** on the job card |
 | IPC | `backup_estimate { jobId, assumedBytesPerSec? }` |
 | REST | `GET /api/v1/jobs/{id}/estimate?assumed_bytes_per_sec=…` (scope `read`) |
-| CLI | `ufop backup estimate --dest … --source … [--include/--exclude/--ignore-file …] [--assumed-speed 20M] [--largest 10]` (no run history: the assumed speed is used) |
+| CLI | `ufop backup estimate --dest … --source … [--include/--exclude/--filter "+ rclone-rule"/--ignore-file …] [--assumed-speed 20M] [--largest 10]` (no run history: the assumed speed is used) |
 
 The output of a backup command is not included in the estimate; a warning says so.
 

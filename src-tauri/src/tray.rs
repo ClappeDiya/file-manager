@@ -1,18 +1,26 @@
-//! System tray: shows backup state in the tooltip and a status line, and
+//! System tray: shows backup state (and the next scheduled sync or
+//! automation) in the tooltip and a status line, and
 //! offers Open, Backups…, Pause for an hour, Resume and Quit. With
 //! "Keep running in the tray" enabled, closing the window hides it so
-//! scheduled backups keep running.
+//! scheduled backups keep running. A "Mounts" submenu lists the saved mounts
+//! with a check mark on the mounted ones (click to mount or unmount) and
+//! "Unmount all"; it is rebuilt whenever a mount changes.
 
 use crate::backup_engine::BackupManager;
+use crate::commands::mount_commands::mount_saved_and_open;
+use crate::connectors::ConnectionManager;
+use crate::mount_engine::{MountInfo, MountManager, MountStatus};
 use crate::storage::Repository;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
+use uuid::Uuid;
 
 pub const OPEN_BACKUPS_EVENT: &str = "ufop://open-backups";
-const KEY_BACKGROUND: &str = "app.run_in_background";
+pub const KEY_BACKGROUND: &str = "app.run_in_background";
 
 /// Whether closing the window should hide it instead of exiting.
 #[derive(Clone, Default)]
@@ -56,12 +64,145 @@ pub fn describe(status: &crate::backup_engine::SchedulerStatus) -> String {
     }
 }
 
-fn show_main(app: &AppHandle) {
-    if let Some(w) = app.webview_windows().values().next() {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
+// ──────────────────────────────────────────────
+// Mounts submenu
+// ──────────────────────────────────────────────
+
+const MOUNT_ITEM_PREFIX: &str = "mount:";
+const UNMOUNT_ALL_ID: &str = "unmount_all";
+
+/// One saved mount in the tray: a check item, checked while mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountMenuItem {
+    pub id: String,
+    pub label: String,
+    pub mounted: bool,
+}
+
+/// What the "Mounts" submenu shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MountsMenu {
+    pub items: Vec<MountMenuItem>,
+    pub can_unmount_all: bool,
+}
+
+/// What a click in the "Mounts" submenu asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountAction {
+    /// Mount a saved mount, or unmount it if it is mounted.
+    Toggle(Uuid),
+    UnmountAll,
+}
+
+/// The submenu for the current mounts (already in the order the list shows).
+pub fn mounts_menu(mounts: &[MountInfo]) -> MountsMenu {
+    MountsMenu {
+        items: mounts
+            .iter()
+            .map(|m| {
+                let state = if m.status == MountStatus::Error { " (failed)" } else { "" };
+                MountMenuItem { id: format!("{MOUNT_ITEM_PREFIX}{}", m.id), label: format!("{} — {}{state}", m.connection_name, m.mount_point), mounted: m.status == MountStatus::Mounted }
+            })
+            .collect(),
+        can_unmount_all: mounts.iter().any(|m| m.status == MountStatus::Mounted),
     }
+}
+
+/// The action behind a menu item id (`None` for ids that are not mount items).
+pub fn parse_mount_action(id: &str) -> Option<MountAction> {
+    if id == UNMOUNT_ALL_ID {
+        return Some(MountAction::UnmountAll);
+    }
+    id.strip_prefix(MOUNT_ITEM_PREFIX).and_then(|u| Uuid::parse_str(u).ok()).map(MountAction::Toggle)
+}
+
+/// Do what a click asked for; the text says what happened.
+pub async fn run_mount_action(action: MountAction, mounts: &MountManager, repo: &Repository, conns: &ConnectionManager) -> Result<String, crate::core::error::AppError> {
+    match action {
+        MountAction::UnmountAll => {
+            let r = mounts.unmount_all(repo).await;
+            if r.failed.is_empty() {
+                Ok(format!("Unmounted {} drive(s)", r.unmounted))
+            } else {
+                Err(crate::core::error::AppError::file_op(format!("Could not unmount: {}", r.failed.join("; ")), "Close files that are open on the drive and try again."))
+            }
+        }
+        MountAction::Toggle(id) => {
+            if mounts.get_mount_status(id).await == MountStatus::Mounted {
+                mounts.unmount_remote(id, repo).await?;
+                Ok("Unmounted".into())
+            } else {
+                Ok(mount_saved_and_open(mounts, id, repo, conns).await?.message)
+            }
+        }
+    }
+}
+
+fn rebuild_mounts_submenu(app: &AppHandle, sub: &Submenu<tauri::Wry>, model: &MountsMenu) -> tauri::Result<()> {
+    for item in sub.items()? {
+        sub.remove(&item)?;
+    }
+    let text = crate::tray_labels::current();
+    if model.items.is_empty() {
+        sub.append(&MenuItem::with_id(app, "mounts_none", text.no_mounts, false, None::<&str>)?)?;
+    }
+    for it in &model.items {
+        sub.append(&CheckMenuItem::with_id(app, &it.id, &it.label, true, it.mounted, None::<&str>)?)?;
+    }
+    sub.append(&PredefinedMenuItem::separator(app)?)?;
+    sub.append(&MenuItem::with_id(app, UNMOUNT_ALL_ID, text.unmount_all, model.can_unmount_all, None::<&str>)?)?;
+    Ok(())
+}
+
+/// Keep the submenu in step with the mounts: rebuilt on every change, and
+/// every few seconds for drives that vanish without telling us.
+fn spawn_mounts_menu(app: AppHandle, sub: Submenu<tauri::Wry>) {
+    tauri::async_runtime::spawn(async move {
+        let (mounts, repo, conns) = (app.state::<MountManager>().inner().clone(), app.state::<Repository>().inner().clone(), app.state::<ConnectionManager>().inner().clone());
+        let mut changes = mounts.subscribe();
+        let mut shown: Option<MountsMenu> = None;
+        let mut redraw = true;
+        loop {
+            let model = mounts_menu(&mounts.list_mounts(&repo, &conns).await.unwrap_or_default());
+            if redraw || shown.as_ref() != Some(&model) {
+                if let Err(e) = rebuild_mounts_submenu(&app, &sub, &model) {
+                    tracing::warn!("Tray mounts menu: {e}");
+                }
+                shown = Some(model);
+            }
+            // A change redraws even when the list looks the same (a click flips a check mark by itself).
+            redraw = tokio::select! {
+                r = changes.changed() => r.is_ok(),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => false,
+            };
+        }
+    });
+}
+
+fn handle_mount_click(app: &AppHandle, action: MountAction) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (mounts, repo, conns) = (app.state::<MountManager>(), app.state::<Repository>(), app.state::<ConnectionManager>());
+        match run_mount_action(action, &mounts, &repo, &conns).await {
+            Ok(msg) => tracing::info!("Tray mounts: {msg}"),
+            Err(e) => {
+                tracing::warn!("Tray mounts: {e}");
+                // The clicked check mark flipped by itself; redraw the true state.
+                mounts.notify();
+                let _ = app.notification().builder().title("Mount failed").body(e.user_message()).show();
+            }
+        }
+    });
+}
+
+/// Show the main window (or, when it was closed, another one); its label.
+fn show_main(app: &AppHandle) -> Option<String> {
+    let windows = app.webview_windows();
+    let w = windows.get("main").or_else(|| windows.values().next())?;
+    let _ = w.show();
+    let _ = w.unminimize();
+    let _ = w.set_focus();
+    Some(w.label().to_string())
 }
 
 /// One log line for "Back up all now".
@@ -74,24 +215,86 @@ pub fn run_all_summary(r: &crate::backup_engine::runs::RunAllReport) -> String {
     s
 }
 
+/// The tray items whose text follows the app's language.
+pub struct TrayMenuItems {
+    open: MenuItem<tauri::Wry>,
+    new_window: MenuItem<tauri::Wry>,
+    backups: MenuItem<tauri::Wry>,
+    run_all: MenuItem<tauri::Wry>,
+    pause: MenuItem<tauri::Wry>,
+    resume: MenuItem<tauri::Wry>,
+    lock: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+    mounts: Submenu<tauri::Wry>,
+}
+
+impl TrayMenuItems {
+    /// Apply the current language's texts (the mounts submenu is rebuilt by its own task).
+    pub fn relabel(&self) {
+        let t = crate::tray_labels::current();
+        let _ = self.open.set_text(t.open);
+        let _ = self.new_window.set_text(t.new_window);
+        let _ = self.backups.set_text(t.backups);
+        let _ = self.run_all.set_text(t.run_all);
+        let _ = self.pause.set_text(t.pause);
+        let _ = self.resume.set_text(t.resume);
+        let _ = self.quit.set_text(t.quit);
+        let _ = self.lock.set_text(t.lock);
+        let _ = self.mounts.set_text(t.mounts);
+    }
+}
+
+/// "Lock UFOP" is offered while the app lock is on and the app is unlocked.
+pub fn set_lock_enabled(app: &AppHandle) {
+    if let (Some(items), Some(lock)) = (app.try_state::<TrayMenuItems>(), app.try_state::<crate::app_lock::AppLock>()) {
+        let _ = items.lock.set_enabled(lock.settings().enabled && !lock.is_locked());
+    }
+}
+
+/// The web view's language changed: relabel the tray and its mounts submenu.
+pub fn apply_language(app: &AppHandle) {
+    if let Some(items) = app.try_state::<TrayMenuItems>() {
+        items.relabel();
+        app.state::<MountManager>().notify();
+    }
+}
+
 pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
+    let text = crate::tray_labels::current();
     let status_item = MenuItem::with_id(app, "status", "Loading…", false, None::<&str>)?;
-    let open = MenuItem::with_id(app, "open", "Open UFOP", true, None::<&str>)?;
-    let backups = MenuItem::with_id(app, "backups", "Backups…", true, None::<&str>)?;
-    let run_all = MenuItem::with_id(app, "run_all", "Back up all now", true, None::<&str>)?;
-    let pause = MenuItem::with_id(app, "pause", "Pause backups for 1 hour", true, None::<&str>)?;
-    let resume = MenuItem::with_id(app, "resume", "Resume backups", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    // Shown only while a sync pair or automation rule has a schedule.
+    let next_item = MenuItem::with_id(app, "next_other", "", false, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", text.open, true, None::<&str>)?;
+    let new_window = MenuItem::with_id(app, "new_window", text.new_window, true, None::<&str>)?;
+    let backups = MenuItem::with_id(app, "backups", text.backups, true, None::<&str>)?;
+    let run_all = MenuItem::with_id(app, "run_all", text.run_all, true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, "pause", text.pause, true, None::<&str>)?;
+    let resume = MenuItem::with_id(app, "resume", text.resume, true, None::<&str>)?;
+    let lock = MenuItem::with_id(app, "lock", text.lock, false, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", text.quit, true, None::<&str>)?;
+    let mounts_menu = Submenu::with_id(app, "mounts", text.mounts, true)?;
+    rebuild_mounts_submenu(app.handle(), &mounts_menu, &MountsMenu::default())?;
     let menu = Menu::with_items(
         app,
-        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &backups, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &quit],
+        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &new_window, &backups, &mounts_menu, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &lock, &quit],
     )?;
     let m2 = mgr.clone();
     let mut builder = TrayIconBuilder::with_id("ufop").tooltip("UFOP").menu(&menu).show_menu_on_left_click(true).on_menu_event(move |app, ev| match ev.id().as_ref() {
-        "open" => show_main(app),
-        "backups" => {
+        "open" => {
             show_main(app);
-            let _ = app.emit(OPEN_BACKUPS_EVENT, ());
+        }
+        "new_window" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::commands::desktop_commands::open_new_window(None, app).await {
+                    tracing::warn!("New window: {}", e.user_message());
+                }
+            });
+        }
+        "backups" => {
+            if let Some(label) = show_main(app) {
+                let _ = app.emit_to(label.as_str(), OPEN_BACKUPS_EVENT, ());
+            }
         }
         "run_all" => {
             let m = m2.clone();
@@ -104,26 +307,57 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
         }
         "pause" => m2.pause(Some(60)),
         "resume" => m2.resume(),
+        "lock" => {
+            let lock = app.state::<crate::app_lock::AppLock>();
+            if lock.lock() {
+                crate::app_lock::announce(app, true);
+            }
+        }
         "quit" => app.exit(0),
-        _ => {}
+        other => {
+            if let Some(action) = parse_mount_action(other) {
+                handle_mount_click(app, action);
+            }
+        }
     });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
+    app.manage(TrayMenuItems { open, new_window, backups, run_all, pause: pause.clone(), resume: resume.clone(), lock, quit, mounts: mounts_menu.clone() });
+    set_lock_enabled(app.handle());
+    spawn_mounts_menu(app.handle().clone(), mounts_menu);
 
-    // Refresh the status line and tooltip.
+    // Refresh the status lines and tooltip.
+    let handle = app.handle().clone();
     tauri::async_runtime::spawn(async move {
-        let mut last = String::new();
+        let mut last = (String::new(), None::<String>);
+        let mut next_shown = false;
         loop {
-            let s = describe(&mgr.status().await);
-            if s != last {
-                let _ = tray.set_tooltip(Some(format!("UFOP — {s}")));
+            let status = mgr.status().await;
+            let s = describe(&status);
+            let upcoming = crate::schedule_library::upcoming::upcoming(&handle.state::<crate::sync_engine::SyncManager>(), &handle.state::<crate::automation_engine::AutomationManager>()).await;
+            let other = crate::schedule_library::upcoming::describe(&upcoming);
+            if (s.clone(), other.clone()) != last {
+                let tip = match &other {
+                    Some(o) => format!("UFOP — {s}\n{o}"),
+                    None => format!("UFOP — {s}"),
+                };
+                let _ = tray.set_tooltip(Some(tip));
                 let _ = status_item.set_text(&s);
-                let paused = mgr.status().await.paused;
-                let _ = pause.set_enabled(!paused);
-                let _ = resume.set_enabled(paused);
-                last = s;
+                let _ = pause.set_enabled(!status.paused);
+                let _ = resume.set_enabled(status.paused);
+                match &other {
+                    Some(o) => {
+                        let _ = next_item.set_text(o);
+                        if !next_shown {
+                            next_shown = menu.insert(&next_item, 1).is_ok();
+                        }
+                    }
+                    None if next_shown => next_shown = menu.remove(&next_item).is_err(),
+                    None => {}
+                }
+                last = (s, other);
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
@@ -168,6 +402,60 @@ mod tests {
             eta_secs: None,
         });
         assert_eq!(describe(&s), "Running backup of Docs 50%");
+    }
+
+    fn mount_info(name: &str, mount_point: &str, status: MountStatus) -> MountInfo {
+        MountInfo {
+            id: Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
+            connection_name: name.into(),
+            protocol: "rclone".into(),
+            mount_point: mount_point.into(),
+            status,
+            auto_mount: false,
+            created_at: chrono::Utc::now(),
+            error_message: None,
+            options: Default::default(),
+            policy_notes: vec![],
+        }
+    }
+
+    #[test]
+    fn mounts_menu_lists_saved_mounts_with_their_state() {
+        assert_eq!(mounts_menu(&[]), MountsMenu::default());
+        let a = mount_info("Work", "/mnt/work", MountStatus::Mounted);
+        let b = mount_info("Photos", "/mnt/photos", MountStatus::Unmounted);
+        let c = mount_info("Old", "/mnt/old", MountStatus::Error);
+        let m = mounts_menu(&[a.clone(), b.clone(), c.clone()]);
+        assert!(m.can_unmount_all);
+        let rows: Vec<(String, bool)> = m.items.iter().map(|i| (i.label.clone(), i.mounted)).collect();
+        assert_eq!(rows, [("Work — /mnt/work".to_string(), true), ("Photos — /mnt/photos".to_string(), false), ("Old — /mnt/old (failed)".to_string(), false)]);
+        assert_eq!(m.items[0].id, format!("mount:{}", a.id));
+        // "Unmount all" has nothing to do when nothing is mounted.
+        assert!(!mounts_menu(&[b, c]).can_unmount_all);
+    }
+
+    #[test]
+    fn menu_ids_map_back_to_actions() {
+        let id = Uuid::new_v4();
+        assert_eq!(parse_mount_action(&format!("mount:{id}")), Some(MountAction::Toggle(id)));
+        assert_eq!(parse_mount_action("unmount_all"), Some(MountAction::UnmountAll));
+        for other in ["open", "backups", "mount:not-a-uuid", "mounts_none", ""] {
+            assert_eq!(parse_mount_action(other), None, "{other}");
+        }
+        // Every id the model produces parses.
+        let m = mounts_menu(&[mount_info("A", "/a", MountStatus::Mounted)]);
+        assert!(matches!(parse_mount_action(&m.items[0].id), Some(MountAction::Toggle(_))));
+    }
+
+    #[tokio::test]
+    async fn clicking_unmount_all_unmounts_and_reports() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        let conns = ConnectionManager::new(repo.clone(), std::sync::Arc::new(crate::security::CredentialStore::new()));
+        let mounts = MountManager::new();
+        assert_eq!(run_mount_action(MountAction::UnmountAll, &mounts, &repo, &conns).await.unwrap(), "Unmounted 0 drive(s)");
+        // Toggling a mount that no longer exists is an error the user is told about.
+        assert!(run_mount_action(MountAction::Toggle(Uuid::new_v4()), &mounts, &repo, &conns).await.is_err());
     }
 
     #[tokio::test]

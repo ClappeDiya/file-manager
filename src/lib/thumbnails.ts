@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
+import { isRemotePath } from "@/lib/location";
 
 /** Mirrors `IMAGE_EXTENSIONS` in thumbnail_engine. */
 export const THUMBNAIL_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff"]);
@@ -73,7 +74,8 @@ export function useThumbnail(path: string, name: string, enabled: boolean, size 
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
     setUrl(null);
-    if (!enabled || !isTauriAvailable() || !hasThumbnail(name)) return;
+    // Connection files are not downloaded just to draw a thumbnail.
+    if (!enabled || !isTauriAvailable() || !hasThumbnail(name) || isRemotePath(path)) return;
     let live = true;
     void loadThumbnail(path, size, version).then((u) => live && setUrl(u));
     return () => {

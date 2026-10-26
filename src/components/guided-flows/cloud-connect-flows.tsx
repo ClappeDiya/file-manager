@@ -2,23 +2,28 @@
  * Cloud Connection Guided Flows (T-056)
  *
  * Wizards 1-4:
- * 1. Connect OneDrive
- * 2. Connect Google Drive
- * 3. Connect Dropbox
- * 4. Connect GCS (S3-Compatible)
+ * 1. Connect OneDrive (personal, or work/school with SharePoint libraries)
+ * 2. Connect Google Drive (My Drive, Shared with me, shared drives)
+ * 3. Connect Dropbox (own folder, team space, team folders)
+ * 4. Connect GCS (S3-compatible, HMAC keys)
  *
- * Each follows the same pattern:
- * - Sign in (OAuth)
- * - Choose folders to sync
- * - Configure sync settings
- * - Test connection
- * - Confirm
+ * Every step does the real work: the connection is saved, the browser
+ * sign-in runs through the OAuth commands (`src/lib/oauth.ts`), the
+ * location is picked from the account's real drives / sites / team spaces,
+ * and the last step connects and lists it. Nothing reports success it has
+ * not checked.
  */
-import { useState, useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
+import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
+import { announceConnectionsChanged, type OAuthSignedIn } from "@/lib/oauth";
+import { OAuthSignIn } from "@/components/oauth-sign-in";
+import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
+import { PasswordInput } from "@/components/password-input";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
-import { Cloud, Check, FolderOpen, RefreshCw, Shield, Key } from "lucide-react";
+import { Cloud, Check, FolderOpen, Shield, Key, Loader2 } from "lucide-react";
 
 // ──────────────────────────────────────────────
 // Shared cloud connect wizard logic
@@ -26,113 +31,192 @@ import { Cloud, Check, FolderOpen, RefreshCw, Shield, Key } from "lucide-react";
 
 type CloudProvider = "onedrive" | "gdrive" | "dropbox";
 
-interface CloudConnectState {
-  authenticated: boolean;
-  selectedFolders: string[];
-  syncMode: "one-way-down" | "one-way-up" | "two-way";
-  testResult: "untested" | "success" | "failed";
+interface RemoteEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
 }
 
-const PROVIDER_INFO: Record<
-  CloudProvider,
-  { name: string; description: string; folders: string[] }
-> = {
+/** What `save_connection` returns (the fields used here). */
+interface SavedProfile {
+  id: string;
+  name: string;
+  protocol: string;
+}
+
+const PROVIDER_INFO: Record<CloudProvider, { name: string; protocol: string; description: string }> = {
   onedrive: {
     name: "Microsoft OneDrive",
-    description:
-      "Connect your OneDrive account to access and sync files between your computer and the cloud.",
-    folders: ["Documents", "Pictures", "Desktop", "Music", "Videos"],
+    protocol: "onedrive",
+    description: "Connect your OneDrive (or a SharePoint document library) to browse and transfer files.",
   },
   gdrive: {
     name: "Google Drive",
-    description:
-      "Connect your Google Drive to access and sync files. Shared drives are also supported.",
-    folders: ["My Drive", "Shared Drives", "Recent", "Starred"],
+    protocol: "google_drive",
+    description: "Connect Google Drive to browse and transfer files. Shared drives are supported.",
   },
   dropbox: {
     name: "Dropbox",
-    description:
-      "Connect Dropbox to browse, sync, and transfer files between your computer and Dropbox.",
-    folders: ["Dropbox", "Camera Uploads", "Screenshots", "Shared Folders"],
+    protocol: "dropbox",
+    description: "Connect Dropbox to browse and transfer files, including team spaces and team folders.",
   },
 };
 
-function useCloudConnectWizard(provider: CloudProvider) {
+const field = "w-full text-sm px-3 py-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[color:var(--color-text)]";
+const primary = "px-6 py-3 rounded-xl bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] font-medium text-sm hover:opacity-90 transition-all disabled:opacity-50";
+
+/** Save (create or update) a connection. */
+async function saveProfile(args: Record<string, unknown>): Promise<SavedProfile> {
+  return tauriInvoke<SavedProfile>("save_connection", args);
+}
+
+/** Connect a saved connection and list its root: the real test. */
+async function connectAndList(protocol: string, connectionId: string, host = ""): Promise<RemoteEntry[]> {
+  await tauriInvoke("connector_connect", { protocol, host, port: null, username: null, remotePath: "/", connectionId });
+  return tauriInvoke<RemoteEntry[]>("connector_list_remote", { protocol, path: "/", connectionId });
+}
+
+function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
   const addActivity = useUIStore((s) => s.addActivity);
   const setActiveGuidedFlow = useUIStore((s) => s.setActiveGuidedFlow);
-
-  const [state, setState] = useState<CloudConnectState>({
-    authenticated: false,
-    selectedFolders: [],
-    syncMode: "two-way",
-    testResult: "untested",
-  });
+  const info = PROVIDER_INFO[provider];
 
   const [step, setStep] = useState(0);
+  const [name, setName] = useState(info.name);
+  const [accountKind, setAccountKind] = useState<"personal" | "business">("personal");
+  const [saved, setSaved] = useState<SavedProfile | null>(null);
+  const [signedIn, setSignedIn] = useState<OAuthSignedIn | null>(null);
+  const [scope, setScope] = useState<CloudExtras>({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [listing, setListing] = useState<RemoteEntry[] | null>(null);
+  // The OAuth app the sign-in saved on the connection (your own, Advanced).
+  const [clientId, setClientId] = useState<string | null>(null);
 
-  const info = PROVIDER_INFO[provider];
+  const extras = useCallback(
+    (): Record<string, unknown> => ({
+      assume_role: null,
+      rclone_remote: null,
+      preset: null,
+      swift: null,
+      // Every save replaces the extras: carry the sign-in's OAuth app over,
+      // or the next sign-in would fall back to the built-in one.
+      oauth: { ...(scope.oauth ?? {}), client_id: clientId, account_kind: provider === "onedrive" ? scope.oauth?.account_kind ?? accountKind : "personal" },
+      google_drive: provider === "gdrive" ? scope.google_drive ?? null : null,
+      onedrive: provider === "onedrive" ? scope.onedrive ?? null : null,
+      dropbox: provider === "dropbox" ? scope.dropbox ?? null : null,
+    }),
+    [scope, provider, accountKind, clientId],
+  );
+
+  const save = useCallback(async (): Promise<SavedProfile> => {
+    const p = await saveProfile({
+      connectionId: saved?.id ?? null,
+      name: name.trim() || info.name,
+      protocol: info.protocol,
+      host: "",
+      port: null,
+      username: null,
+      password: null,
+      remotePath: "/",
+      groupId: null,
+      extras: extras(),
+    });
+    setSaved(p);
+    return p;
+  }, [saved, name, info, extras]);
+
+  /** Signed in: read back the OAuth app the sign-in saved on the connection. */
+  const handleSignedIn = useCallback(async (s: OAuthSignedIn) => {
+    try {
+      const p = await tauriInvoke<{ extras?: { oauth?: OAuthSettings | null } | null } | null>("get_connection", { connectionId: s.connection_id });
+      setClientId(p?.extras?.oauth?.client_id ?? null);
+    } catch (e) {
+      console.error("Cannot read the connection back:", e);
+    }
+    setSignedIn(s);
+  }, []);
+
+  /** Save the chosen location, then connect and list it. */
+  const preview = useCallback(async () => {
+    setError(null);
+    setBusy(true);
+    setListing(null);
+    try {
+      const p = await save();
+      setListing(await connectAndList(info.protocol, p.id));
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [save, info.protocol]);
 
   const steps: WizardStepDef[] = [
     {
+      id: "account",
+      label: "Account",
+      helpText: `Name this connection${provider === "onedrive" ? " and choose the kind of Microsoft account" : ""}. It is saved when you continue.`,
+      validate: () => (name.trim() ? null : "Enter a name for the connection."),
+    },
+    {
       id: "sign-in",
       label: "Sign In",
-      helpText: `Click the sign-in button to securely connect your ${info.name} account. We use OAuth, so your password is never shared with us.`,
-      validate: () =>
-        state.authenticated
-          ? null
-          : `Please sign in to ${info.name} to continue.`,
+      helpText: `Sign in with ${info.name} in your browser. UFOP never sees your password; the access it is granted is kept in the system keychain.`,
+      validate: () => (signedIn ? null : `Sign in to ${info.name} to continue.`),
     },
     {
-      id: "select-folders",
-      label: "Choose Folders",
-      helpText: "Select which cloud folders you want to access from this computer. You can change this later.",
-    },
-    {
-      id: "sync-settings",
-      label: "Sync Settings",
-      helpText:
-        "Choose how files sync between your computer and the cloud. Two-way keeps both locations in sync. One-way copies in only one direction.",
-    },
-    {
-      id: "test-connection",
-      label: "Test & Confirm",
-      helpText: "We'll test the connection to make sure everything works before finalizing setup.",
+      id: "location",
+      label: "Location",
+      helpText: "Choose which part of the account this connection opens, then check it by listing it.",
+      validate: () => (listing ? null : "Check the location (List it) before finishing."),
     },
   ];
 
-  const handleComplete = useCallback(() => {
-    addActivity({
-      type: "connect",
-      summary: `Connected to ${info.name}. ${state.selectedFolders.length} folder${state.selectedFolders.length !== 1 ? "s" : ""} configured for sync.`,
-      paths: state.selectedFolders,
-      undoable: false,
-    });
-    setActiveGuidedFlow(null);
-  }, [addActivity, info.name, state.selectedFolders, setActiveGuidedFlow]);
+  const goTo = useCallback(
+    async (next: number) => {
+      setError(null);
+      if (step === 0 && next === 1) {
+        setBusy(true);
+        try {
+          await save();
+        } catch (e) {
+          setError(errorText(e));
+          return;
+        } finally {
+          setBusy(false);
+        }
+      }
+      setStep(next);
+    },
+    [step, save],
+  );
+
+  const handleComplete = useCallback(async () => {
+    setBusy(true);
+    try {
+      await save();
+      addActivity({
+        type: "connect",
+        summary: `Connected to ${info.name}${signedIn?.account ? ` as ${signedIn.account}` : ""}.`,
+        paths: [],
+        undoable: false,
+      });
+      announceConnectionsChanged();
+      setActiveGuidedFlow(null);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [save, addActivity, info.name, signedIn, setActiveGuidedFlow]);
 
   const handleCancel = useCallback(() => {
+    // A connection saved along the way stays (it can be signed in later from Connections).
+    if (saved) announceConnectionsChanged();
     setActiveGuidedFlow(null);
-  }, [setActiveGuidedFlow]);
-
-  return { state, setState, step, setStep, steps, info, handleComplete, handleCancel };
-}
-
-// ──────────────────────────────────────────────
-// Generic Cloud Connect Wizard Component
-// ──────────────────────────────────────────────
-
-function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
-  const { state, setState, step, setStep, steps, info, handleComplete, handleCancel } =
-    useCloudConnectWizard(provider);
-
-  const toggleFolder = (folder: string) => {
-    setState((prev) => ({
-      ...prev,
-      selectedFolders: prev.selectedFolders.includes(folder)
-        ? prev.selectedFolders.filter((f) => f !== folder)
-        : [...prev.selectedFolders, folder],
-    }));
-  };
+  }, [saved, setActiveGuidedFlow]);
 
   return (
     <WizardShell
@@ -140,231 +224,95 @@ function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
       subtitle={info.description}
       steps={steps}
       currentStep={step}
-      onStepChange={setStep}
-      onComplete={handleComplete}
+      onStepChange={(i) => void goTo(i)}
+      onComplete={() => void handleComplete()}
       onCancel={handleCancel}
-      completeLabel="Connect"
+      loading={busy}
+      completeLabel="Finish"
     >
-      {/* Step 1: Sign In */}
       {step === 0 && (
-        <div className="flex flex-col items-center text-center py-6">
-          <div className="h-16 w-16 rounded-2xl bg-[var(--color-primary)]/10 flex items-center justify-center mb-6">
-            <Cloud className="h-8 w-8 text-[color:var(--color-primary)]" aria-hidden="true" />
+        <div className="space-y-4 py-2">
+          <div className="flex items-center gap-3">
+            <div className="h-12 w-12 rounded-2xl bg-[var(--color-primary)]/10 flex items-center justify-center">
+              <Cloud className="h-6 w-6 text-[color:var(--color-primary)]" aria-hidden="true" />
+            </div>
+            <p className="text-sm text-[color:var(--color-text-secondary)]">{info.description}</p>
           </div>
-          <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">
-            Sign in to {info.name}
-          </h3>
-          <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm mb-6">
-            You'll be redirected to {info.name}'s secure sign-in page. Your
-            password is never shared with us.
-          </p>
-          <button
-            className={cn(
-              "px-6 py-3 rounded-xl font-medium text-sm transition-all",
-              state.authenticated
-                ? "bg-[var(--color-primary)]/10 text-[color:var(--color-primary)] border-2 border-[var(--color-primary)]"
-                : "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:opacity-90",
-            )}
-            onClick={() => setState((prev) => ({ ...prev, authenticated: true }))}
-          >
-            {state.authenticated ? (
-              <span className="flex items-center gap-2">
-                <Check className="h-4 w-4" aria-hidden="true" />
-                Signed in successfully
-              </span>
-            ) : (
-              `Sign in to ${info.name}`
-            )}
-          </button>
-          <p className="text-xs text-[color:var(--color-text-tertiary)] mt-4">
+          <div>
+            <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1" htmlFor="cloud-name">Connection name</label>
+            <input id="cloud-name" value={name} onChange={(e) => setName(e.target.value)} className={field} />
+          </div>
+          {provider === "onedrive" && (
+            <div>
+              <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1" htmlFor="cloud-account-kind">Account</label>
+              <select id="cloud-account-kind" value={accountKind} onChange={(e) => setAccountKind(e.target.value as "personal" | "business")} className={field}>
+                <option value="personal">Personal Microsoft account</option>
+                <option value="business">Work or school (Microsoft 365, SharePoint)</option>
+              </select>
+            </div>
+          )}
+        </div>
+      )}
+
+      {step === 1 && saved && (
+        <div className="py-2 space-y-3">
+          {signedIn ? (
+            <p className="text-sm flex items-center gap-2 text-[color:var(--color-text)]" data-testid="cloud-signed-in">
+              <Check className="h-4 w-4 text-[color:var(--color-primary)]" aria-hidden="true" />
+              Signed in{signedIn.account ? ` as ${signedIn.account}` : ""}.
+            </p>
+          ) : null}
+          {signedIn?.warning ? (
+            <p role="status" className="text-xs text-[color:var(--color-warning)]" data-testid="cloud-signed-in-warning">
+              {signedIn.warning}
+            </p>
+          ) : null}
+          {signedIn ? null : (
+            <OAuthSignIn connectionId={saved.id} protocol={info.protocol} onSignedIn={(s) => void handleSignedIn(s)} />
+          )}
+          <p className="text-xs text-[color:var(--color-text-tertiary)]">
             <Shield className="h-3 w-3 inline mr-1" aria-hidden="true" />
-            Uses secure OAuth authentication
+            OAuth 2.0 with PKCE; tokens are stored in the system keychain.
           </p>
         </div>
       )}
 
-      {/* Step 2: Choose Folders */}
-      {step === 1 && (
-        <div>
-          <h3 className="text-base font-semibold text-[color:var(--color-text)] mb-2">
-            Which folders would you like to access?
-          </h3>
-          <p className="text-sm text-[color:var(--color-text-secondary)] mb-4">
-            Selected folders will be available in your file manager. You can add
-            or remove folders later.
-          </p>
-          <div className="space-y-2">
-            {info.folders.map((folder) => {
-              const selected = state.selectedFolders.includes(folder);
-              return (
-                <button
-                  key={folder}
-                  className={cn(
-                    "flex items-center gap-3 w-full p-3 rounded-lg border transition-all text-left",
-                    selected
-                      ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
-                      : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
-                  )}
-                  onClick={() => toggleFolder(folder)}
-                  aria-pressed={selected}
-                >
-                  <FolderOpen
-                    className={cn(
-                      "h-5 w-5",
-                      selected
-                        ? "text-[color:var(--color-primary)]"
-                        : "text-[color:var(--color-text-secondary)]",
-                    )}
-                    aria-hidden="true"
-                  />
-                  <span className="text-sm text-[color:var(--color-text)] flex-1">
-                    {folder}
-                  </span>
-                  {selected && (
-                    <Check className="h-4 w-4 text-[color:var(--color-primary)]" aria-hidden="true" />
-                  )}
-                </button>
-              );
-            })}
-          </div>
+      {step === 2 && saved && (
+        <div className="py-2 space-y-3">
+          <CloudScopeFields
+            protocol={info.protocol}
+            connectionId={saved.id}
+            value={{ ...scope, oauth: scope.oauth ?? { client_id: null, account_kind: accountKind } }}
+            onChange={(next) => {
+              setScope(next);
+              setListing(null);
+            }}
+          />
+          <button type="button" className={primary} disabled={busy} onClick={() => void preview()}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin inline" aria-hidden="true" /> : "List it"}
+          </button>
+          {listing && (
+            <div data-testid="cloud-listing">
+              <p className="text-xs font-medium text-[color:var(--color-text-secondary)] mb-1">
+                Connected. {listing.length} item{listing.length === 1 ? "" : "s"} at the top:
+              </p>
+              <ul className="max-h-40 overflow-y-auto text-sm space-y-0.5">
+                {listing.slice(0, 50).map((e) => (
+                  <li key={e.path} className="flex items-center gap-2">
+                    {e.is_dir && <FolderOpen className="h-3.5 w-3.5" aria-hidden="true" />}
+                    {e.name}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Step 3: Sync Settings */}
-      {step === 2 && (
-        <div>
-          <h3 className="text-base font-semibold text-[color:var(--color-text)] mb-2">
-            How should files sync?
-          </h3>
-          <p className="text-sm text-[color:var(--color-text-secondary)] mb-4">
-            Choose how changes are synchronized between your computer and{" "}
-            {info.name}.
-          </p>
-          <div className="space-y-2">
-            {[
-              {
-                id: "two-way" as const,
-                label: "Two-way sync",
-                desc: "Changes on either side are synced to the other. Best for most users.",
-              },
-              {
-                id: "one-way-down" as const,
-                label: "Download only",
-                desc: "Cloud changes are downloaded, but local changes are not uploaded.",
-              },
-              {
-                id: "one-way-up" as const,
-                label: "Upload only",
-                desc: "Local changes are uploaded, but cloud changes are not downloaded.",
-              },
-            ].map((mode) => (
-              <button
-                key={mode.id}
-                className={cn(
-                  "flex items-start gap-3 w-full p-4 rounded-lg border transition-all text-left",
-                  state.syncMode === mode.id
-                    ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
-                    : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
-                )}
-                onClick={() => setState((prev) => ({ ...prev, syncMode: mode.id }))}
-                aria-pressed={state.syncMode === mode.id}
-              >
-                <RefreshCw
-                  className={cn(
-                    "h-5 w-5 shrink-0 mt-0.5",
-                    state.syncMode === mode.id
-                      ? "text-[color:var(--color-primary)]"
-                      : "text-[color:var(--color-text-secondary)]",
-                  )}
-                  aria-hidden="true"
-                />
-                <div>
-                  <span className="text-sm font-medium text-[color:var(--color-text)] block">
-                    {mode.label}
-                  </span>
-                  <span className="text-xs text-[color:var(--color-text-secondary)] block mt-0.5">
-                    {mode.desc}
-                  </span>
-                </div>
-                {state.syncMode === mode.id && (
-                  <Check className="h-4 w-4 text-[color:var(--color-primary)] shrink-0 ml-auto mt-0.5" aria-hidden="true" />
-                )}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Step 4: Test & Confirm */}
-      {step === 3 && (
-        <div className="flex flex-col items-center text-center py-6">
-          <div
-            className={cn(
-              "h-16 w-16 rounded-2xl flex items-center justify-center mb-6",
-              state.testResult === "success"
-                ? "bg-[var(--color-primary)]/10"
-                : state.testResult === "failed"
-                  ? "bg-[var(--color-error)]/10"
-                  : "bg-[var(--color-bg-secondary)]",
-            )}
-          >
-            {state.testResult === "success" ? (
-              <Check className="h-8 w-8 text-[color:var(--color-primary)]" aria-hidden="true" />
-            ) : (
-              <Cloud className="h-8 w-8 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
-            )}
-          </div>
-
-          {state.testResult === "untested" && (
-            <>
-              <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">
-                Ready to test your connection
-              </h3>
-              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm mb-6">
-                We'll verify that we can access your {info.name} account and the
-                selected folders.
-              </p>
-              <button
-                className="px-6 py-3 rounded-xl bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] font-medium text-sm hover:opacity-90 transition-all"
-                onClick={() => setState((prev) => ({ ...prev, testResult: "success" }))}
-              >
-                Test Connection
-              </button>
-            </>
-          )}
-
-          {state.testResult === "success" && (
-            <>
-              <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">
-                Connection successful
-              </h3>
-              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm">
-                Your {info.name} account is connected and ready.{" "}
-                {state.selectedFolders.length > 0
-                  ? `${state.selectedFolders.length} folder${state.selectedFolders.length !== 1 ? "s" : ""} will be synced.`
-                  : "All folders will be accessible."}
-              </p>
-            </>
-          )}
-
-          {state.testResult === "failed" && (
-            <>
-              <h3 className="text-lg font-semibold text-[color:var(--color-error)] mb-2">
-                Connection failed
-              </h3>
-              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm mb-4">
-                We couldn't reach {info.name}. This might be a temporary network
-                issue.
-              </p>
-              <button
-                className="px-6 py-3 rounded-xl bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] font-medium text-sm hover:opacity-90"
-                onClick={() => setState((prev) => ({ ...prev, testResult: "untested" }))}
-              >
-                Try Again
-              </button>
-            </>
-          )}
-        </div>
+      {error && (
+        <p className="text-sm text-[color:var(--color-error)] mt-2" role="alert" data-testid="cloud-error">
+          {error}
+        </p>
       )}
     </WizardShell>
   );
@@ -378,7 +326,10 @@ interface GCSConnectState {
   accessKeyId: string;
   secretAccessKey: string;
   endpoint: string;
-  testResult: "untested" | "success" | "failed";
+  testResult: "untested" | "testing" | "success" | "failed";
+  error: string | null;
+  buckets: number;
+  connectionId: string | null;
 }
 
 function ConnectGCSWizardInner() {
@@ -390,6 +341,9 @@ function ConnectGCSWizardInner() {
     secretAccessKey: "",
     endpoint: "https://storage.googleapis.com",
     testResult: "untested",
+    error: null,
+    buckets: 0,
+    connectionId: null,
   });
 
   const [step, setStep] = useState(0);
@@ -400,6 +354,7 @@ function ConnectGCSWizardInner() {
       label: "Select Preset",
       helpText:
         "Google Cloud Storage is accessed via an S3-compatible endpoint. The endpoint URL is pre-filled for you.",
+      validate: () => (state.endpoint.trim() ? null : "Enter the endpoint URL."),
     },
     {
       id: "enter-credentials",
@@ -415,9 +370,31 @@ function ConnectGCSWizardInner() {
       id: "test-connection",
       label: "Test Connection",
       helpText:
-        "We will test the S3-compatible connection to Google Cloud Storage to verify your credentials.",
+        "We save the connection and list your buckets through the S3-compatible endpoint to check the keys.",
+      validate: () => (state.testResult === "success" ? null : "Test the connection first."),
     },
   ];
+
+  const test = useCallback(async () => {
+    setState((prev) => ({ ...prev, testResult: "testing", error: null }));
+    try {
+      const p = await saveProfile({
+        connectionId: state.connectionId,
+        name: "Google Cloud Storage",
+        protocol: "s3",
+        host: state.endpoint.trim(),
+        port: null,
+        username: state.accessKeyId.trim(),
+        password: state.secretAccessKey,
+        remotePath: "/",
+        groupId: null,
+      });
+      const buckets = await connectAndList("s3", p.id, state.endpoint.trim());
+      setState((prev) => ({ ...prev, connectionId: p.id, testResult: "success", buckets: buckets.length }));
+    } catch (e) {
+      setState((prev) => ({ ...prev, testResult: "failed", error: errorText(e) }));
+    }
+  }, [state.connectionId, state.endpoint, state.accessKeyId, state.secretAccessKey]);
 
   const handleComplete = useCallback(() => {
     addActivity({
@@ -427,12 +404,14 @@ function ConnectGCSWizardInner() {
       paths: [],
       undoable: false,
     });
+    announceConnectionsChanged();
     setActiveGuidedFlow(null);
   }, [addActivity, setActiveGuidedFlow]);
 
   const handleCancel = useCallback(() => {
+    if (state.connectionId) announceConnectionsChanged();
     setActiveGuidedFlow(null);
-  }, [setActiveGuidedFlow]);
+  }, [state.connectionId, setActiveGuidedFlow]);
 
   return (
     <WizardShell
@@ -459,16 +438,17 @@ function ConnectGCSWizardInner() {
             for you.
           </p>
           <div className="w-full max-w-sm text-left">
-            <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1">
+            <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1" htmlFor="gcs-endpoint">
               Endpoint URL
             </label>
             <input
+              id="gcs-endpoint"
               type="text"
               value={state.endpoint}
               onChange={(e) =>
-                setState((prev) => ({ ...prev, endpoint: e.target.value }))
+                setState((prev) => ({ ...prev, endpoint: e.target.value, testResult: "untested" }))
               }
-              className="w-full text-sm px-3 py-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[color:var(--color-text)]"
+              className={field}
             />
           </div>
           <p className="text-xs text-[color:var(--color-text-tertiary)] mt-4 max-w-sm">
@@ -492,7 +472,7 @@ function ConnectGCSWizardInner() {
           </p>
           <div className="space-y-3">
             <div>
-              <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1">
+              <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1" htmlFor="gcs-key-id">
                 Access Key ID
               </label>
               <div className="relative">
@@ -501,12 +481,14 @@ function ConnectGCSWizardInner() {
                   aria-hidden="true"
                 />
                 <input
+                  id="gcs-key-id"
                   type="text"
                   value={state.accessKeyId}
                   onChange={(e) =>
                     setState((prev) => ({
                       ...prev,
                       accessKeyId: e.target.value,
+                      testResult: "untested",
                     }))
                   }
                   placeholder="GOOG1E..."
@@ -515,20 +497,21 @@ function ConnectGCSWizardInner() {
               </div>
             </div>
             <div>
-              <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1">
+              <label className="block text-xs font-medium text-[color:var(--color-text-secondary)] mb-1" htmlFor="gcs-secret">
                 Secret Access Key
               </label>
-              <input
-                type="password"
+              <PasswordInput
+                id="gcs-secret"
                 value={state.secretAccessKey}
                 onChange={(e) =>
                   setState((prev) => ({
                     ...prev,
                     secretAccessKey: e.target.value,
+                    testResult: "untested",
                   }))
                 }
                 placeholder="Enter your secret key"
-                className="w-full text-sm px-3 py-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[color:var(--color-text)]"
+                className={field}
               />
             </div>
           </div>
@@ -559,22 +542,16 @@ function ConnectGCSWizardInner() {
             )}
           </div>
 
-          {state.testResult === "untested" && (
+          {(state.testResult === "untested" || state.testResult === "testing") && (
             <>
               <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">
                 Ready to test your connection
               </h3>
               <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm mb-6">
-                We'll verify the S3-compatible connection to Google Cloud Storage
-                using your HMAC credentials.
+                We'll save the connection and list your buckets with your HMAC credentials.
               </p>
-              <button
-                className="px-6 py-3 rounded-xl bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] font-medium text-sm hover:opacity-90 transition-all"
-                onClick={() =>
-                  setState((prev) => ({ ...prev, testResult: "success" }))
-                }
-              >
-                Test Connection
+              <button className={primary} disabled={state.testResult === "testing"} onClick={() => void test()}>
+                {state.testResult === "testing" ? "Testing…" : "Test Connection"}
               </button>
             </>
           )}
@@ -584,9 +561,8 @@ function ConnectGCSWizardInner() {
               <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">
                 Connection successful
               </h3>
-              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm">
-                Your Google Cloud Storage account is connected and ready via the
-                S3-compatible endpoint.
+              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm" data-testid="gcs-success">
+                Listed {state.buckets} bucket{state.buckets === 1 ? "" : "s"} through the S3-compatible endpoint.
               </p>
             </>
           )}
@@ -596,16 +572,10 @@ function ConnectGCSWizardInner() {
               <h3 className="text-lg font-semibold text-[color:var(--color-error)] mb-2">
                 Connection failed
               </h3>
-              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm mb-4">
-                We couldn't connect to Google Cloud Storage. Please check your
-                HMAC credentials and try again.
+              <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm mb-4" role="alert">
+                {state.error}
               </p>
-              <button
-                className="px-6 py-3 rounded-xl bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] font-medium text-sm hover:opacity-90"
-                onClick={() =>
-                  setState((prev) => ({ ...prev, testResult: "untested" }))
-                }
-              >
+              <button className={primary} onClick={() => void test()}>
                 Try Again
               </button>
             </>

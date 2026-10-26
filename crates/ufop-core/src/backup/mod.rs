@@ -55,7 +55,8 @@ pub mod reader;
 pub mod recovery;
 pub mod restore;
 pub mod restore_mirror;
-pub mod retention;
+// Retention is shared with sync's versioned mode (`crate::retention`).
+pub use crate::retention;
 pub mod schedule;
 pub mod select;
 pub mod shared;

@@ -150,7 +150,21 @@ export const ACTION_TYPES: { type: RuleAction["type"]; label: string; advanced?:
   { type: "validate_batch", label: "Validate a batch of files", advanced: true },
   { type: "ai_task", label: "Ask the local AI (summarize, classify…)", advanced: true },
   { type: "scan_for_malware", label: "Scan for malware (ClamAV)" },
+  { type: "verify_pair", label: "Verify a sync pair (compare both sides)", advanced: true },
+  { type: "list_files", label: "Write a file listing (CSV / JSON)", advanced: true },
+  { type: "remove_empty_dirs", label: "Remove empty folders", advanced: true },
+  { type: "purge", label: "Purge a folder (remove everything in it)", advanced: true },
 ];
+
+/** Names a step's result can be saved under: letters, digits, `_` and `-`, starting with a letter or `_`. */
+export const RESULT_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,39}$/;
+/** The fields of a saved step result, usable as {steps.<name>.<field>}. */
+export const RESULT_FIELDS = ["files", "count", "bytes", "path"] as const;
+
+/** Result names declared by the steps before step `i`. */
+export function earlierResults(steps: { output_as?: string | null }[], i: number): string[] {
+  return steps.slice(0, i).map((s) => s.output_as?.trim() ?? "").filter(Boolean);
+}
 
 export function defaultAction(type: RuleAction["type"]): RuleAction {
   switch (type) {
@@ -189,6 +203,14 @@ export function defaultAction(type: RuleAction["type"]): RuleAction {
       return { type, to: "pdf", dest_path: "" };
     case "scan_for_malware":
       return { type, quarantine_path: "~/Quarantine", notify: true };
+    case "verify_pair":
+      return { type, sync_pair_id: "", full: true };
+    case "remove_empty_dirs":
+      return { type, path: "", remove_root: false };
+    case "list_files":
+      return { type, path: "", output: "", format: "csv", recursive: true, include_dirs: false, overwrite: true };
+    case "purge":
+      return { type, path: "", max_files: null };
     case "ai_task":
       return { type, instruction: "Summarize this file in three bullet points.", dest_path: "", suffix: "ai.md", max_chars: 20_000 };
     case "validate_batch":
@@ -252,7 +274,7 @@ export function formFromRule(rule: AutomationRule): RuleForm {
     trigger: rule.trigger,
     match,
     conditions,
-    steps: [{ action: rule.action, continue_on_error: false }, ...(rule.steps ?? [])],
+    steps: [{ action: rule.action, continue_on_error: false, ...(rule.output_as ? { output_as: rule.output_as } : {}) }, ...(rule.steps ?? [])],
     // Stored rules keep their own options (absent = engine defaults).
     options: rule.options ?? { overwrite: "rename", retry: { ...NO_RETRY }, priority: 0, allow_overlap: false, settle_secs: 0, source: null },
     customTree,
@@ -280,7 +302,8 @@ export function ruleFromForm(form: RuleForm): AutomationRule {
       : null;
   // With a workflow, `action` is its first action (the engine runs the graph).
   const firstNodeAction = form.workflow ? workflowActions(form.workflow)[0] : undefined;
-  const [first, ...rest] = form.workflow ? [{ action: firstNodeAction ?? form.steps[0].action, continue_on_error: false }] : form.steps;
+  const [first, ...rest] = form.workflow ? [{ action: firstNodeAction ?? form.steps[0].action, continue_on_error: false, output_as: null as string | null }] : form.steps;
+  const named = (name?: string | null) => (name?.trim() ? name.trim() : undefined);
   const source = isFileTrigger(form.trigger) ? null : form.options.source ?? null;
   return {
     id: form.id ?? crypto.randomUUID(),
@@ -290,7 +313,8 @@ export function ruleFromForm(form: RuleForm): AutomationRule {
     conditions: tree ? [] : leaves,
     condition_tree: tree,
     action: first.action,
-    steps: rest,
+    ...(named(first.output_as) ? { output_as: named(first.output_as) } : {}),
+    steps: rest.map((st) => (named(st.output_as) ? { ...st, output_as: named(st.output_as) } : { action: st.action, continue_on_error: st.continue_on_error })),
     options: { ...form.options, source },
     created_at: base?.created_at ?? now,
     updated_at: now,
@@ -331,9 +355,17 @@ function actionErrors(a: RuleAction, n: string): string[] {
     }
     for (const m of members) if (m.max !== null && m.max < m.min) errors.push(`${n}: '${m.pattern}' allows fewer files than it requires.`);
   }
+  if (a.type === "verify_pair" && !a.sync_pair_id) errors.push(`${n}: choose a sync pair.`);
+  if (a.type === "list_files" && !a.output.trim()) errors.push(`${n}: choose where to save the listing.`);
+  if (a.type === "purge") {
+    if (!a.path.trim()) errors.push(`${n}: choose the folder to purge.`);
+    if (a.max_files !== null && !(a.max_files >= 1)) errors.push(`${n}: the file limit must be at least 1.`);
+  }
   if (a.type === "download_url") {
     if (!/^https?:\/\/[^/\s]+/i.test(a.url.trim())) errors.push(`${n}: enter an http(s) URL to download.`);
-    if (!a.dest_path.trim()) errors.push(`${n}: choose the folder to save into.`);
+    if (a.destination_connection_id) {
+      if (!a.remote_path?.trim()) errors.push(`${n}: enter the remote folder to upload into.`);
+    } else if (!a.dest_path.trim()) errors.push(`${n}: choose the folder to save into.`);
     if (!(a.max_mb >= 1)) errors.push(`${n}: the size limit must be at least 1 MB.`);
     if (a.sha256 && !/^([0-9a-f]{64}|.*\{.*\}.*)$/i.test(a.sha256.trim())) errors.push(`${n}: the SHA-256 must be 64 hex digits.`);
   }
@@ -361,6 +393,15 @@ export function validateForm(form: RuleForm): string[] {
     });
   } else {
     form.steps.forEach((s, i) => errors.push(...actionErrors(s.action, `Action ${i + 1}`)));
+  }
+  const names = form.workflow ? form.workflow.nodes.map((nd) => nd.output_as) : form.steps.map((st) => st.output_as);
+  const used = new Set<string>();
+  for (const raw of names) {
+    const name = raw?.trim();
+    if (!name) continue;
+    if (!RESULT_NAME.test(name)) errors.push(`"${name}" is not a valid result name: use letters, digits, _ and -, starting with a letter.`);
+    else if (used.has(name)) errors.push(`The result name "${name}" is used by more than one step.`);
+    used.add(name);
   }
   for (const r of form.conditions) {
     if (r.condition.type === "name_regex") {
@@ -393,7 +434,7 @@ export function linearSteps(wf: Workflow): ActionStep[] | null {
     // "Always" out of a step = carry on when it fails (the first action can't).
     const keepGoing = out[0]?.on === "always";
     if (keepGoing && steps.length === 0) return null;
-    steps.push({ action: n.action, continue_on_error: keepGoing });
+    steps.push({ action: n.action, continue_on_error: keepGoing, ...(n.output_as ? { output_as: n.output_as } : {}) });
     cur = out[0]?.to;
   }
   return steps.length === wf.nodes.length ? steps : null;
@@ -438,12 +479,33 @@ export interface RulePreset {
   id: string;
   label: string;
   description: string;
+  /** Extra words the template search matches (topics, step names). */
+  tags: string[];
   build: (folder: string) => RuleForm;
+}
+
+/**
+ * Templates matching `query`: every word must appear in the name,
+ * description or a tag (case-insensitive); name matches rank first.
+ * An empty query lists them all, in their own order.
+ */
+export function searchPresets(presets: RulePreset[], query: string): RulePreset[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return presets;
+  const scored: { p: RulePreset; rank: number; i: number }[] = [];
+  presets.forEach((p, i) => {
+    const name = p.label.toLowerCase();
+    const rest = `${p.description} ${p.tags.join(" ")}`.toLowerCase();
+    if (!words.every((w) => name.includes(w) || rest.includes(w))) return;
+    scored.push({ p, i, rank: words.every((w) => name.includes(w)) ? 0 : 1 });
+  });
+  return scored.sort((a, b) => a.rank - b.rank || a.i - b.i).map((x) => x.p);
 }
 
 export const PRESETS: RulePreset[] = [
   {
     id: "notify-arrivals",
+    tags: ["notification","alert","watch","folder","new files"],
     label: "Tell me when files arrive",
     description: "A notification for every new file in a folder.",
     build: (folder) => ({
@@ -454,6 +516,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "file-by-date",
+    tags: ["organise","organize","sort","move","year","month","folders"],
     label: "File arrivals by date",
     description: "Move each new file into Year/Month folders.",
     build: (folder) => ({
@@ -464,6 +527,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "expire-old",
+    tags: ["delete","retention","trash","schedule","nightly","cleanup","age"],
     label: "Clean up old files",
     description: "Every night, move files untouched for 30 days to the folder's trash.",
     build: (folder) => ({
@@ -477,6 +541,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "malware-scan",
+    tags: ["antivirus","clamav","virus","security","quarantine"],
     label: "Scan arrivals for malware",
     description: "Scan each new file with ClamAV; infected files go to a quarantine folder and you are notified.",
     build: (folder) => ({
@@ -487,6 +552,7 @@ export const PRESETS: RulePreset[] = [
   },
   {
     id: "unzip-arrivals",
+    tags: ["extract","archive","zip","decompress"],
     label: "Unzip arriving archives",
     description: "Extract new .zip files next to them and keep the archive.",
     build: (folder) => ({
@@ -494,6 +560,30 @@ export const PRESETS: RulePreset[] = [
       name: "Extract arriving zips",
       conditions: [{ key: rowKey(), negate: false, condition: { type: "extension_is", extensions: ["zip"] } }],
       steps: [{ action: { type: "extract_archive", dest_path: `${folder}/{name}`, max_entries: 10_000, delete_archive: false }, continue_on_error: false }],
+    }),
+  },
+  {
+    id: "weekly-listing",
+    tags: ["inventory", "csv", "json", "report", "list files", "schedule", "weekly"],
+    label: "Weekly file listing",
+    description: "Every Sunday write a CSV listing of everything in a folder.",
+    build: (folder) => ({
+      ...newRuleForm(folder),
+      name: "Weekly file listing",
+      trigger: { type: "schedule", cron_expr: "0 0 3 * * Sun *", cron_human: "Every Sunday at 03:00" },
+      steps: [{ action: { type: "list_files", path: folder, output: `${folder || "~"}/listing-{yyyy}-{mm}-{dd}.csv`, format: "csv", recursive: true, include_dirs: false, overwrite: true }, continue_on_error: false }],
+    }),
+  },
+  {
+    id: "remove-empty-folders",
+    tags: ["cleanup", "empty", "directories", "tidy", "schedule", "weekly"],
+    label: "Tidy up empty folders",
+    description: "Every Sunday remove folders that have nothing in them.",
+    build: (folder) => ({
+      ...newRuleForm(folder),
+      name: "Remove empty folders",
+      trigger: { type: "schedule", cron_expr: "0 0 3 * * Sun *", cron_human: "Every Sunday at 03:00" },
+      steps: [{ action: { type: "remove_empty_dirs", path: folder, remove_root: false }, continue_on_error: false }],
     }),
   },
 ];

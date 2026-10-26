@@ -14,33 +14,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The profile name meaning the top-level settings.
-pub const DEFAULT_PROFILE: &str = "default";
-
-/// Settings a profile can carry.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct Profile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_format: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_refresh: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_csrf: Option<String>,
-}
+pub use ufop_core::profiles::{valid_profile_name, Profile, DEFAULT_PROFILE};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CliConfig {
     pub api_url: Option<String>,
     pub token: Option<String>,
     pub default_format: Option<String>,
+    /// Absent in a file the desktop app created.
+    #[serde(default)]
     pub connections: Vec<SavedConnection>,
     /// `ufop server …`: base URL, access/automation token and refresh token.
     #[serde(default)]
@@ -86,21 +68,10 @@ pub fn select(profile: Option<String>, api_url: Option<String>) {
     let _ = SELECTION.set(Selection { profile: profile.filter(|p| !p.is_empty()), api_url });
 }
 
-/// Valid profile names: letters, digits, `-`, `_`, `.` (1–64).
-pub fn valid_profile_name(name: &str) -> bool {
-    (1..=64).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
 impl CliConfig {
     /// Config file path: `UFOP_CONFIG`, else ~/.config/ufop/config.toml
     pub fn path() -> PathBuf {
-        if let Some(p) = std::env::var_os("UFOP_CONFIG").filter(|p| !p.is_empty()) {
-            return PathBuf::from(p);
-        }
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("ufop");
-        config_dir.join("config.toml")
+        ufop_core::profiles::config_path(dirs::config_dir())
     }
 
     /// Load config from disk with the active profile applied, returning default if not found.
@@ -275,6 +246,23 @@ mod tests {
         c.api_url = Some("https://login".into());
         c.save_to(&f).unwrap();
         assert_eq!(CliConfig::load_raw(&f).api_url.as_deref(), Some("https://login"));
+    }
+
+    /// The desktop app creates the file with just a profile; the CLI must still read it.
+    #[test]
+    fn reads_a_file_with_only_profiles() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("ufop").join("config.toml");
+        ufop_core::profiles::save_server_url(&f, "office", "https://files.example.com").unwrap();
+        let mut c = CliConfig::load_raw(&f);
+        assert_eq!(c.profiles["office"].server_url.as_deref(), Some("https://files.example.com"));
+        c.activate("office");
+        assert_eq!(c.server_url.as_deref(), Some("https://files.example.com"));
+        c.server_token = Some("t".into());
+        c.save_to(&f).unwrap();
+        // And the desktop still lists it, now signed in.
+        let rows = ufop_core::profiles::list(&f).unwrap();
+        assert!(rows.iter().any(|r| r.name == "office" && r.signed_in));
     }
 
     #[test]

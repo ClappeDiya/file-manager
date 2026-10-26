@@ -7,6 +7,7 @@
  */
 import { create } from "zustand";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import type { RunNotify } from "@/lib/run-notify";
 
 // ── Types ──
 
@@ -29,12 +30,19 @@ export interface SyncPair {
   copy_options?: import("@/lib/copy-options").CopyOptions;
   /** Mirrors `SyncRunOptions` (ufop-core sync_types.rs). */
   run_options?: SyncRunOptions;
+  dest_state?: "scan" | "trusted_inventory" | "blind_upload";
+  checksum_algorithm?: "xxh3" | "sha256";
+  /** Copy options the pair sets itself; the rest follow the global sync
+   *  defaults. `null`: pair from before defaults existed (all its own). */
+  option_overrides?: string[] | null;
 }
 
-export interface SyncRunOptions {
+export interface SyncRunOptions extends RunNotify {
   settle_secs: number;
   completion_marker: string | null;
   version_template: string | null;
+  /** Versioned backup: keep at most this many versions of each file (null = all). */
+  keep_versions?: number | null;
 }
 
 export const DEFAULT_RUN_OPTIONS: SyncRunOptions = { settle_secs: 0, completion_marker: null, version_template: null };
@@ -50,6 +58,8 @@ export interface SyncFilter {
   max_size: number;
   file_types: string[];
   exclude_file_types: string[];
+  /** Ordered include/exclude rules, first match wins (decided before the lists above). */
+  rules?: import("@/stores/backup-store").FilterRule[];
 }
 
 export interface SyncPreview {
@@ -102,6 +112,12 @@ export interface SyncReport {
   resumed: boolean;
   /** Robocopy-compatible exit code bitmask (1 copied, 2 extras, 4 mismatches, 8 failures). */
   exit_code?: number;
+  /** Versioned backup: old versions removed by `keep_versions`. */
+  versions_pruned?: number;
+  /** What started the run: manual, scheduled, watcher, api or automation. */
+  trigger?: string;
+  /** The run changed more files than its stored item list holds. */
+  items_truncated?: boolean;
 }
 
 export interface SyncConflictItem {

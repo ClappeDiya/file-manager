@@ -392,10 +392,10 @@ pub async fn save_body(resp: reqwest::Response, local: &str) -> Result<u64, AppE
 }
 
 /// [`save_body`] with `what` naming the download in errors. The file is
-/// written as `<local>.ufop-part` and renamed once complete.
+/// written as `.<name>.ufop-part` beside it and renamed once complete.
 pub async fn save_body_as(mut resp: reqwest::Response, local: &str, what: &str) -> Result<u64, AppError> {
     use tokio::io::AsyncWriteExt;
-    let part = format!("{local}.ufop-part");
+    let part = super::staging_path_local(local);
     let mut f = tokio::fs::File::create(&part).await?;
     let mut n = 0u64;
     let r: Result<(), AppError> = async {

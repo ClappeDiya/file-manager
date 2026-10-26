@@ -1,7 +1,9 @@
 pub mod ai_engine;
 pub mod automation_engine;
 pub mod backup_engine;
+pub mod chat_control;
 pub mod commands;
+pub mod compare_engine;
 pub mod paths;
 pub mod compat_engine;
 pub mod convert_engine;
@@ -13,13 +15,18 @@ pub mod governance;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata_engine;
+pub mod embedded_server;
+pub mod feedback;
+pub mod log_query;
 pub mod logging;
 pub mod diagnostics;
 pub mod managed_settings;
 pub mod net;
+pub mod notify_hub;
 pub mod search_engine;
 pub mod thumbnail_engine;
 pub mod mount_engine;
+pub mod rclone_engine;
 pub mod narrator;
 pub mod safety;
 pub mod security;
@@ -29,19 +36,24 @@ pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod app_lock;
+pub mod cloud_folders;
+pub mod reset;
+pub mod startup;
 pub mod tray;
+pub mod tray_labels;
 
 use ai_engine::AiAssistant;
 use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, drive_commands, editor_commands, encryption_commands, file_ops_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands};
+use commands::{ai_commands, app_lock_commands, archive_commands, compat_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, desktop_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
 use commands::terminal_commands::TerminalManager;
-use connectors::{ConnectionManager, ConnectorRegistry, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
+use connectors::{ConnectionManager, ConnectorRegistry, DropboxConnector, GoogleDriveConnector, OneDriveConnector, PeerManager, S3Connector, ServerTransferManager};
 use mount_engine::MountManager;
 use core::traits::StorageOperations;
 use security::confirmation::ConfirmationManager;
@@ -71,20 +83,29 @@ struct AppState {
     s3_connector: std::sync::Arc<S3Connector>,
     gdrive_connector: std::sync::Arc<GoogleDriveConnector>,
     onedrive_connector: std::sync::Arc<OneDriveConnector>,
+    dropbox_connector: std::sync::Arc<DropboxConnector>,
+    /// Google Drive / Dropbox / OneDrive sign-ins in progress.
+    oauth_flows: std::sync::Arc<connectors::oauth_flow::OAuthFlows>,
     editor_state: std::sync::Arc<commands::editor_commands::EditorState>,
     automation_mgr: AutomationManager,
     spaces_mgr: SpacesManager,
     confirmation_mgr: ConfirmationManager,
     ledger: OperationLedger,
     safety_interlock: SafetyInterlock,
+    /// Folder comparisons: running tasks and results to act on.
+    compare_mgr: compare_engine::CompareManager,
     narrator: OperationNarrator,
     quickflow_suggester: LedgerSuggester,
     backup_mgr: BackupManager,
     schedule_library: schedule_library::ScheduleLibrary,
     fleet_agent: fleet_agent::FleetAgent,
+    /// The web server inside the app (Settings > Local web server; off until started).
+    embedded_server: embedded_server::EmbeddedServer,
     /// Optional loopback Prometheus exporter (Settings → Advanced; off by default).
     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
+    startup: startup::StartupState,
+    app_lock: app_lock::AppLock,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
@@ -93,10 +114,20 @@ struct AppState {
     credential_store: std::sync::Arc<CredentialStore>,
 }
 
+/// Settings that must be in force before any engine starts: the rclone
+/// binary and rclone.conf chosen in Settings → rclone. Applied right after
+/// the database opens, in both init paths, so saved auto-mounts, the backup
+/// scheduler and every other rclone caller use them from the first call.
+async fn apply_startup_settings(repo: &Repository) {
+    commands::rclone_commands::activate_stored(repo).await;
+}
+
 /// Initialize the database, transfer manager, and connection manager, restoring persisted state.
 async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError> {
     // Open database (creates if needed, runs migrations)
     let repo = Repository::open_default().await?;
+    // Before anything below can run rclone (auto-mounts, backups, connectors).
+    apply_startup_settings(&repo).await;
 
     // Restore transfer queue from database
     let transfer_mgr = TransferManager::new();
@@ -116,6 +147,9 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         }
     }
 
+    // Failed jobs are restored too (still failed); keep only what the saved limits allow.
+    transfer_engine::retention::enforce_at_startup(&repo).await;
+    transfer_engine::retention::persist_failures(&transfer_mgr, repo.clone());
     let queued_jobs = StorageOperations::load_transfer_queue(&repo).await?;
     if !queued_jobs.is_empty() {
         tracing::info!(
@@ -123,6 +157,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
             queued_jobs.len()
         );
         transfer_mgr.restore_jobs(queued_jobs).await;
+    }
+    if let Ok(Some(json)) = repo.get_config(PENDING_MOVES_KEY).await {
+        match serde_json::from_str::<Vec<transfer_engine::location::MoveGroup>>(&json) {
+            Ok(moves) => transfer_mgr.restore_moves(moves).await,
+            Err(e) => tracing::warn!("Pending moves not restored: {e}"),
+        }
+        let _ = repo.delete_config(PENDING_MOVES_KEY).await;
     }
 
     // Initialize credential store and connection manager
@@ -133,13 +174,15 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     let transfer_history = TransferHistory::new(repo.pool().clone());
     transfer_mgr.set_history(transfer_history.clone()).await;
 
-    // Initialize connector registry (SFTP, FTP, WebDAV, SMB, NFS, Local)
-    let connector_registry = ConnectorRegistry::new();
-
-    // Create shared connector instances for advanced cloud commands
+    // Shared OAuth connector instances: in the registry and managed for the
+    // typed cloud commands; rotated tokens are saved to the credential store.
     let s3_connector = std::sync::Arc::new(S3Connector::new());
-    let gdrive_connector = std::sync::Arc::new(GoogleDriveConnector::new());
-    let onedrive_connector = std::sync::Arc::new(OneDriveConnector::new());
+    let gdrive_connector = std::sync::Arc::new(GoogleDriveConnector::new().with_credentials(credential_store.clone()));
+    let onedrive_connector = std::sync::Arc::new(OneDriveConnector::new().with_credentials(credential_store.clone()));
+    let dropbox_connector = std::sync::Arc::new(DropboxConnector::new().with_credentials(credential_store.clone()));
+
+    // Initialize connector registry (SFTP, FTP, WebDAV, SMB, NFS, Local, cloud)
+    let connector_registry = ConnectorRegistry::with_cloud(gdrive_connector.clone(), dropbox_connector.clone(), onedrive_connector.clone());
 
     // Named schedules and holiday calendars, loaded before anything that is
     // scheduled by them (sync pairs, automation rules, backup jobs).
@@ -150,6 +193,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Initialize sync manager (T-039..T-042)
     let sync_mgr = SyncManager::new();
+    sync_mgr.attach_repository(repo.clone());
     // Restore saved pairs and re-arm their triggers. Non-fatal, matching the
     // automation-rule load below: a corrupt row must not stop the app booting.
     // The in-memory fallback path deliberately does not do this — its DB is
@@ -159,6 +203,12 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     }
     if let Err(e) = sync_mgr.load_reports_from_db(&repo, 50).await {
         tracing::warn!("Failed to load sync run history (non-fatal): {e}");
+    }
+    if let Err(e) = sync_mgr.load_default_options(&repo).await {
+        tracing::warn!("Failed to load the global sync defaults (non-fatal): {e}");
+    }
+    if let Err(e) = commands::transfer_commands::load_bandwidth_schedule(&repo).await {
+        tracing::warn!("Failed to load the bandwidth timetable (non-fatal): {e}");
     }
 
     // Initialize peer manager (T-031) and server transfer manager (T-033)
@@ -205,6 +255,14 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     if let Err(e) = ledger.prune(30).await {
         tracing::warn!("Operation ledger prune failed (non-fatal): {e}");
     }
+    // Copies of connection files opened or previewed: keep a week, 1 GB.
+    tokio::task::spawn_blocking(|| {
+        use commands::connector_commands::{preview_cache_root, prune_preview_cache, PREVIEW_CACHE_MAX_AGE, PREVIEW_CACHE_MAX_BYTES};
+        let removed = prune_preview_cache(&preview_cache_root(), PREVIEW_CACHE_MAX_AGE, PREVIEW_CACHE_MAX_BYTES);
+        if removed > 0 {
+            tracing::info!("Removed {removed} cached connection previews");
+        }
+    });
 
     // Initialize automation manager (Quickflows)
     let mut automation_mgr = AutomationManager::new();
@@ -274,10 +332,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     }
     // Management console agent (registration, heartbeats, policies, reports);
     // its loop starts in `setup`, like the scheduler.
+    let embedded_server = embedded_server::EmbeddedServer::new(repo.clone(), backup_mgr.clone(), connection_mgr.clone(), agent_store.clone());
     let fleet_agent = fleet_agent::init_or_default(backup_mgr.clone(), agent_store, credential_store.clone(), "desktop").await;
     // The scheduler starts in Tauri's `setup` hook: this function runs on a
     // throwaway runtime whose spawned tasks die when it is dropped.
     let background_mode = tray::load_background_mode(&repo).await;
+    let startup = startup::load(&repo).await;
+    let app_lock = app_lock::AppLock::load(&repo, master_pw_mgr.is_master_password_set(&repo).await.unwrap_or(false)).await;
 
     Ok(AppState {
         repo,
@@ -296,6 +357,8 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         s3_connector,
         gdrive_connector,
         onedrive_connector,
+        dropbox_connector,
+        oauth_flows: std::sync::Arc::new(connectors::oauth_flow::OAuthFlows::new()),
         editor_state,
         automation_mgr,
         spaces_mgr,
@@ -303,12 +366,16 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         ledger,
         schedule_library,
         safety_interlock,
+        compare_mgr: compare_engine::CompareManager::new(),
         narrator,
         quickflow_suggester,
         desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
         backup_mgr,
         fleet_agent,
+        embedded_server,
         background_mode,
+        startup,
+        app_lock,
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
@@ -335,7 +402,7 @@ fn start_background_engines(app: tauri::AppHandle) {
             let manager = app.state::<SyncManager>();
             let ledger = app.state::<OperationLedger>();
             let repo = app.state::<Repository>();
-            match commands::sync_commands::run_sync_pair(&manager, &ledger, &repo, &pair_id.to_string()).await {
+            match commands::sync_commands::run_sync_pair_as(&manager, &ledger, &repo, &pair_id.to_string(), ufop_core::run_trigger::RunTrigger::Scheduled).await {
                 Ok(report) => tracing::info!("Scheduled sync {} finished: {:?}", report.pair_name, report.status),
                 Err(e) => tracing::warn!("Scheduled sync {pair_id} failed: {e}"),
             }
@@ -365,15 +432,35 @@ fn start_background_engines(app: tauri::AppHandle) {
 }
 
 /// Persist transfer queue and workspace state on shutdown.
+/// The queued jobs kept over a restart. A folder comparison's transfers
+/// end with the app: its connector transfers (only shown in the queue) and
+/// its local copies into a staging file (only moved into place by the
+/// comparison that started them) are not resumed.
+fn jobs_to_persist(jobs: Vec<core::types::TransferJob>) -> Vec<core::types::TransferJob> {
+    jobs.into_iter().filter(|j| !j.external && !compare_engine::apply::is_staging(&j.dest_path)).collect()
+}
+
 async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) {
-    // Save transfer queue
-    let jobs = transfer_mgr.snapshot_jobs().await;
+    // Save transfer queue (see `jobs_to_persist`).
+    let jobs = jobs_to_persist(transfer_mgr.snapshot_jobs().await);
     if let Err(e) = StorageOperations::save_transfer_queue(repo, &jobs).await {
         tracing::error!("Failed to persist transfer queue on shutdown: {e}");
     } else {
         tracing::info!("Transfer queue persisted ({} job(s))", jobs.len());
     }
+    // The moves among them, so a restored job still removes its original.
+    let moves = transfer_mgr.snapshot_moves().await;
+    let saved = match serde_json::to_string(&moves) {
+        Ok(json) if !moves.is_empty() => repo.set_config(PENDING_MOVES_KEY, &json).await,
+        _ => repo.delete_config(PENDING_MOVES_KEY).await.map(|_| ()),
+    };
+    if let Err(e) = saved {
+        tracing::error!("Failed to persist pending moves on shutdown: {e}");
+    }
 }
+
+/// Moves not finished when the app quit (`TransferManager::snapshot_moves`).
+const PENDING_MOVES_KEY: &str = "transfer.pending_moves";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -399,14 +486,19 @@ pub fn run() {
                 let repo = rt2
                     .block_on(Repository::open_in_memory())
                     .expect("Failed to create in-memory database");
+                rt2.block_on(apply_startup_settings(&repo));
                 let credential_store = std::sync::Arc::new(CredentialStore::new());
                 let connection_mgr = ConnectionManager::new(repo.clone(), credential_store.clone());
+                let fb_gdrive = std::sync::Arc::new(GoogleDriveConnector::new().with_credentials(credential_store.clone()));
+                let fb_onedrive = std::sync::Arc::new(OneDriveConnector::new().with_credentials(credential_store.clone()));
+                let fb_dropbox = std::sync::Arc::new(DropboxConnector::new().with_credentials(credential_store.clone()));
                 let transfer_history = TransferHistory::new(repo.pool().clone());
                 let transfer_mgr = TransferManager::new();
                 let vault_mgr = VaultManager::new();
                 rt2.block_on(async {
                     transfer_mgr.init_journal(repo.pool().clone()).await;
                     transfer_mgr.set_history(transfer_history.clone()).await;
+                    transfer_engine::retention::persist_failures(&transfer_mgr, repo.clone());
                     vault_mgr.set_pool(repo.pool().clone()).await;
                 });
                 let ledger = OperationLedger::new(repo.pool().clone());
@@ -434,9 +526,16 @@ pub fn run() {
                     credential_store.clone(),
                     "desktop",
                 ));
+                let embedded_server = embedded_server::EmbeddedServer::new(
+                    repo.clone(),
+                    backup_mgr.clone(),
+                    connection_mgr.clone(),
+                    crate::security::settings_store::SettingsStore::plain(repo.pool().clone()),
+                );
                 let audit_trail = security::audit::AuditTrail::new(repo.pool().clone(), Some(credential_store.clone()), None);
                 let ai_assistant = AiAssistant::with_audit(repo.pool().clone());
                 let fallback_schedules = schedule_library::ScheduleLibrary::new(repo.pool().clone());
+                let fallback_repo = repo.clone();
                 AppState {
                     metadata_store: metadata_engine::MetadataStore::new(repo.clone()),
                     search_manager: search_engine::SearchManager::new(
@@ -449,8 +548,12 @@ pub fn run() {
                     transfer_mgr,
                     connection_mgr,
                     transfer_history,
-                    connector_registry: ConnectorRegistry::new(),
-                    sync_mgr: SyncManager::new(),
+                    connector_registry: ConnectorRegistry::with_cloud(fb_gdrive.clone(), fb_dropbox.clone(), fb_onedrive.clone()),
+                    sync_mgr: {
+                        let m = SyncManager::new();
+                        m.attach_repository(fallback_repo.clone());
+                        m
+                    },
                     peer_mgr: PeerManager::new(),
                     server_transfer_mgr: ServerTransferManager::new(),
                     ai_assistant,
@@ -459,8 +562,10 @@ pub fn run() {
                     master_pw_mgr: MasterPasswordManager::new(),
                     mount_mgr: MountManager::new(),
                     s3_connector: std::sync::Arc::new(S3Connector::new()),
-                    gdrive_connector: std::sync::Arc::new(GoogleDriveConnector::new()),
-                    onedrive_connector: std::sync::Arc::new(OneDriveConnector::new()),
+                    gdrive_connector: fb_gdrive,
+                    onedrive_connector: fb_onedrive,
+                    dropbox_connector: fb_dropbox,
+                    oauth_flows: std::sync::Arc::new(connectors::oauth_flow::OAuthFlows::new()),
                     editor_state: std::sync::Arc::new(commands::editor_commands::EditorState::new()),
                     automation_mgr,
                     spaces_mgr: SpacesManager::new(),
@@ -468,22 +573,38 @@ pub fn run() {
                     ledger,
                     schedule_library: fallback_schedules,
                     safety_interlock,
+                    compare_mgr: compare_engine::CompareManager::new(),
                     narrator,
                     quickflow_suggester,
                     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics::new(backup_mgr.clone()),
                     backup_mgr,
                     fleet_agent,
+                    embedded_server,
                     background_mode: tray::BackgroundMode::default(),
+                    startup: startup::StartupState::default(),
+                    app_lock: app_lock::AppLock::default(),
                     audit_trail,
                 }
             }
         }
     };
 
+    // Pane transfers to and from saved connections run in the transfer queue;
+    // it signs in through the registry and the saved connections (set here so
+    // both init paths above get it).
+    app_state.transfer_mgr.set_remote_resolver(std::sync::Arc::new(commands::connector_commands::PaneResolver::new(
+        app_state.connector_registry.clone(),
+        app_state.connection_mgr.clone(),
+    )));
+
     // Clone for shutdown hook
     let shutdown_repo = app_state.repo.clone();
     let setup_backup_mgr = app_state.backup_mgr.clone();
     let close_mode = app_state.background_mode.clone();
+    let window_startup = app_state.startup.clone();
+    let setup_startup = app_state.startup.clone();
+    let ipc_lock = app_state.app_lock.clone();
+    let setup_lock = app_state.app_lock.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
     let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
@@ -523,6 +644,25 @@ pub fn run() {
                     tracing::warn!("Backup notification failed: {e}");
                 }
             }));
+            // Transfers and sync runs → OS notifications, when Settings →
+            // Notifications asks for them; sync results → the pair's profile.
+            let desktop = app.handle().clone();
+            let sink: std::sync::Arc<dyn Fn(notify_hub::desktop::DesktopEvent) + Send + Sync> = std::sync::Arc::new(move |event| {
+                let app = desktop.clone();
+                tauri::async_runtime::spawn(async move { notify_hub::desktop::show(&app, event).await });
+            });
+            notify_hub::desktop::wire_transfers(&app.state::<TransferManager>(), sink.clone());
+            notify_hub::desktop::wire_sync(&app.state::<SyncManager>(), sink);
+            notify_hub::run::wire_sync_reports(app.handle());
+            notify_hub::run::wire_profile_users(app.handle());
+            // Chat-bot remote control: nothing starts unless the user turned it on.
+            app.manage(chat_control::service::ChatControlService::new(app.handle().clone()));
+            let chat = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = chat.state::<chat_control::service::ChatControlService>().apply(false).await {
+                    tracing::warn!("Remote control did not start: {}", e.user_message());
+                }
+            });
             mgr.start_scheduler();
             // The Prometheus exporter, when the user turned it on.
             let metrics = setup_metrics.clone();
@@ -543,13 +683,28 @@ pub fn run() {
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
-            if let Err(e) = tray::setup(app, mgr) {
-                tracing::warn!("System tray unavailable (non-fatal): {e}");
+            commands::mount_commands::forward_mount_changes(app.handle().clone(), &app.state::<MountManager>());
+            app_lock::spawn_idle_watch(app.handle().clone(), setup_lock.clone());
+            match tray::setup(app, mgr) {
+                Ok(()) => setup_startup.set_tray_created(true),
+                Err(e) => tracing::warn!("System tray unavailable (non-fatal): {e}"),
             }
-            // Launched at login: start hidden in the tray.
-            if std::env::args().any(|a| a == "--background") {
-                for w in app.webview_windows().values() {
-                    let _ = w.hide();
+            // Settings → Startup & Tray: tray icon, and the window at launch
+            // (hidden at login, or every launch when asked).
+            let prefs = setup_startup.get();
+            if let Some(tray) = app.tray_by_id("ufop") {
+                let _ = tray.set_visible(prefs.show_tray_icon);
+            }
+            let launch = setup_startup.effective(app.state::<tray::BackgroundMode>().enabled()).launch;
+            for w in app.webview_windows().values() {
+                match launch {
+                    startup::LaunchWindow::Show => {}
+                    startup::LaunchWindow::Hide => {
+                        let _ = w.hide();
+                    }
+                    startup::LaunchWindow::Minimize => {
+                        let _ = w.minimize();
+                    }
                 }
             }
             Ok(())
@@ -570,6 +725,8 @@ pub fn run() {
         .manage(app_state.s3_connector)
         .manage(app_state.gdrive_connector)
         .manage(app_state.onedrive_connector)
+        .manage(app_state.dropbox_connector)
+        .manage(app_state.oauth_flows)
         .manage(app_state.editor_state)
         .manage(app_state.automation_mgr)
         .manage(app_state.spaces_mgr)
@@ -577,19 +734,24 @@ pub fn run() {
         .manage(app_state.ledger)
         .manage(app_state.schedule_library)
         .manage(app_state.safety_interlock)
+        .manage(app_state.compare_mgr)
         .manage(app_state.narrator)
         .manage(app_state.quickflow_suggester)
         .manage(app_state.backup_mgr)
         .manage(app_state.fleet_agent)
+        .manage(app_state.embedded_server)
         .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
+        .manage(app_state.startup)
+        .manage(app_state.app_lock)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
         .manage(app_state.thumbnails)
         .manage(app_state.office_renderer)
         .manage(app_state.credential_store)
-        .invoke_handler(tauri::generate_handler![
+        // While the app lock is on, only the lock screen's commands run.
+        .invoke_handler(app_lock::gate(ipc_lock, tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
             audit_commands::export_audit_log,
@@ -599,6 +761,22 @@ pub fn run() {
             system_commands::greet,
             system_commands::get_app_version,
             system_commands::get_portable_status,
+            desktop_commands::set_ui_language,
+            desktop_commands::get_startup_settings,
+            desktop_commands::set_startup_settings,
+            desktop_commands::reset_settings,
+            desktop_commands::detect_cloud_folders,
+            desktop_commands::open_new_window,
+            app_lock_commands::app_lock_status,
+            app_lock_commands::app_lock_set_settings,
+            app_lock_commands::app_lock_now,
+            app_lock_commands::app_lock_unlock,
+            app_lock_commands::app_lock_activity,
+            compat_commands::compat_profiles,
+            compat_commands::compat_scan_folder,
+            compat_commands::compat_fix_names,
+            compat_commands::compat_list_renames,
+            compat_commands::compat_restore_names,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
@@ -618,6 +796,7 @@ pub fn run() {
             confirmation_commands::request_destructive_confirmation,
             // Transfer management (T-015)
             transfer_commands::enqueue_transfer,
+            transfer_commands::enqueue_location_transfer,
             transfer_commands::pause_transfer,
             transfer_commands::resume_transfer,
             transfer_commands::cancel_transfer,
@@ -626,6 +805,8 @@ pub fn run() {
             transfer_commands::set_transfer_priority,
             transfer_commands::reorder_transfer,
             transfer_commands::set_global_throttle,
+            transfer_commands::get_bandwidth_schedule,
+            transfer_commands::set_bandwidth_schedule,
             transfer_commands::set_connection_throttle,
             transfer_commands::get_throttle_config,
             transfer_commands::update_transfer_progress,
@@ -649,6 +830,8 @@ pub fn run() {
             transfer_commands::search_transfer_history,
             transfer_commands::export_transfer_history,
             transfer_commands::cleanup_transfer_history,
+            transfer_commands::get_failed_transfer_retention,
+            transfer_commands::set_failed_transfer_retention,
             // Three-layer architecture
             transfer_commands::set_verify_tier,
             transfer_commands::get_verify_tier,
@@ -664,6 +847,9 @@ pub fn run() {
             connection_commands::delete_connection,
             connection_commands::test_connection,
             connection_commands::search_connections,
+            connection_commands::set_connection_starred,
+            connection_commands::list_connection_status,
+            connection_commands::clear_connection_credentials_rejected,
             connection_commands::create_connection_group,
             connection_commands::list_connection_groups,
             connection_commands::delete_connection_group,
@@ -685,6 +871,31 @@ pub fn run() {
             connector_commands::connector_make_directory,
             connector_commands::connector_remove,
             connector_commands::connector_list_protocols,
+            // OAuth sign-in (Google Drive, Dropbox, OneDrive)
+            oauth_commands::oauth_provider_info,
+            oauth_commands::oauth_begin,
+            oauth_commands::oauth_await,
+            oauth_commands::oauth_complete,
+            oauth_commands::oauth_cancel,
+            oauth_commands::oauth_import_grant,
+            oauth_commands::oauth_sign_out,
+            oauth_commands::oauth_status,
+            oauth_commands::gdrive_list_shared_drives,
+            oauth_commands::onedrive_search_sites,
+            oauth_commands::onedrive_list_site_libraries,
+            oauth_commands::dropbox_list_namespaces,
+            connector_commands::connector_quota,
+            connector_commands::connector_folder_size,
+            connector_commands::connector_folder_size_cancel,
+            // Folder compare and reconcile
+            commands::compare_commands::compare_folders,
+            commands::compare_commands::compare_cancel,
+            commands::compare_commands::compare_release,
+            commands::compare_commands::compare_plan_action,
+            commands::compare_commands::compare_apply,
+            connector_commands::connector_rename,
+            connector_commands::connector_stat,
+            connector_commands::connector_fetch_preview,
             // SMB/CIFS (T-023)
             drive_commands::smb_discover_shares,
             drive_commands::smb_list_shares,
@@ -714,13 +925,18 @@ pub fn run() {
             backup_commands::backup_get_job,
             backup_commands::backup_save_job,
             backup_commands::backup_delete_job,
+            backup_commands::duplicate_backup_job,
             backup_commands::backup_test_destination,
             backup_commands::backup_test_destination_compat,
             backup_commands::backup_run,
             backup_commands::backup_execute,
             backup_commands::backup_cancel,
             backup_commands::backup_change_passphrase,
+            chat_control_commands::chat_control_get,
+            chat_control_commands::chat_control_save,
+            chat_control_commands::chat_control_status,
             schedule_commands::schedules_list,
+            schedule_commands::upcoming_runs,
             schedule_commands::schedule_save,
             schedule_commands::schedule_delete,
             schedule_commands::calendars_list,
@@ -744,6 +960,7 @@ pub fn run() {
             backup_commands::backup_search,
             backup_commands::backup_compare,
             backup_commands::backup_run_history,
+            backup_commands::backup_replica_history,
             backup_commands::desktop_metrics_status,
             backup_commands::desktop_metrics_configure,
             backup_commands::backup_prune_history,
@@ -833,6 +1050,8 @@ pub fn run() {
             sync_commands::update_sync_pair,
             sync_commands::run_sync,
             sync_commands::get_sync_run_history,
+            sync_commands::get_sync_run_items,
+            sync_commands::get_sync_live_files,
             sync_commands::prune_sync_run_history,
             sync_commands::get_sync_health,
             sync_commands::sync_dry_run,
@@ -842,6 +1061,13 @@ pub fn run() {
             sync_commands::get_quarantine_entries,
             sync_commands::get_sync_reports,
             sync_commands::rollback_sync,
+            sync_commands::get_sync_baseline_info,
+            sync_commands::reset_sync_baseline,
+            sync_commands::duplicate_sync_pair,
+            sync_commands::export_sync_pair,
+            sync_commands::import_sync_pair,
+            sync_commands::get_sync_default_options,
+            sync_commands::set_sync_default_options,
             sync_commands::export_sync_report_csv,
             sync_commands::export_sync_report_json,
             sync_commands::start_sync_watcher,
@@ -851,6 +1077,11 @@ pub fn run() {
             sync_commands::detect_time_offset,
             // Sync Filter Presets
             sync_commands::get_sync_filter_presets,
+            filter_commands::parse_filter_rules,
+            filter_commands::get_filter_groups,
+            filter_commands::list_user_filter_presets,
+            filter_commands::save_user_filter_preset,
+            filter_commands::delete_user_filter_preset,
             sync_commands::parse_robocopy_command,
             sync_commands::robocopy_command_preview,
             sync_commands::get_sync_progress,
@@ -913,6 +1144,7 @@ pub fn run() {
             ai_commands::ai_set_ollama_model,
             // Terminal (T-046)
             terminal_commands::terminal_create_local,
+            terminal_commands::terminal_help_commands,
             terminal_commands::terminal_create_remote,
             terminal_commands::terminal_list_sessions,
             terminal_commands::terminal_close_session,
@@ -994,6 +1226,22 @@ pub fn run() {
             commands::proxy_commands::proxy_set,
             commands::proxy_commands::proxy_test,
             commands::connector_commands::rclone_list_remotes,
+            commands::rclone_commands::rclone_status,
+            commands::rclone_commands::rclone_settings_get,
+            commands::rclone_commands::rclone_settings_set,
+            commands::rclone_commands::rclone_detect,
+            commands::rclone_commands::rclone_install_managed,
+            commands::rclone_commands::rclone_providers,
+            commands::rclone_commands::rclone_remote_get,
+            commands::rclone_commands::rclone_remote_create,
+            commands::rclone_commands::rclone_remote_update,
+            commands::rclone_commands::rclone_config_continue,
+            commands::rclone_commands::rclone_config_oauth,
+            commands::rclone_commands::rclone_config_cancel,
+            commands::rclone_commands::rclone_remote_delete,
+            commands::rclone_commands::rclone_remote_test,
+            commands::rclone_commands::rclone_crypt_info,
+            commands::rclone_commands::rclone_cryptdecode,
             commands::connector_commands::connection_presets,
             file_ops_commands::move_files,
             file_ops_commands::rename_file,
@@ -1065,6 +1313,12 @@ pub fn run() {
             mount_commands::mount_cache_usage,
             mount_commands::mount_clear_cache,
             mount_commands::delete_mount_config,
+            mount_commands::update_mount_config,
+            mount_commands::saved_mount_options,
+            mount_commands::mount_saved_config,
+            mount_commands::unmount_all_mounts,
+            mount_commands::free_drive_letters,
+            mount_commands::open_mount_point,
             // Settings Export/Import & Sync
             settings_commands::export_all_settings,
             settings_commands::import_all_settings,
@@ -1163,6 +1417,19 @@ pub fn run() {
             log_commands::diagnostics_send,
             log_commands::set_log_level,
             log_commands::get_log_directory,
+            log_commands::query_logs,
+            embedded_server_commands::embedded_server_status,
+            embedded_server_commands::embedded_server_save_settings,
+            embedded_server_commands::embedded_server_start,
+            embedded_server_commands::embedded_server_stop,
+            embedded_server_commands::embedded_server_set_password,
+            embedded_server_commands::open_server_in_browser,
+            embedded_server_commands::server_profiles_list,
+            embedded_server_commands::server_profile_save,
+            embedded_server_commands::server_profile_remove,
+            embedded_server_commands::server_profile_test,
+            feedback_commands::feedback_destination,
+            feedback_commands::feedback_submit,
             log_commands::export_logs_json,
             log_commands::export_logs_to_file,
             // Trusted SSH Host CAs
@@ -1180,6 +1447,8 @@ pub fn run() {
             automation_commands::automation_rule_revisions,
             automation_commands::automation_restore_revision,
             automation_commands::automation_convert_to_workflow,
+            automation_commands::automation_action_risks,
+            automation_commands::automation_rule_confirmations,
             automation_commands::create_automation_rule,
             automation_commands::update_automation_rule,
             automation_commands::delete_automation_rule,
@@ -1240,18 +1509,33 @@ pub fn run() {
             safety_commands::safety_confirm_intent,
             // Operation Narrator (plain-language cross-engine story per correlation trace)
             narrator_commands::narrator_narrate_operation,
-        ])
+        ]))
         .on_window_event(move |window, event| {
             // "Keep running in the tray": closing hides the window so
             // scheduled backups continue.
+            // Other windows (File → New Window) just close.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if close_mode.enabled() {
+                if window.label() == "main" && window_startup.effective(close_mode.enabled()).close_to_tray {
                     api.prevent_close();
                     let _ = window.hide();
                     return;
                 }
             }
+            // "Minimise to the tray": the minimised main window leaves the
+            // taskbar (the tray's Open brings back the main window only, so
+            // other windows stay in the taskbar).
+            if let tauri::WindowEvent::Resized(_) = event {
+                if window.label() == "main" && window_startup.effective(close_mode.enabled()).minimize_to_tray && window.is_minimized().unwrap_or(false) {
+                    let _ = window.hide();
+                }
+            }
+            // The app ends with its last window: only then stop and persist.
             if let tauri::WindowEvent::Destroyed = event {
+                use tauri::Manager;
+                let open: Vec<String> = window.app_handle().webview_windows().keys().cloned().collect();
+                if !startup::is_last_window(window.label(), open.iter().map(String::as_str)) {
+                    return;
+                }
                 tracing::info!("Window closing, persisting state...");
                 // Running backups stop at a safe point (partial version,
                 // repository lock released) before the app exits.
@@ -1284,6 +1568,90 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a folder comparison's local copy (into a hidden staging
+    /// file) was saved with the queue at exit and could resume on restart,
+    /// leaving the staging file behind; only connector transfers were left out.
+    #[tokio::test]
+    async fn the_queue_kept_over_a_restart_leaves_out_a_comparisons_transfers() {
+        use crate::core::traits::TransferOperations;
+        let mgr = TransferManager::new();
+        mgr.enqueue("/a/file.zip", "/b/file.zip", 10).await.unwrap();
+        mgr.enqueue("/a/x.txt", "/b/.x.txt.ufop-compare-0a1b2c3d", 10).await.unwrap();
+        mgr.track_external("sftp://s/y.txt", "/b/y.txt", 10, None).await.unwrap();
+        let kept = jobs_to_persist(mgr.snapshot_jobs().await);
+        assert_eq!(kept.iter().map(|j| j.dest_path.as_str()).collect::<Vec<_>>(), ["/b/file.zip"]);
+        assert!(!compare_engine::apply::is_staging("/b/.x.txt.ufop-compare-notahex!"));
+        assert!(!compare_engine::apply::is_staging("/b/x.txt.ufop-compare-0a1b2c3d"), "not hidden");
+        assert!(compare_engine::apply::is_staging("C:\\b\\.x.ufop-compare-0A1B2C3D"));
+        // Review: a long name's staging file stays within 255 bytes and is
+        // still recognised as staging.
+        let long = std::path::PathBuf::from("/b").join(format!("{}.txt", "y".repeat(248)));
+        let staging = compare_engine::apply::staging_for(&long);
+        assert!(staging.file_name().unwrap().len() <= 255, "{}", staging.display());
+        assert!(compare_engine::apply::is_staging(&staging.to_string_lossy()));
+    }
+
+    /// The stored rclone settings become the ones every rclone call uses.
+    #[tokio::test]
+    async fn startup_settings_make_the_stored_rclone_current() {
+        use crate::rclone_engine::resolver::{self, BinarySource, RcloneSettings};
+        let prior = resolver::current_settings();
+        let repo = Repository::open_in_memory().await.unwrap();
+        // The binary the default lookup already finds (rclone tests running in
+        // parallel see the same program); without one, a stand-in that fails
+        // like a missing rclone.
+        let d = tempfile::tempdir().unwrap();
+        let found = resolver::resolve();
+        let bin = if found.found && std::path::Path::new(&found.path).is_absolute() {
+            found.path.clone()
+        } else {
+            let p = d.path().join("rclone");
+            std::fs::write(&p, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p.to_string_lossy().into_owned()
+        };
+        let stored = commands::rclone_commands::persist(&repo, RcloneSettings { binary_path: Some(bin.clone()), config_path: None }).await.unwrap();
+        apply_startup_settings(&repo).await;
+        let (applied, now) = (resolver::current_settings(), resolver::resolve());
+        resolver::apply(prior);
+        assert_eq!(applied, stored);
+        assert_eq!((now.path.as_str(), now.source), (bin.as_str(), BinarySource::Settings));
+    }
+
+    /// Regression: saved auto-mounts were started in `initialize_app_state`
+    /// while the rclone settings were only applied later (in
+    /// `start_background_engines`), so startup mounts ignored the binary and
+    /// rclone.conf chosen in Settings. Both init paths must apply them as
+    /// soon as the database is open, before anything can run rclone.
+    #[test]
+    fn startup_settings_are_applied_before_any_engine_starts() {
+        let src = include_str!("lib.rs");
+        let body = |start: &str, end: &str| {
+            let a = src.find(start).unwrap_or_else(|| panic!("{start} not found"));
+            let b = a + src[a..].find(end).unwrap_or_else(|| panic!("{end} not found after {start}"));
+            &src[a..b]
+        };
+        let pos = |hay: &str, needle: &str| hay.find(needle).unwrap_or_else(|| panic!("{needle} not found"));
+        let apply = "apply_startup_settings(&repo).await";
+        // Normal path: right after the database opens, before auto-mounts and managers.
+        let init = body("async fn initialize_app_state()", "\n}\n");
+        let opened = pos(init, "Repository::open_default()");
+        let applied = pos(init, apply);
+        assert!(opened < applied, "settings applied before the database opens");
+        for later in ["auto_mount_saved", "TransferManager::new()", "BackupManager::"] {
+            assert!(applied < pos(init, later), "{later} runs before the rclone settings are applied");
+        }
+        // Fallback path: the same, before its managers are built.
+        let fallback = body("Starting with in-memory database as fallback", "AppState {");
+        let mem = pos(fallback, "Repository::open_in_memory()");
+        let applied = pos(fallback, "apply_startup_settings(&repo)");
+        assert!(mem < applied && applied < pos(fallback, "TransferManager::new()"), "fallback path does not apply the rclone settings first");
+    }
 
     #[tokio::test]
     async fn test_initialize_with_in_memory() {

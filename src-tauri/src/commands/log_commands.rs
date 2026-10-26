@@ -126,6 +126,17 @@ pub async fn get_log_directory() -> Result<String, AppError> {
     Ok(log_dir.to_string_lossy().to_string())
 }
 
+/// One page of the app's own log, newest first, for the in-app log viewer:
+/// filter by lowest level, module, time range and text; pass the previous
+/// page's `next_cursor` for older records, or `since` (the newest record's
+/// time) to follow the log live.
+#[tauri::command]
+pub async fn query_logs(query: crate::log_query::LogQuery) -> Result<crate::log_query::LogPage, AppError> {
+    tokio::task::spawn_blocking(move || crate::log_query::query(&get_log_dir_path(), &query))
+        .await
+        .map_err(|e| AppError::internal(format!("Log reader failed: {e}")))?
+}
+
 /// Export recent log entries as structured JSON.
 ///
 /// Reads the latest log file and parses it into structured entries.

@@ -1,5 +1,8 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { isSecondaryWindow, sharedWindowStorage } from "@/lib/app-window";
+import { locationLabel } from "@/lib/location";
+import { useConnectionsStore } from "@/stores/connections-store";
 
 // ──────────────────────────────────────────────
 // Types
@@ -463,6 +466,12 @@ function genId(): string {
   return `id-${Date.now()}-${++_idCounter}`;
 }
 
+/** Tab label of a pane path: local paths as always; a connection folder's
+ *  listed name, or the connection's name at its root. */
+export function paneLabel(path: string): string {
+  return locationLabel(path, (id) => useConnectionsStore.getState().nameOf(id));
+}
+
 function getHomePath(): string {
   // In Tauri, we get this from the backend. Default to "/" for now.
   return "/";
@@ -513,6 +522,11 @@ const MAX_SELECTION_STASHES = 20;
 // ──────────────────────────────────────────────
 // Store
 // ──────────────────────────────────────────────
+
+export const FILE_MANAGER_STORAGE_KEY = "ufop-file-manager-state";
+
+/** What each window has for itself; everything else persisted is shared by all windows. */
+export const WINDOW_FIELDS = ["panes", "activePaneIndex", "singlePaneMode", "paneSplitPercent", "paneOrientation", "syncBrowsing", "recentlyClosedTabs", "selectionStashes"] as const;
 
 export const useFileManagerStore = create<FileManagerState>()(
   persist(
@@ -1356,7 +1370,7 @@ export const useFileManagerStore = create<FileManagerState>()(
           if (idx <= 0) return s;
           const newIdx = idx - 1;
           const newPath = history[newIdx];
-          const newLabel = newPath === "/" ? "Root" : newPath.split("/").filter(Boolean).pop() || "Root";
+          const newLabel = paneLabel(newPath);
           pane.tabs = pane.tabs.map((t) =>
             t.id === tab.id ? { ...t, path: newPath, label: newLabel, historyIndex: newIdx } : t,
           );
@@ -1375,7 +1389,7 @@ export const useFileManagerStore = create<FileManagerState>()(
           if (idx >= history.length - 1) return s;
           const newIdx = idx + 1;
           const newPath = history[newIdx];
-          const newLabel = newPath === "/" ? "Root" : newPath.split("/").filter(Boolean).pop() || "Root";
+          const newLabel = paneLabel(newPath);
           pane.tabs = pane.tabs.map((t) =>
             t.id === tab.id ? { ...t, path: newPath, label: newLabel, historyIndex: newIdx } : t,
           );
@@ -1423,7 +1437,9 @@ export const useFileManagerStore = create<FileManagerState>()(
       },
     }),
     {
-      name: "ufop-file-manager-state",
+      name: FILE_MANAGER_STORAGE_KEY,
+      // A second window keeps its own panes and layout (see `app-window.ts`).
+      storage: createJSONStorage(() => sharedWindowStorage(localStorage, WINDOW_FIELDS, isSecondaryWindow())),
       partialize: (state) => ({
         panes: state.panes,
         singlePaneMode: state.singlePaneMode,

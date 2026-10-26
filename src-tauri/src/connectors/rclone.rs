@@ -1,6 +1,7 @@
 //! Connector for anything rclone can reach (Google Cloud Storage, Box,
-//! pCloud, Mega, Backblaze, Jottacloud… 70+ backends) through the user's
-//! `rclone` binary and its configured remotes.
+//! pCloud, Mega, Backblaze, Jottacloud… 70+ backends) through the rclone
+//! binary and rclone.conf chosen by `rclone_engine::resolver` (Settings →
+//! rclone, then `UFOP_RCLONE`, then `PATH`) and its configured remotes.
 //!
 //! A connection names a remote (`gcs:` from `rclone config`, or an
 //! on-the-fly `:backend,opt=value:`). Listing uses `rclone lsjson`; files
@@ -9,6 +10,7 @@
 use super::{Connector, ShareLink, ShareOptions, ShareScope};
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, FileEntry};
+use crate::rclone_engine::Rclone;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -38,10 +40,6 @@ struct LsJsonEntry {
     is_dir: bool,
 }
 
-fn exe() -> String {
-    std::env::var("UFOP_RCLONE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "rclone".into())
-}
-
 /// `gdrive` → `gdrive:`; `:s3,provider=AWS:` and `gdrive:bucket` stay.
 pub fn normalize_remote(remote: &str) -> Result<String, AppError> {
     let r = remote.trim();
@@ -66,27 +64,15 @@ pub fn target(remote: &str, path: &str) -> String {
     }
 }
 
-/// Run rclone with `args`; stdout on success, the last stderr line otherwise.
+/// Run rclone with `args` (the resolved binary and config file); stdout on
+/// success, the last stderr line otherwise.
 async fn run(args: &[String], timeout: Duration) -> Result<String, AppError> {
-    let mut cmd = tokio::process::Command::new(exe());
-    cmd.args(args).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    let out = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| AppError::connection("rclone timed out", "Check the remote is reachable."))?
-        .map_err(|e| AppError::connection(format!("Could not start rclone: {e}"), "Install rclone (https://rclone.org/install/) or set UFOP_RCLONE to its path."))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("unknown error");
-        let msg = line.split_once(" : ").map(|(_, m)| m).unwrap_or(line).trim();
-        return Err(AppError::connection(format!("rclone: {msg}"), "Check the remote with `rclone config` and try again."));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Rclone::current().run(args, timeout).await
 }
 
 /// Configured remotes, for the connection form.
 pub async fn list_remotes() -> Result<Vec<RcloneRemote>, AppError> {
-    let out = run(&["listremotes".into(), "--long".into()], LIST_TIMEOUT).await?;
-    Ok(parse_listremotes(&out))
+    crate::rclone_engine::config::list_remotes(&Rclone::current()).await
 }
 
 pub fn parse_listremotes(out: &str) -> Vec<RcloneRemote> {
@@ -124,6 +110,20 @@ pub fn parse_lsjson(out: &str, dir: &str) -> Result<Vec<FileEntry>, AppError> {
 
 pub struct RcloneConnector {
     remote: RwLock<Option<String>>,
+    /// rclone binary for `about` / `size` (tests); `None` = the resolved one.
+    program: Option<String>,
+}
+
+/// `rclone about --json` → quota.
+pub fn parse_about(out: &str) -> Result<super::RemoteQuota, AppError> {
+    let v: serde_json::Value = serde_json::from_str(out).map_err(|e| AppError::connection(format!("Unexpected rclone about output: {e}"), "Update rclone."))?;
+    Ok(super::RemoteQuota { total: super::json_u64(&v["total"]), used: super::json_u64(&v["used"]), free: super::json_u64(&v["free"]), trashed: super::json_u64(&v["trashed"]) })
+}
+
+/// `rclone size --json` → size (rclone does not count folders).
+pub fn parse_size(out: &str) -> Result<super::FolderSize, AppError> {
+    let v: serde_json::Value = serde_json::from_str(out).map_err(|e| AppError::connection(format!("Unexpected rclone size output: {e}"), "Update rclone."))?;
+    Ok(super::FolderSize { bytes: super::json_u64(&v["bytes"]).unwrap_or(0), files: super::json_u64(&v["count"]).unwrap_or(0), folders: None, complete: true })
 }
 
 impl Default for RcloneConnector {
@@ -134,7 +134,20 @@ impl Default for RcloneConnector {
 
 impl RcloneConnector {
     pub fn new() -> Self {
-        Self { remote: RwLock::new(None) }
+        Self { remote: RwLock::new(None), program: None }
+    }
+
+    /// Use `program` as the rclone binary for quota and size.
+    pub fn with_program(program: &str) -> Self {
+        Self { remote: RwLock::new(None), program: Some(program.to_string()) }
+    }
+
+    async fn run_mine(&self, args: &[String], timeout: Duration) -> Result<String, AppError> {
+        let rc = Rclone::current();
+        match &self.program {
+            Some(p) => rc.with_program(p).run(args, timeout).await,
+            None => rc.run(args, timeout).await,
+        }
     }
 
     async fn remote(&self) -> Result<String, AppError> {
@@ -154,6 +167,19 @@ impl RcloneConnector {
 type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
 impl Connector for RcloneConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { let r = self.remote().await?;
+            run(&["moveto".into(), target(&r, &from), target(&r, &to)], TRANSFER_TIMEOUT).await.map(|_| ()) })
+    }
+
+    fn server_copy(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { let r = self.remote().await?;
+            run(&["copyto".into(), target(&r, &from), target(&r, &to)], TRANSFER_TIMEOUT).await.map(|_| true) })
+    }
+
+
     fn connect(&self, profile: &ConnectionProfile) -> Fut<'_, ()> {
         let remote = profile.extras.rclone_remote.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| profile.host.clone());
         Box::pin(async move { self.connect_remote(&remote).await })
@@ -215,6 +241,28 @@ impl Connector for RcloneConnector {
         })
     }
 
+    /// `rclone about --json` (backends without quotas fail: none reported).
+    fn quota(&self) -> Fut<'_, Option<super::RemoteQuota>> {
+        Box::pin(async move {
+            let r = self.remote().await?;
+            match self.run_mine(&["about".into(), "--json".into(), r], LIST_TIMEOUT).await {
+                Ok(out) => parse_about(&out).map(Some),
+                Err(e) if e.to_string().contains("doesn't support about") || e.to_string().contains("not supported") => Ok(None),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// `rclone size --json`: the backend counts, no listing walk.
+    fn folder_size_fast(&self, remote_path: &str) -> Fut<'_, Option<super::FolderSize>> {
+        let rp = remote_path.to_string();
+        Box::pin(async move {
+            let r = self.remote().await?;
+            let out = self.run_mine(&["size".into(), "--json".into(), target(&r, &rp)], TRANSFER_TIMEOUT).await?;
+            parse_size(&out).map(Some)
+        })
+    }
+
     fn create_share_link(&self, remote_path: &str, options: &ShareOptions) -> Fut<'_, ShareLink> {
         let (rp, o) = (remote_path.to_string(), options.clone());
         Box::pin(async move {
@@ -266,8 +314,30 @@ mod tests {
         assert!(e[1].modified.is_some());
     }
 
+    /// About and size through a stand-in rclone that prints canned JSON.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quota_and_size_use_rclone_about_and_size() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("rclone");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  lsjson) echo '[]' ;;\n  about) echo '{\"total\":1000,\"used\":250,\"free\":750,\"trashed\":5}' ;;\n  size) echo \"{\\\"count\\\":3,\\\"bytes\\\":42,\\\"sizeless\\\":0,\\\"target\\\":\\\"$3\\\"}\" ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let c = RcloneConnector::with_program(fake.to_str().unwrap());
+        *c.remote.write().await = Some("gdrive:".into());
+        assert_eq!(c.quota().await.unwrap(), Some(crate::connectors::RemoteQuota { total: Some(1000), used: Some(250), free: Some(750), trashed: Some(5) }));
+        let s = c.folder_size_fast("/Photos").await.unwrap().unwrap();
+        assert_eq!((s.bytes, s.files, s.folders, s.complete), (42, 3, None, true));
+        assert_eq!(parse_size(r#"{"count":1,"bytes":"9"}"#).unwrap().bytes, 9);
+        assert!(parse_about("not json").is_err());
+    }
+
     fn rclone_available() -> bool {
-        std::process::Command::new(exe()).arg("version").output().is_ok_and(|o| o.status.success())
+        std::process::Command::new(Rclone::current().program).arg("version").output().is_ok_and(|o| o.status.success())
     }
 
     /// Real rclone against its local backend (`:local:`).

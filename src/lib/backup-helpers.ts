@@ -9,12 +9,12 @@ import { formatBackupTime } from "@/lib/backup-time";
 export const inputCls =
   "w-full px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500";
 
-/** Filter rules ↔ text (`+pattern` include, `-pattern` exclude; `[re]` regex, `{group}` group). */
+/** Filter rules ↔ text (`+pattern` include, `-pattern` exclude; `[re]` regex, `{group}` group, `rclone:glob` rclone glob). */
 export function rulesToText(rules: FilterRule[]): string {
   return rules
     .map((r) => {
       const sign = r.action === "include" ? "+" : "-";
-      const p = r.kind === "regex" ? `[${r.pattern}]` : r.kind === "group" ? `{${r.pattern}}` : r.pattern;
+      const p = r.kind === "regex" ? `[${r.pattern}]` : r.kind === "group" ? `{${r.pattern}}` : r.kind === "rclone" ? `rclone:${r.pattern}` : r.pattern;
       return `${sign}${p}`;
     })
     .join("\n");
@@ -30,6 +30,7 @@ export function textToRules(text: string): FilterRule[] {
       const body = l.slice(1).trim();
       if (body.startsWith("[") && body.endsWith("]")) return { action, kind: "regex", pattern: body.slice(1, -1) } as FilterRule;
       if (body.startsWith("{") && body.endsWith("}")) return { action, kind: "group", pattern: body.slice(1, -1) } as FilterRule;
+      if (body.startsWith("rclone:")) return { action, kind: "rclone", pattern: body.slice(7).trim() } as FilterRule;
       return { action, kind: /[*?]/.test(body) ? "wildcard" : "exact", pattern: body } as FilterRule;
     });
 }

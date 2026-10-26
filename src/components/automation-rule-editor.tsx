@@ -9,7 +9,10 @@
  */
 import { NamedSchedulePicker } from "@/components/schedule-pickers";
 import { WorkflowBuilder } from "@/components/workflow-builder";
-import { autoLayout } from "@/lib/workflow-model";
+import { PresetCombobox } from "@/components/preset-combobox";
+import { RunNotifyPicker } from "@/components/run-notify-picker";
+import { RiskBadge, RiskConfirm, fetchHighRiskSteps, useRiskLookup, type HighRiskStep } from "@/components/step-risk";
+import { autoLayout, workflowActions } from "@/lib/workflow-model";
 import { refId } from "@/stores/schedule-store";
 import { useCallback, useEffect, useState } from "react";
 import { ArrowDown, ArrowUp, Building2, ClipboardCopy, FlaskConical, Link2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
@@ -27,7 +30,9 @@ import {
   NO_RETRY,
   OVERWRITE_LABELS,
   PRESETS,
+  RESULT_FIELDS,
   TRIGGER_TYPES,
+  earlierResults,
   commandLines,
   defaultAction,
   defaultCondition,
@@ -387,11 +392,38 @@ function ActionFields({
             <TemplatePreview template={a.url} sample={sample} regex={regex} />
           </div>
           <div>
-            <label className={label} htmlFor={id("dest")}>Save into folder</label>
-            <FolderInput id={id("dest")} value={a.dest_path} onChange={(v) => onChange({ ...a, dest_path: v })} placeholder="/Downloads/{yyyy}" />
-            <TemplatePreview template={a.dest_path} sample={sample} asPath regex={regex} />
-            {tokenHint}
+            <label className={label} htmlFor={id("dconn")}>Send it to</label>
+            <select
+              id={id("dconn")}
+              className={field}
+              value={a.destination_connection_id ?? ""}
+              onChange={(e) => {
+                const c = connections.find((x) => x.id === e.target.value);
+                onChange({ ...a, destination_connection_id: e.target.value || null, destination_protocol: c?.protocol ?? null });
+              }}
+            >
+              <option value="">A folder on this computer</option>
+              {connections.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}{c.protocol ? ` (${c.protocol})` : ""}</option>
+              ))}
+            </select>
           </div>
+          {a.destination_connection_id ? (
+            <div>
+              <label className={label} htmlFor={id("dremote")}>Remote folder</label>
+              <input id={id("dremote")} className={field} value={a.remote_path ?? ""} placeholder="/incoming/{yyyy}" onChange={(e) => onChange({ ...a, remote_path: e.target.value })} />
+              <TemplatePreview template={a.remote_path ?? ""} sample={sample} regex={regex} />
+              {tokenHint}
+              <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">Fetched to a temporary file, uploaded, then the temporary file is removed (also when the upload fails).</p>
+            </div>
+          ) : (
+            <div>
+              <label className={label} htmlFor={id("dest")}>Save into folder</label>
+              <FolderInput id={id("dest")} value={a.dest_path} onChange={(v) => onChange({ ...a, dest_path: v })} placeholder="/Downloads/{yyyy}" />
+              <TemplatePreview template={a.dest_path} sample={sample} asPath regex={regex} />
+              {tokenHint}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-2">
             <div>
               <label className={label} htmlFor={id("fname")}>File name (optional)</label>
@@ -414,7 +446,98 @@ function ActionFields({
             <input type="checkbox" checked={a.allow_private} onChange={(e) => onChange({ ...a, allow_private: e.target.checked })} />
             Allow intranet addresses (localhost, private and link-local networks)
           </label>
-          <p className="text-[11px] text-[var(--color-text-muted)]">Downloads to a hidden temporary file and moves it into place when complete. Redirects are followed (up to 5); private addresses stay blocked unless allowed above.</p>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Downloads to a hidden temporary file and moves it into place (or uploads it) when complete. Redirects are followed (up to 5); private addresses stay blocked unless allowed above.</p>
+        </div>
+      );
+    case "verify_pair":
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("vpair")}>Sync pair</label>
+            <select id={id("vpair")} className={field} value={a.sync_pair_id} onChange={(e) => onChange({ ...a, sync_pair_id: e.target.value })}>
+              <option value="">Choose…</option>
+              {syncPairs.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={a.full} onChange={(e) => onChange({ ...a, full: e.target.checked })} /> Compare file contents, not only sizes (slower)
+          </label>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Reads both sides and changes nothing. The step fails when files differ or are missing, so later steps (or a workflow&apos;s failure branch) can react.</p>
+        </div>
+      );
+    case "remove_empty_dirs":
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("edpath")}>Folder (empty = the folder of the file that started the run)</label>
+            <FolderInput id={id("edpath")} value={a.path} onChange={(v) => onChange({ ...a, path: v })} placeholder="Folder of the triggering file" />
+            <TemplatePreview template={a.path} sample={sample} asPath regex={regex} />
+          </div>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={a.remove_root} onChange={(e) => onChange({ ...a, remove_root: e.target.checked })} /> Also remove the folder itself when it ends up empty
+          </label>
+          <p className="text-[11px] text-[var(--color-text-muted)]">Removes folders with nothing in them, deepest first. Folders that hold any file stay.</p>
+        </div>
+      );
+    case "list_files":
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("lfpath")}>Folder to list (empty = the folder of the file that started the run)</label>
+            <FolderInput id={id("lfpath")} value={a.path} onChange={(v) => onChange({ ...a, path: v })} placeholder="Folder of the triggering file" />
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="col-span-2">
+              <label className={label} htmlFor={id("lfout")}>Save the listing as</label>
+              <input id={id("lfout")} className={`${field} font-mono`} value={a.output} placeholder="/Reports/files-{yyyy}-{mm}-{dd}.csv" onChange={(e) => onChange({ ...a, output: e.target.value })} />
+              <TemplatePreview template={a.output} sample={sample} regex={regex} />
+            </div>
+            <div>
+              <label className={label} htmlFor={id("lffmt")}>Format</label>
+              <select id={id("lffmt")} className={field} value={a.format} onChange={(e) => onChange({ ...a, format: e.target.value as typeof a.format })}>
+                <option value="csv">CSV</option>
+                <option value="json">JSON</option>
+              </select>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-3 text-xs">
+            <label className="flex items-center gap-1">
+              <input type="checkbox" checked={a.recursive} onChange={(e) => onChange({ ...a, recursive: e.target.checked })} /> Include subfolders
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="checkbox" checked={a.include_dirs} onChange={(e) => onChange({ ...a, include_dirs: e.target.checked })} /> List folders too
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="checkbox" checked={a.overwrite} onChange={(e) => onChange({ ...a, overwrite: e.target.checked })} /> Replace an existing listing (otherwise a number is added)
+            </label>
+          </div>
+          {tokenHint}
+        </div>
+      );
+    case "purge":
+      if (!advanced) return <p className="text-xs text-[var(--color-text-muted)]">Switch to Advanced mode to edit purges.</p>;
+      return (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={id("purgepath")}>Folder to purge</label>
+            <FolderInput id={id("purgepath")} value={a.path} onChange={(v) => onChange({ ...a, path: v })} placeholder="/Temp/exports" />
+            <TemplatePreview template={a.path} sample={sample} asPath regex={regex} />
+          </div>
+          <div className="w-56">
+            <label className={label} htmlFor={id("purgemax")}>Stop if it holds more than (files, optional)</label>
+            <input
+              id={id("purgemax")}
+              type="number"
+              min={1}
+              className={field}
+              value={a.max_files ?? ""}
+              placeholder="No limit"
+              onChange={(e) => onChange({ ...a, max_files: e.target.value.trim() === "" ? null : Number(e.target.value) })}
+            />
+          </div>
+          <p className="text-[11px] text-red-600">Removes the folder and everything in it, permanently. Drive roots and home folders are refused, and the safety interlock stops a purge far larger than usual. Try a dry run first.</p>
         </div>
       );
     case "convert_image": {
@@ -596,6 +719,7 @@ export function AutomationRuleEditor() {
   const [customCommands, setCustomCommands] = useState<Named[]>([]);
   const [revisions, setRevisions] = useState<RuleRevision[]>([]);
   const [copied, setCopied] = useState(false);
+  const [riskPrompt, setRiskPrompt] = useState<HighRiskStep[] | null>(null);
   const loadRules = useAutomationStore((s) => s.loadRules);
 
   useEffect(() => {
@@ -609,6 +733,7 @@ export function AutomationRuleEditor() {
     setWebhook(null);
     setSample("");
     setCopied(false);
+    setRiskPrompt(null);
     void tauriInvokeSafe<Named[]>("list_sync_pairs", undefined, []).then(setSyncPairs);
     void tauriInvokeSafe<Named[]>("list_connections", undefined, []).then(setConnections);
     void tauriInvokeSafe<Named[]>("list_custom_commands", undefined, []).then(setCustomCommands);
@@ -620,16 +745,28 @@ export function AutomationRuleEditor() {
   const containerRef = useFocusTrap<HTMLDivElement>({ active: editorOpen, onEscape: closeEditor });
   const update = useCallback((patch: Partial<RuleForm>) => setForm((f) => ({ ...f, ...patch })), []);
   const setStep = (i: number, action: RuleAction) => setForm((f) => ({ ...f, steps: f.steps.map((s, j) => (j === i ? { ...s, action } : s)) }));
+  const setOutputAs = (i: number, name: string) => setForm((f) => ({ ...f, steps: f.steps.map((s, j) => (j === i ? { ...s, output_as: name || null } : s)) }));
+  const allActions = form.workflow ? workflowActions(form.workflow) : form.steps.map((s) => s.action);
+  const riskOf = useRiskLookup(advanced ? allActions : []);
   const regex = form.conditions.find((r) => r.condition.type === "name_regex" && !r.negate)?.condition as Extract<RuleCondition, { type: "name_regex" }> | undefined;
 
   if (!editorOpen) return null;
 
-  const save = async (): Promise<AutomationRule | null> => {
+  const save = async (confirmedRisk = false): Promise<AutomationRule | null> => {
     const problems = validateForm(form);
     setErrors(problems);
     if (problems.length) return null;
     setBusy(true);
     try {
+      // A High-risk step needs an explicit yes, in Standard and Advanced alike; the answer comes from Rust.
+      if (!confirmedRisk) {
+        const high = await fetchHighRiskSteps(ruleFromForm(form));
+        if (high.length > 0) {
+          setRiskPrompt(high);
+          return null;
+        }
+      }
+      setRiskPrompt(null);
       const rule = ruleFromForm(form);
       const result = form.id ? await updateRule(rule) : await createRule(rule);
       setForm((f) => ({ ...f, id: result.id, base: result }));
@@ -675,7 +812,14 @@ export function AutomationRuleEditor() {
         <div className="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
           <h2 id="rule-editor-title" className="text-sm font-semibold">{managedBy ? "View rule" : form.id ? "Edit rule" : "New rule"}</h2>
           <div className="flex items-center gap-2">
-            {!form.id && (
+            {!form.id && advanced && (
+              <PresetCombobox
+                className="w-48"
+                presets={PRESETS}
+                onPick={(p) => setForm(p.build("watch_path" in form.trigger ? form.trigger.watch_path : ""))}
+              />
+            )}
+            {!form.id && !advanced && (
               <select
                 aria-label="Start from a template"
                 className={`${field} w-48`}
@@ -897,6 +1041,7 @@ export function AutomationRuleEditor() {
                       <p className="text-[11px] text-[var(--color-text-muted)]">A combined condition; replace it with a single one to edit it here.</p>
                     )
                   }
+                  riskOf={advanced ? riskOf : undefined}
                   newAction={() => defaultAction("notify")}
                   newCondition={() => ({ type: "condition", condition: defaultCondition("extension_is") })}
                 />
@@ -923,6 +1068,7 @@ export function AutomationRuleEditor() {
                     ))}
                     {step.action.type === "replay_op" && <option value="replay_op">Replay pinned operation</option>}
                   </select>
+                  {advanced && <RiskBadge risk={riskOf(step.action)} />}
                   <Button variant="ghost" size="icon" aria-label={`Move action ${i + 1} up`} disabled={i === 0} onClick={() => setForm((f) => { const s = [...f.steps]; [s[i - 1], s[i]] = [s[i], s[i - 1]]; return { ...f, steps: s }; })}>
                     <ArrowUp className="h-3.5 w-3.5" />
                   </Button>
@@ -934,6 +1080,16 @@ export function AutomationRuleEditor() {
                   </Button>
                 </div>
                 <ActionFields a={step.action} onChange={(a) => setStep(i, a)} idx={i} sample={sample} regex={regex?.pattern} syncPairs={syncPairs} connections={connections} customCommands={customCommands} advanced={advanced} />
+                {advanced && (
+                  <div>
+                    <label className={label} htmlFor={`step-${i}-out`}>Save this step&apos;s result as (optional)</label>
+                    <input id={`step-${i}-out`} className={`${field} font-mono`} value={step.output_as ?? ""} placeholder="e.g. listing" onChange={(e) => setOutputAs(i, e.target.value)} />
+                    <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">
+                      Later steps can use {RESULT_FIELDS.map((f) => `{steps.${step.output_as?.trim() || "name"}.${f}}`).join(" ")}
+                      {earlierResults(form.steps, i).length > 0 && <> · available here: {earlierResults(form.steps, i).map((n) => `{steps.${n}.…}`).join(" ")}</>}
+                    </p>
+                  </div>
+                )}
                 {i > 0 && (
                   <label className="flex items-center gap-1 text-[11px]">
                     <input type="checkbox" checked={step.continue_on_error} onChange={(e) => update({ steps: form.steps.map((s, j) => (j === i ? { ...s, continue_on_error: e.target.checked } : s)) })} />
@@ -1032,6 +1188,9 @@ export function AutomationRuleEditor() {
                 </label>
               )}
             </div>
+            <div className="mt-3">
+              <RunNotifyPicker value={form.options} onChange={(patch) => update({ options: { ...form.options, ...patch } })} advanced={advanced} />
+            </div>
           </details>
 
           {/* Dry run */}
@@ -1105,6 +1264,8 @@ export function AutomationRuleEditor() {
 
           </fieldset>
 
+          {riskPrompt && <RiskConfirm steps={riskPrompt} onCancel={() => setRiskPrompt(null)} onConfirm={() => void save(true)} />}
+
           {errors.length > 0 && (
             <ul className="text-xs text-red-500 space-y-0.5" role="alert">
               {errors.map((e) => (
@@ -1125,7 +1286,7 @@ export function AutomationRuleEditor() {
           </div>
           <div className="flex gap-2">
             <Button variant="ghost" size="sm" onClick={closeEditor}>Close</Button>
-            {!managedBy && <Button size="sm" onClick={save} disabled={busy}>{form.id ? "Save changes" : "Create rule"}</Button>}
+            {!managedBy && <Button size="sm" onClick={() => void save()} disabled={busy}>{form.id ? "Save changes" : "Create rule"}</Button>}
           </div>
         </div>
       </div>

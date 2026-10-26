@@ -202,6 +202,84 @@
   },
   {
     "id": "00000000-0000-4000-8000-000000000005",
+    "name": "Weekly file listing",
+    "enabled": false,
+    "trigger": {
+      "type": "schedule",
+      "cron_expr": "0 0 3 * * Sun *",
+      "cron_human": "Every Sunday at 03:00"
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "list_files",
+      "path": "/inbox",
+      "output": "/inbox/listing-{yyyy}-{mm}-{dd}.csv",
+      "format": "csv",
+      "recursive": true,
+      "include_dirs": false,
+      "overwrite": true
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000006",
+    "name": "Remove empty folders",
+    "enabled": false,
+    "trigger": {
+      "type": "schedule",
+      "cron_expr": "0 0 3 * * Sun *",
+      "cron_human": "Every Sunday at 03:00"
+    },
+    "conditions": [],
+    "condition_tree": null,
+    "action": {
+      "type": "remove_empty_dirs",
+      "path": "/inbox",
+      "remove_root": false
+    },
+    "steps": [],
+    "options": {
+      "overwrite": "rename",
+      "retry": {
+        "retries": 3,
+        "delay_ms": 5000,
+        "exponential": true,
+        "max_delay_ms": 300000
+      },
+      "priority": 0,
+      "allow_overlap": false,
+      "settle_secs": 3,
+      "source": null
+    },
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+    "last_triggered": null,
+    "trigger_count": 0,
+    "error_count": 0,
+    "last_error": null
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000007",
     "name": "R",
     "enabled": false,
     "trigger": {
@@ -353,6 +431,67 @@
           "notify": false
         },
         "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "list_files",
+          "path": "/in",
+          "output": "/reports/files-{yyyy}.json",
+          "format": "json",
+          "recursive": true,
+          "include_dirs": true,
+          "overwrite": false
+        },
+        "continue_on_error": false,
+        "output_as": "listing"
+      },
+      {
+        "action": {
+          "type": "verify_pair",
+          "sync_pair_id": "pair-1",
+          "full": true
+        },
+        "continue_on_error": true
+      },
+      {
+        "action": {
+          "type": "remove_empty_dirs",
+          "path": "/in",
+          "remove_root": true
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "purge",
+          "path": "/in/tmp",
+          "max_files": 500
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "download_url",
+          "url": "https://example.com/a.bin",
+          "dest_path": "",
+          "file_name": "a.bin",
+          "overwrite": false,
+          "max_mb": 10,
+          "sha256": null,
+          "allow_private": false,
+          "destination_connection_id": "conn-1",
+          "destination_protocol": "sftp",
+          "remote_path": "/in/{yyyy}"
+        },
+        "continue_on_error": false
+      },
+      {
+        "action": {
+          "type": "notify",
+          "title": "{steps.listing.count} files",
+          "body": "{steps.listing.path}"
+        },
+        "continue_on_error": true
       }
     ],
     "options": {
@@ -371,7 +510,13 @@
         "recursive": true,
         "newest": 5,
         "include_dirs": false
-      }
+      },
+      "notify_profile_id": "profile-1",
+      "notify_on": [
+        "warning",
+        "error"
+      ],
+      "min_bytes": 1048576
     },
     "created_at": "2026-01-01T00:00:00Z",
     "updated_at": "2026-01-01T00:00:00Z",
@@ -381,7 +526,7 @@
     "last_error": null
   },
   {
-    "id": "00000000-0000-4000-8000-000000000006",
+    "id": "00000000-0000-4000-8000-000000000008",
     "name": "R",
     "enabled": false,
     "trigger": {

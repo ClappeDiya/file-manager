@@ -9,7 +9,7 @@
 //! - Compatible with Nextcloud, ownCloud, and other WebDAV servers
 
 use crate::core::error::AppError;
-use crate::core::types::{ConnectionProfile, FileEntry};
+use crate::core::types::{ConnectionProfile, FileEntry, WebDavAuthMode, WebDavSettings, WebDavVendor};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1051,6 +1051,17 @@ impl Default for WebDavConnector {
 // ── Connector trait implementation ──
 
 impl super::Connector for WebDavConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.rename(&from, &to).await })
+    }
+
+    fn server_copy(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.copy(&from, &to).await.map(|()| true) })
+    }
+
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
@@ -1130,11 +1141,11 @@ impl super::Connector for WebDavConnector {
                     advice: "Check the URL and network connectivity.".to_string(),
                 })?;
 
-                if response.status().as_u16() == 401 {
-                    return Err(AppError::Connection {
-                        message: "Authentication failed.".to_string(),
-                        advice: "Check your username, password, or token.".to_string(),
-                    });
+                if matches!(response.status().as_u16(), 401 | 403) {
+                    return Err(AppError::auth(
+                        format!("The WebDAV server refused the sign-in (HTTP {})", response.status().as_u16()),
+                        "Check your username, password, or token.",
+                    ));
                 }
 
                 // Check for DAV header
@@ -1233,10 +1244,14 @@ impl super::Connector for WebDavConnector {
         let mut profile = profile.clone();
         Box::pin(async move {
             {
+                let settings = profile.extras.webdav.clone().unwrap_or_default();
+                let auth_method = auth_for(&settings, profile.username.clone(), secret)?;
                 let mut cfg = self.config.write().await;
-                cfg.auth_method = match (profile.username.clone().filter(|u| !u.is_empty()), secret) {
-                    (Some(username), Some(password)) => WebDavAuthMethod::Basic { username, password },
-                    _ => WebDavAuthMethod::None,
+                cfg.auth_method = auth_method;
+                cfg.compat_mode = match settings.vendor {
+                    WebDavVendor::Generic => WebDavCompat::Standard,
+                    WebDavVendor::Nextcloud => WebDavCompat::Nextcloud,
+                    WebDavVendor::Owncloud => WebDavCompat::OwnCloud,
                 };
                 // The host may be a full URL ("http://host:8080/dav"); its scheme
                 // decides TLS, since the form has no separate field for it.
@@ -1282,6 +1297,67 @@ impl super::Connector for WebDavConnector {
     fn remove(&self, remote_path: &str, _is_dir: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + '_>> {
         let r = remote_path.to_string();
         Box::pin(async move { self.delete(&r).await })
+    }
+}
+
+/// The sign-in a saved profile asks for: Basic with the user name and
+/// password (the default), a bearer token, or none.
+fn auth_for(settings: &WebDavSettings, username: Option<String>, secret: Option<String>) -> Result<WebDavAuthMethod, AppError> {
+    let secret = secret.filter(|s| !s.is_empty());
+    Ok(match settings.auth {
+        WebDavAuthMode::Basic => match (username.filter(|u| !u.is_empty()), secret) {
+            (Some(username), Some(password)) => WebDavAuthMethod::Basic { username, password },
+            _ => WebDavAuthMethod::None,
+        },
+        WebDavAuthMode::Bearer => WebDavAuthMethod::OAuth {
+            access_token: secret.ok_or_else(|| AppError::validation("Enter the bearer token (as the connection's password)"))?,
+            refresh_token: None,
+            token_endpoint: None,
+        },
+        WebDavAuthMode::None => WebDavAuthMethod::None,
+    })
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::connectors::mock_http::{serve, status};
+    use crate::connectors::Connector;
+    use crate::core::types::ConnectionProtocol;
+
+    /// Regression: saved profiles always signed in with Basic auth; the
+    /// bearer mode and the Nextcloud/ownCloud vendor never reached the connector.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bearer_mode_and_vendor_reach_the_connector() {
+        let mock = serve(|r| match r.header("authorization").as_deref() {
+            Some("Bearer t0k3n") => {
+                let mut resp = status(200, "");
+                resp.headers_mut().insert("dav", "1, 2".parse().unwrap());
+                resp
+            }
+            _ => status(401, "need a token"),
+        })
+        .await;
+        let mut p = crate::connectors::live_tests::profile(ConnectionProtocol::WebDav, &format!("{}/remote.php/dav", mock.base), None, "alice", "/");
+        p.extras.webdav = Some(WebDavSettings { auth: WebDavAuthMode::Bearer, vendor: WebDavVendor::Nextcloud });
+        let c = WebDavConnector::new();
+        c.connect_with_secret(&p, Some("t0k3n".into())).await.unwrap();
+        assert!(c.is_connected());
+        assert_eq!(mock.requests("/remote.php/dav")[0].header("authorization").as_deref(), Some("Bearer t0k3n"));
+        let cfg = c.config.read().await.clone();
+        assert_eq!(cfg.compat_mode, WebDavCompat::Nextcloud);
+        assert!(matches!(cfg.auth_method, WebDavAuthMethod::OAuth { ref access_token, .. } if access_token == "t0k3n"));
+        c.disconnect().await.unwrap();
+
+        // Basic (the default) still sends the user name and password, which this server refuses.
+        p.extras.webdav = Some(WebDavSettings { auth: WebDavAuthMode::Basic, vendor: WebDavVendor::Owncloud });
+        assert!(c.connect_with_secret(&p, Some("t0k3n".into())).await.is_err());
+        assert_eq!(c.config.read().await.compat_mode, WebDavCompat::OwnCloud);
+        // Bearer without a token is refused before any request.
+        p.extras.webdav = Some(WebDavSettings { auth: WebDavAuthMode::Bearer, vendor: WebDavVendor::Generic });
+        let before = mock.log.lock().unwrap().len();
+        assert!(c.connect_with_secret(&p, None).await.is_err());
+        assert_eq!(mock.log.lock().unwrap().len(), before);
     }
 }
 

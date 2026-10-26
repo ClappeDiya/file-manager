@@ -10,7 +10,7 @@ import { logger } from '@/lib/utils/logger';
 export async function POST(request: NextRequest) {
   const raw = await request.text();
   try {
-    const result = handleBillingWebhook(raw, request.headers);
+    const result = await handleBillingWebhook(raw, request.headers);
     return NextResponse.json({ received: true, result });
   } catch (e) {
     if (e instanceof BillingError) {

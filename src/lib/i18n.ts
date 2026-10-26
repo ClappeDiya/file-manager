@@ -10,6 +10,8 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { scaleBytes } from "@/lib/format-bytes";
+import { tauriInvokeSafe } from "@/hooks/use-tauri";
+import enTranslations from "../locales/en.json";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -17,6 +19,9 @@ import { scaleBytes } from "@/lib/format-bytes";
 
 /** Supported locale codes (BCP 47 language subtag) */
 export type Locale = "en" | "es" | "fr" | "de" | "pt" | "ja" | "zh" | "ko";
+
+/** What the user chose in Settings: a language, or follow the system. */
+export type LocalePreference = Locale | "system";
 
 /** A flat or nested object of translation strings */
 export type TranslationMap = Record<string, string | Record<string, string>>;
@@ -250,7 +255,30 @@ function localeToTag(locale: Locale): string {
 // Zustand store
 // ---------------------------------------------------------------------------
 
+/** English, bundled: what a key falls back to while a language loads or lacks it. */
+const FALLBACK: TranslationMap = enTranslations as TranslationMap;
+
+export function isLocalePreference(v: unknown): v is LocalePreference {
+  return v === "system" || (typeof v === "string" && (SUPPORTED_LOCALES as readonly string[]).includes(v));
+}
+
+/** The language a preference stands for on this computer. */
+export function resolvePreference(pref: LocalePreference): Locale {
+  return pref === "system" ? detectLocale() : pref;
+}
+
+/** `<html lang>`, and the desktop shell's own texts (tray menu). */
+function applyLocale(locale: Locale) {
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = locale;
+    document.documentElement.dir = "ltr"; // All supported locales are LTR
+  }
+  void tauriInvokeSafe("set_ui_language", { locale }, null);
+}
+
 interface I18nState {
+  /** The user's choice; `system` follows the computer's language. */
+  preference: LocalePreference;
   locale: Locale;
   translations: TranslationMap;
   isLoading: boolean;
@@ -262,13 +290,31 @@ interface I18nState {
   /** Change locale and load new translations */
   setLocale: (locale: Locale) => Promise<void>;
 
+  /** Choose a language, or `system` to follow the computer's. */
+  setPreference: (pref: LocalePreference) => Promise<void>;
+
   /** Translate a key with optional interpolation params */
   t: (key: string, params?: InterpolationParams) => string;
+}
+
+/**
+ * v0 stored only `locale`, and English counted as "not chosen": the OS
+ * language came back at every start, so choosing English on a German
+ * computer did not stick. v1 stores the choice itself. A v0 language other
+ * than English was a choice; v0 English is read as "follow the system",
+ * which is what v0 did with it.
+ */
+export function migrateI18nState(persisted: unknown, version: number): { preference: LocalePreference } {
+  const p = (persisted && typeof persisted === "object" ? persisted : {}) as { locale?: unknown; preference?: unknown };
+  if (version >= 1 && isLocalePreference(p.preference)) return { preference: p.preference };
+  if (isLocalePreference(p.locale) && p.locale !== DEFAULT_LOCALE) return { preference: p.locale };
+  return { preference: "system" };
 }
 
 export const useI18n = create<I18nState>()(
   persist(
     (set, get) => ({
+      preference: "system",
       locale: DEFAULT_LOCALE,
       translations: {},
       isLoading: false,
@@ -279,14 +325,11 @@ export const useI18n = create<I18nState>()(
         if (state.isInitialized) return;
 
         set({ isLoading: true });
-
-        // If no persisted locale, auto-detect from OS
-        const savedLocale = state.locale;
-        const detectedLocale = savedLocale !== DEFAULT_LOCALE ? savedLocale : detectLocale();
-
-        const translations = await loadTranslationFile(detectedLocale);
+        const locale = resolvePreference(state.preference);
+        const translations = await loadTranslationFile(locale);
+        applyLocale(locale);
         set({
-          locale: detectedLocale,
+          locale,
           translations,
           isLoading: false,
           isInitialized: true,
@@ -298,22 +341,24 @@ export const useI18n = create<I18nState>()(
           console.warn(`[i18n] Unsupported locale: ${locale}`);
           return;
         }
+        await get().setPreference(locale);
+      },
 
-        set({ isLoading: true });
-        const translations = await loadTranslationFile(locale);
-
-        // Update document lang attribute for accessibility
-        if (typeof document !== "undefined") {
-          document.documentElement.lang = locale;
-          document.documentElement.dir = "ltr"; // All supported locales are LTR
+      setPreference: async (pref: LocalePreference) => {
+        if (!isLocalePreference(pref)) {
+          console.warn(`[i18n] Unsupported locale: ${String(pref)}`);
+          return;
         }
-
-        set({ locale, translations, isLoading: false });
+        const locale = resolvePreference(pref);
+        set({ isLoading: true, preference: pref });
+        const translations = await loadTranslationFile(locale);
+        applyLocale(locale);
+        set({ locale, translations, isLoading: false, isInitialized: true });
       },
 
       t: (key: string, params?: InterpolationParams): string => {
         const { translations, locale } = get();
-        const resolved = resolveKey(key, translations);
+        const resolved = resolveKey(key, translations) ?? resolveKey(key, FALLBACK);
 
         if (resolved === undefined) {
           // In development, warn about missing keys
@@ -330,8 +375,10 @@ export const useI18n = create<I18nState>()(
     }),
     {
       name: "ufop-i18n",
-      // Only persist locale preference, not the entire translations
-      partialize: (state) => ({ locale: state.locale }),
+      version: 1,
+      migrate: migrateI18nState,
+      // Only persist the language choice, not the translations
+      partialize: (state) => ({ preference: state.preference }),
     },
   ),
 );
@@ -351,4 +398,10 @@ export function t(key: string, params?: InterpolationParams): string {
 /** Get current locale outside React */
 export function getCurrentLocale(): Locale {
   return useI18n.getState().locale;
+}
+
+/** `t` for components: re-renders when the language (its translations) changes. */
+export function useT(): (key: string, params?: InterpolationParams) => string {
+  useI18n((s) => s.translations);
+  return useI18n.getState().t;
 }

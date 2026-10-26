@@ -69,10 +69,14 @@ pub fn spec_for(profile: &ConnectionProfile, secret: Option<&str>) -> Result<Rcl
     }
 }
 
-/// Arguments for `rclone mount`; `flags` carry the cache and read-only options
-/// (`policy::rclone_flags`).
+/// Arguments for `rclone mount`; `flags` carry the cache, read-only and other
+/// options (`policy::rclone_flags`). Folder listings are trusted for
+/// `policy::DEFAULT_DIR_CACHE_TIME` unless `flags` set `--dir-cache-time`.
 pub fn mount_args(spec: &RcloneSpec, mount_point: &str, flags: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = vec!["mount".into(), spec.source.clone(), mount_point.into(), "--dir-cache-time".into(), "30s".into()];
+    let mut v: Vec<String> = vec!["mount".into(), spec.source.clone(), mount_point.into()];
+    if !flags.iter().any(|f| f == "--dir-cache-time") {
+        v.extend(["--dir-cache-time".into(), super::policy::DEFAULT_DIR_CACHE_TIME.into()]);
+    }
     v.extend(flags.iter().cloned());
     v
 }
@@ -97,8 +101,9 @@ pub fn fuse_available() -> Result<(), (String, String)> {
     Err(("FUSE".into(), "This OS has no FUSE support".into()))
 }
 
+/// The resolved rclone binary runs (`rclone version`).
 pub fn rclone_available() -> bool {
-    std::process::Command::new(std::env::var("UFOP_RCLONE").unwrap_or_else(|_| "rclone".into())).arg("version").output().is_ok_and(|o| o.status.success())
+    crate::rclone_engine::Rclone::current().version_blocking().is_ok()
 }
 
 /// Whether `p` is a mount point now (Unix: a different device than its parent).
@@ -112,6 +117,11 @@ pub fn is_mounted(p: &Path) -> bool {
     #[cfg(not(unix))]
     {
         // WinFsp mounts appear once rclone is serving; existence is the signal.
+        // A drive letter ("X:") is checked at its root.
+        let s = p.to_string_lossy();
+        if s.len() == 2 && s.ends_with(':') {
+            return Path::new(&format!("{s}\\")).exists();
+        }
         p.exists()
     }
 }
@@ -125,10 +135,10 @@ pub struct RcloneProcesses {
 impl RcloneProcesses {
     /// Start `rclone mount` and wait until the mount point is live.
     pub async fn mount(&self, id: uuid::Uuid, spec: &RcloneSpec, mount_point: &str, flags: &[String]) -> Result<(), String> {
-        let exe = std::env::var("UFOP_RCLONE").unwrap_or_else(|_| "rclone".into());
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(mount_args(spec, mount_point, flags)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| format!("Could not start rclone: {e}"))?;
+        let rc = crate::rclone_engine::Rclone::current();
+        let mut cmd = tokio::process::Command::new(&rc.program);
+        cmd.args(rc.base_args()).args(mount_args(spec, mount_point, flags)).envs(spec.env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        let mut child = crate::rclone_engine::resolver::spawn(&mut cmd).await.map_err(|e| format!("Could not start rclone: {e}"))?;
         let deadline = tokio::time::Instant::now() + MOUNT_WAIT;
         loop {
             if is_mounted(Path::new(mount_point)) {
@@ -220,6 +230,26 @@ mod tests {
         p.extras.rclone_remote = Some("box:".into());
         p.remote_path = "/".into();
         assert_eq!(spec_for(&p, None).unwrap(), RcloneSpec { source: "box:".into(), env: vec![] });
+    }
+
+    #[test]
+    fn dir_cache_time_defaults_to_30s_unless_set() {
+        let spec = RcloneSpec { source: "r:".into(), env: vec![] };
+        assert_eq!(mount_args(&spec, "/m", &[]).join(" "), "mount r: /m --dir-cache-time 30s");
+        let flags: Vec<String> = ["--dir-cache-time", "5m", "--read-only"].map(String::from).to_vec();
+        let args = mount_args(&spec, "/m", &flags);
+        assert_eq!(args.join(" "), "mount r: /m --dir-cache-time 5m --read-only");
+        assert_eq!(args.iter().filter(|a| *a == "--dir-cache-time").count(), 1);
+    }
+
+    #[test]
+    fn subfolder_extends_the_rclone_source() {
+        let mut p = profile(ConnectionProtocol::Rclone, "gcs");
+        p.remote_path = super::super::policy::join_subfolder("/bucket", Some("photos/2024"));
+        assert_eq!(spec_for(&p, None).unwrap().source, "gcs:bucket/photos/2024");
+        let mut s3 = profile(ConnectionProtocol::S3, "https://abc.r2.cloudflarestorage.com");
+        s3.remote_path = super::super::policy::join_subfolder("/bucket", Some("a b/c"));
+        assert_eq!(spec_for(&s3, Some("k")).unwrap().source, "UFOPMOUNT:bucket/a b/c");
     }
 
     /// Real `rclone mount` of a local folder (needs rclone + FUSE).

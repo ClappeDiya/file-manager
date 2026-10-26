@@ -1,7 +1,9 @@
 //! One retry/backoff policy for every engine that retries: backup backends,
 //! automation runs, webhook and SIEM delivery. Callers decide *what* is
-//! retryable; this module only decides *when* to try again.
+//! retryable ([`is_retryable`] is the shared default for [`AppError`]s);
+//! this module decides *when* to try again.
 
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -43,6 +45,23 @@ impl RetryPolicy {
     pub fn allows_retry(&self, attempts_made: u32) -> bool {
         attempts_made <= self.retries
     }
+}
+
+/// Whether an operation that failed with `e` may succeed if tried again.
+///
+/// Network, transfer and busy-service failures often do. Rejected
+/// credentials (401/403, wrong password, revoked token) never do, and
+/// retrying them can lock the account; neither do bad input, local
+/// file-system problems, wrong passphrases or misconfiguration.
+pub fn is_retryable(e: &AppError) -> bool {
+    !matches!(
+        e,
+        AppError::Authentication { .. }
+            | AppError::Encryption { .. }
+            | AppError::PermissionDenied { .. }
+            | AppError::Configuration { .. }
+            | AppError::FileOperation { .. }
+    )
 }
 
 /// Outcome of a retried operation, with how many attempts it took.
@@ -130,6 +149,17 @@ mod tests {
 
         let r: Retried<(), &str> = retry_blocking(&p, |_| Err("fatal"), |e| *e != "fatal", |_, _, _| {});
         assert_eq!(r.attempts, 1, "non-retryable errors stop at once");
+    }
+
+    #[test]
+    fn rejected_credentials_are_never_retryable() {
+        assert!(!is_retryable(&AppError::auth("HTTP 401", "check")));
+        assert!(!is_retryable(&AppError::validation("bad")));
+        assert!(is_retryable(&AppError::connection("reset", "retry")));
+        assert!(is_retryable(&AppError::transfer("cut", "retry")));
+        let p = RetryPolicy { retries: 3, delay_ms: 0, exponential: false, max_delay_ms: 0 };
+        let r: Retried<(), AppError> = retry_blocking(&p, |_| Err(AppError::auth("401", "x")), is_retryable, |_, _, _| {});
+        assert_eq!(r.attempts, 1);
     }
 
     #[test]

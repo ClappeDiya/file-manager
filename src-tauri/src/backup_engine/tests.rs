@@ -48,6 +48,116 @@ async fn job_crud_validation_and_persistence() {
 }
 
 #[tokio::test]
+async fn duplicate_job_copies_definition_with_schedules_off() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    let m = manager(t.path()).await;
+    let mut j = job(&src, &dst);
+    j.schedule.enabled = true;
+    j.schedule.start_time = "02:00".into();
+    j.schedule.interval_minutes = 1440;
+    j.maintenance.compact = Some(BackupSchedule { enabled: true, start_time: "03:00".into(), interval_minutes: 1440, ..Default::default() });
+    j.reports.headers = vec![notify::webhook::WebhookHeader { name: "Authorization".into(), value: "Bearer s3cret".into(), secret: true, credential_id: String::new() }];
+    // A replica on its own timer, with a stored cloud credential.
+    m.set_destination_secret("replica-cred", "replica-key").await.unwrap();
+    let cloud = stores::CloudConfig::S3(stores::s3::S3Config { bucket: "b".into(), ..Default::default() });
+    j.replicas = vec![Replica {
+        name: "Offsite".into(),
+        destination: BackupDestination::Cloud { config: cloud, credential_id: "replica-cred".into() },
+        schedule: ReplicaSchedule::Interval { minutes: 60 },
+        last_run: Some("2026-01-01T00:00:00Z".into()),
+        last_result: Some("ok".into()),
+        ..Default::default()
+    }];
+    let original = m.save_job(j, Some("pw".into())).await.unwrap();
+    m.execute(&original.id, BackupOperation::Backup { dry_run: false }).await.unwrap();
+    let original = m.get_job(&original.id).await.unwrap();
+    assert!(original.stats.version_count > 0);
+
+    let copy = m.duplicate_job(&original.id).await.unwrap();
+    assert_ne!(copy.id, original.id);
+    assert_eq!(copy.name, "Docs (copy)");
+    assert_eq!(copy.sources, original.sources);
+    assert!(!copy.schedule.enabled, "the copy never runs on its own");
+    assert!(!copy.maintenance.compact.as_ref().unwrap().enabled);
+    assert_eq!(copy.stats.version_count, 0, "no history");
+    assert_eq!(m.passphrase(&copy.id).await.unwrap().as_deref(), Some("pw"));
+    // Secrets are copied, not shared.
+    let (oh, ch) = (&original.reports.headers[0], &copy.reports.headers[0]);
+    assert!(!ch.credential_id.is_empty() && ch.credential_id != oh.credential_id);
+    assert_eq!(m.prepare_reports(&copy.reports).await.headers[0].value, "Bearer s3cret");
+    // Replicas: no timer, no history, their own copy of the credential.
+    let r = &copy.replicas[0];
+    assert_ne!(r.id, original.replicas[0].id);
+    assert_eq!(r.schedule, ReplicaSchedule::Manual, "the copy's replica never runs on a timer");
+    assert!(r.last_run.is_none() && r.last_result.is_none());
+    let BackupDestination::Cloud { credential_id, .. } = &r.destination else { panic!("cloud replica") };
+    assert!(credential_id != "replica-cred" && !credential_id.is_empty());
+    assert_eq!(m.destination_secret(credential_id).await.unwrap().as_deref(), Some("replica-key"));
+    assert_eq!(m.list_jobs().await.len(), 2);
+    assert!(m.duplicate_job("missing").await.is_err());
+}
+
+/// Regression: the copy of a job whose schedule and maintenance come from a
+/// policy template kept running on the template's schedule, against the
+/// original's destination. Credentials this machine does not store (a
+/// central reference) were dropped from the copy's notifications.
+#[tokio::test]
+async fn duplicate_job_of_a_template_scheduled_job_is_not_scheduled() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst) = (t.path().join("src"), t.path().join("dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    let m = manager(t.path()).await;
+    let nightly = BackupSchedule { enabled: true, start_time: "02:00".into(), interval_minutes: 1440, ..Default::default() };
+    let tpl = m
+        .save_template(templates::PolicyTemplate {
+            name: "Nightly".into(),
+            settings: templates::SettingsPatch {
+                schedule: Some(nightly.clone()),
+                maintenance: Some(schedule::MaintenanceSchedule { compact: Some(nightly.clone()), ..Default::default() }),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let later = Utc::now() + chrono::Duration::days(30);
+    // Both kinds of job: an explicit override list, and one from before override lists.
+    for overrides in [Some(vec!["options.compression_level".to_string()]), None] {
+        let mut j = job(&src, &dst);
+        j.name = format!("Docs {overrides:?}");
+        j.template_ids = vec![tpl.id.clone()];
+        j.overrides = overrides.clone();
+        j.options.compression_level = 7; // the job's own setting
+        j.notifications = vec![notify::Notification {
+            channel: notify::Channel::Telegram { chat_id: "42".into(), api_base: String::new() },
+            send_on: vec!["error".into()],
+            credential_id: "central-telegram".into(),
+            template: String::new(),
+            cert: Default::default(),
+        }];
+        let original = m.save_job(j, Some("pw".into())).await.unwrap();
+        assert!(m.effective_job(&original.id).await.unwrap().schedule.enabled, "the template schedules the original");
+        assert!(m.due_jobs(later).await.contains(&original.id));
+
+        let copy = m.duplicate_job(&original.id).await.unwrap();
+        let eff = m.effective_job(&copy.id).await.unwrap();
+        assert!(!eff.schedule.enabled, "{overrides:?}: the copy runs on the template's schedule");
+        assert_eq!(eff.schedule.start_time, "02:00", "the schedule is kept, turned off");
+        assert!(!eff.maintenance.compact.as_ref().is_some_and(|c| c.enabled), "{overrides:?}: maintenance still on");
+        assert!(!m.due_jobs(later).await.contains(&copy.id));
+        assert!(m.due_maintenance(later).await.iter().all(|(id, _)| id != &copy.id));
+        // Everything else resolves as it did for the original.
+        assert_eq!(eff.options.compression_level, 7);
+        assert_eq!(serde_json::to_value(&eff.options).unwrap(), serde_json::to_value(&m.effective_job(&original.id).await.unwrap().options).unwrap());
+        assert_eq!(copy.template_ids, original.template_ids);
+        assert_eq!(copy.notifications[0].credential_id, "central-telegram", "a credential reference was dropped");
+    }
+}
+
+#[tokio::test]
 async fn backup_restore_history_and_queries() {
     let t = tempfile::tempdir().unwrap();
     let (src, dst, out) = (t.path().join("src"), t.path().join("dst"), t.path().join("out"));
@@ -853,6 +963,8 @@ async fn photos_library_job_backup_restore_and_commands() {
 #[cfg(unix)]
 #[tokio::test]
 async fn concurrency_cap_runs_jobs_in_parallel_but_never_one_job_twice() {
+    // Changes the process-wide backup caps.
+    let _rates = crate::transfer_engine::throttle::global_rates_test_lock().await;
     let t = tempfile::tempdir().unwrap();
     let m = manager(t.path()).await;
     let mk = |n: &str| {
@@ -1656,6 +1768,7 @@ async fn run_history_and_files_page_with_totals() {
             summary: summary.into(),
             report: serde_json::Value::Null,
             log: vec![],
+            trigger: Default::default(),
         };
         m.insert_run(&run).await.unwrap();
     }

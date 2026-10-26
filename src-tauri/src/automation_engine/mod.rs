@@ -12,7 +12,9 @@ pub mod download;
 pub mod evaluator;
 pub mod executor;
 pub mod malware;
+pub mod outputs;
 pub mod pinner;
+pub mod risk;
 pub mod scheduler;
 pub mod services;
 pub mod suggester;
@@ -40,6 +42,10 @@ pub struct AutomationRule {
     pub trigger: RuleTrigger,
     pub conditions: Vec<RuleCondition>,
     pub action: RuleAction,
+    /// Name under which `action`'s result is saved for later steps
+    /// (`{steps.<name>.path}`…); each further step names its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_as: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub last_triggered: Option<String>,
@@ -92,6 +98,8 @@ fn default_fail_on_invalid() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RuleExtra {
     #[serde(default)]
+    output_as: Option<String>,
+    #[serde(default)]
     condition_tree: Option<ConditionNode>,
     #[serde(default)]
     steps: Vec<ActionStep>,
@@ -110,6 +118,9 @@ pub struct ActionStep {
     /// Keep going with later steps if this one fails.
     #[serde(default)]
     pub continue_on_error: bool,
+    /// Name under which the step's result is saved for later steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_as: Option<String>,
 }
 
 /// A boolean tree of conditions.
@@ -171,6 +182,9 @@ pub struct RuleOptions {
     /// SHA-256 of the secret in this rule's webhook URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_secret_hash: Option<String>,
+    /// Where the result of a run is reported (a notification profile).
+    #[serde(flatten)]
+    pub notify: ufop_core::run_notify::RunNotify,
 }
 
 fn no_retry() -> ufop_core::retry::RetryPolicy {
@@ -188,6 +202,7 @@ impl Default for RuleOptions {
             source: None,
             command_approval: None,
             webhook_secret_hash: None,
+            notify: Default::default(),
         }
     }
 }
@@ -202,6 +217,7 @@ impl AutomationRule {
             trigger,
             conditions: Vec::new(),
             action,
+            output_as: None,
             created_at: now.clone(),
             updated_at: now,
             last_triggered: None,
@@ -214,6 +230,16 @@ impl AutomationRule {
             workflow: None,
             managed_by: None,
         }
+    }
+
+    /// Everything that can be checked before the rule runs: its graph, its
+    /// notification settings and the step results its templates use.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if let Some(wf) = &self.workflow {
+            wf.validate().map_err(AppError::validation)?;
+        }
+        self.options.notify.validate().map_err(AppError::validation)?;
+        outputs::validate_rule(self).map_err(AppError::validation)
     }
 
     /// Every action the rule can run: its workflow's action nodes, or
@@ -450,7 +476,72 @@ pub enum RuleAction {
         /// Allow loopback, private and link-local addresses (intranet servers).
         #[serde(default)]
         allow_private: bool,
+        /// Send the download straight to a saved connection instead of a
+        /// local folder: it is fetched to a temporary file, uploaded with the
+        /// same path as `TransferToConnector`, and the temporary file removed.
+        #[serde(default)]
+        destination_connection_id: Option<String>,
+        /// The connection's protocol (as for `TransferToConnector`).
+        #[serde(default)]
+        destination_protocol: Option<String>,
+        /// Remote folder (a template) the file is uploaded into.
+        #[serde(default)]
+        remote_path: Option<String>,
     },
+    /// Compare a sync pair's source and destination (`verify_sync`) and fail
+    /// the step when files differ; `full` compares contents, not just sizes.
+    VerifyPair {
+        sync_pair_id: String,
+        #[serde(default)]
+        full: bool,
+    },
+    /// Remove empty folders under `path` (a template; empty = the
+    /// triggering folder), deepest first. Folders with anything in them stay.
+    RemoveEmptyDirs {
+        #[serde(default)]
+        path: String,
+        /// Also remove `path` itself when it ends up empty.
+        #[serde(default)]
+        remove_root: bool,
+    },
+    /// Write a listing of the files under `path` (a template; empty = the
+    /// triggering folder) to `output`, as CSV or JSON.
+    ListFiles {
+        #[serde(default)]
+        path: String,
+        output: String,
+        #[serde(default)]
+        format: ListFormat,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        include_dirs: bool,
+        /// Replace an existing listing instead of adding a number.
+        #[serde(default = "default_true")]
+        overwrite: bool,
+    },
+    /// Remove a folder and everything in it. High risk: it refuses paths
+    /// near a drive root or home folder, and the safety interlock refuses a
+    /// purge far larger than usual.
+    Purge {
+        path: String,
+        /// Refuse when the folder holds more files than this.
+        #[serde(default)]
+        max_files: Option<u64>,
+    },
+}
+
+/// Format of a `ListFiles` listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListFormat {
+    #[default]
+    Csv,
+    Json,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_download_max_mb() -> u64 {
@@ -757,6 +848,10 @@ impl FireContext {
         if let Some(ledger) = &self.ledger {
             record_automation_log(ledger, &log).await;
         }
+        // Result notifications (profile channels) are fail-open too.
+        if let (Some(services), Some(rule)) = (&services, &updated) {
+            services.run_finished(rule, &log).await;
+        }
         Ok(log)
     }
 }
@@ -769,6 +864,7 @@ async fn db_save_rule(repo: &crate::storage::Repository, rule: &AutomationRule) 
         let conditions_json = serde_json::to_string(&rule_clone.conditions).unwrap_or_default();
         let action_json = serde_json::to_string(&rule_clone.action).unwrap_or_default();
         let extra_json = serde_json::to_string(&RuleExtra {
+            output_as: rule_clone.output_as.clone(),
             condition_tree: rule_clone.condition_tree.clone(),
             steps: rule_clone.steps.clone(),
             options: rule_clone.options.clone(),
@@ -975,6 +1071,7 @@ impl AutomationManager {
                             title: "Error".to_string(),
                             body: "Invalid action configuration".to_string(),
                         }),
+                        output_as: extra.output_as,
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         last_triggered: row.get(8)?,
@@ -1002,9 +1099,7 @@ impl AutomationManager {
 
     /// Save or update a rule in the database.
     pub async fn save_rule(&self, repo: &crate::storage::Repository, rule: &AutomationRule) -> Result<(), AppError> {
-        if let Some(wf) = &rule.workflow {
-            wf.validate().map_err(AppError::validation)?;
-        }
+        rule.validate()?;
         db_save_rule(repo, rule).await?;
 
         // Update in-memory list
@@ -1311,6 +1406,7 @@ impl AutomationManager {
         copy.conditions = src.conditions.clone();
         copy.condition_tree = src.condition_tree.clone();
         copy.steps = src.steps.clone();
+        copy.output_as = src.output_as.clone();
         copy.workflow = src.workflow.clone();
         copy.options = RuleOptions { command_approval: None, webhook_secret_hash: None, ..src.options.clone() };
         self.save_rule(repo, &copy).await?;
@@ -1680,6 +1776,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_run_is_reported_to_the_services_for_notifications() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let mgr = AutomationManager::new();
+        let svc = Arc::new(services::mock::RecordingServices::default());
+        mgr.set_services(svc.clone());
+        let mut ok = AutomationRule::new("tells".into(), RuleTrigger::Manual, RuleAction::Notify { title: "t".into(), body: "b".into() });
+        ok.options.notify = ufop_core::run_notify::RunNotify { notify_profile_id: Some("p".into()), notify_on: vec!["error".into()], min_bytes: Some(5) };
+        mgr.save_rule(&repo, &ok).await.unwrap();
+        let bad = AutomationRule::new("breaks".into(), RuleTrigger::Manual, RuleAction::RunSync { sync_pair_id: "p".into() });
+        mgr.save_rule(&repo, &bad).await.unwrap();
+        mgr.run_rule(&repo, &ok.id).await.unwrap();
+        assert_eq!(*svc.finished.lock().unwrap(), vec!["tells:Success".to_string()]);
+        let failing = Arc::new(services::mock::RecordingServices { fail_with: Some("boom".into()), ..Default::default() });
+        mgr.set_services(failing.clone());
+        let log = mgr.run_rule(&repo, &bad.id).await.unwrap();
+        assert_eq!(log.status, AutomationStatus::Failed);
+        assert_eq!(*failing.finished.lock().unwrap(), vec!["breaks:Failed".to_string()]);
+        // The notification settings are stored with the rule's options.
+        let reloaded = AutomationManager::new();
+        reloaded.load_rules_from_db(&repo).await.unwrap();
+        assert_eq!(reloaded.get_rule(&ok.id).await.unwrap().options.notify, ok.options.notify);
+    }
+
+    #[tokio::test]
     async fn revisions_are_kept_listed_and_restored() {
         let repo = crate::storage::Repository::open_in_memory().await.unwrap();
         let mgr = AutomationManager::new();
@@ -1726,7 +1846,18 @@ mod tests {
         let last = &rules[rules.len() - 2];
         assert_eq!(last.trigger, RuleTrigger::Webhook);
         assert!(matches!(last.condition_tree, Some(ConditionNode::Any { ref nodes }) if nodes.len() == 2));
-        assert_eq!(last.steps.len(), 7);
+        assert_eq!(last.steps.len(), 13);
+        // Steps, result names and notification settings added with the Quickflows parity work.
+        assert!(matches!(&last.steps[7].action, RuleAction::ListFiles { format: ListFormat::Json, recursive: true, include_dirs: true, overwrite: false, .. }));
+        assert_eq!(last.steps[7].output_as.as_deref(), Some("listing"));
+        assert!(matches!(&last.steps[8].action, RuleAction::VerifyPair { sync_pair_id, full: true } if sync_pair_id == "pair-1"));
+        assert!(matches!(&last.steps[9].action, RuleAction::RemoveEmptyDirs { remove_root: true, .. }));
+        assert!(matches!(&last.steps[10].action, RuleAction::Purge { path, max_files: Some(500) } if path == "/in/tmp"));
+        assert!(matches!(&last.steps[11].action, RuleAction::DownloadUrl { destination_connection_id: Some(c), destination_protocol: Some(p), remote_path: Some(r), .. } if c == "conn-1" && p == "sftp" && r == "/in/{yyyy}"));
+        assert!(outputs::validate_rule(last).is_ok(), "{{steps.listing.*}} resolves to the earlier step");
+        assert_eq!(last.options.notify.notify_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(last.options.notify.notify_on, vec!["warning".to_string(), "error".to_string()]);
+        assert_eq!(last.options.notify.min_bytes, Some(1_048_576));
         assert!(matches!(&last.steps[6].action, RuleAction::ScanForMalware { quarantine_path, notify: false } if quarantine_path == "/quarantine/{yyyy}"));
         assert!(matches!(&last.steps[5].action, RuleAction::AiTask { instruction, suffix, max_chars: 5000, .. } if instruction == "Classify {filename}" && suffix == "class.txt"));
         assert!(matches!(&last.steps[2].action, RuleAction::ConvertImage { format: Some(f), max_width: Some(800), max_height: None, quality: None, dest_path } if f == "webp" && dest_path == "/in/small"));
@@ -2049,7 +2180,7 @@ mod tests {
         let mut rule = AutomationRule::new("orig".into(), RuleTrigger::Webhook, RuleAction::CreateFolder { path: "/tmp/{customer}".into() });
         rule.enabled = true;
         rule.trigger_count = 9;
-        rule.steps = vec![ActionStep { action: RuleAction::CreateFolder { path: "/tmp/b".into() }, continue_on_error: true }];
+        rule.steps = vec![ActionStep { action: RuleAction::CreateFolder { path: "/tmp/b".into() }, continue_on_error: true, output_as: None }];
         rule.options.priority = 3;
         mgr.save_rule(&repo, &rule).await.unwrap();
         mgr.rotate_webhook_secret(&repo, &rule.id).await.unwrap();
