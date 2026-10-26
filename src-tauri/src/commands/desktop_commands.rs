@@ -48,3 +48,33 @@ pub async fn set_startup_settings(
     }
     get_startup_settings(app, startup, background).await
 }
+
+/// Settings → Reset: put the chosen preferences back to their defaults.
+/// Start-at-login is turned off with the Desktop scope. Data, saved
+/// passwords and integrations are never touched (see `reset`).
+#[tauri::command]
+pub async fn reset_settings(
+    scopes: Vec<crate::reset::ResetScope>,
+    app: tauri::AppHandle,
+    startup: tauri::State<'_, crate::startup::StartupState>,
+    background: tauri::State<'_, crate::tray::BackgroundMode>,
+    sync: tauri::State<'_, crate::sync_engine::SyncManager>,
+    repo: tauri::State<'_, crate::storage::Repository>,
+) -> Result<crate::reset::ResetReport, AppError> {
+    let live = crate::reset::Live { startup: &startup, background: &background, sync: &sync };
+    let report = crate::reset::reset(&repo, &scopes, live).await?;
+    if scopes.contains(&crate::reset::ResetScope::Desktop) {
+        use tauri_plugin_autostart::ManagerExt;
+        let al = app.autolaunch();
+        if al.is_enabled().unwrap_or(false) {
+            if let Err(e) = al.disable() {
+                tracing::warn!("Reset: could not turn off start-at-login: {e}");
+            }
+        }
+        if let Some(tray) = app.tray_by_id("ufop") {
+            let _ = tray.set_visible(true);
+        }
+    }
+    crate::security::audit::SecurityAudit::log(repo.inner(), "settings.reset", "user", "settings", &format!("{scopes:?}")).await;
+    Ok(report)
+}

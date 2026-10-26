@@ -271,6 +271,15 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Forget the saved global defaults: the built-in ones apply again.
+    pub async fn reset_default_options(&self, repo: &crate::storage::Repository) -> Result<(), AppError> {
+        repo.delete_config(DEFAULT_OPTIONS_KEY).await?;
+        if let Ok(mut cur) = self.default_options.write() {
+            *cur = CopyOptions::default();
+        }
+        Ok(())
+    }
+
     /// Validate, save and apply new global defaults.
     pub async fn set_default_options(&self, repo: &crate::storage::Repository, options: CopyOptions) -> Result<CopyOptions, AppError> {
         copier::validate_options(&options)?;

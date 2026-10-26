@@ -1552,6 +1552,15 @@ export function getDefaultCommands(actions: {
       keywords: ["startup", "login", "autostart", "tray", "minimise", "minimize", "close", "background", "menu bar"],
     },
     {
+      id: "reset-settings",
+      label: "Reset Settings\u2026",
+      description: "Put appearance, startup and tray, and sync defaults back to the defaults (data is kept)",
+      icon: <RotateCcw className="h-4 w-4" />,
+      category: "Navigation",
+      action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("reset") : actions.onOpenSettings?.()),
+      keywords: ["reset", "defaults", "factory", "restore settings", "start over", "preferences"],
+    },
+    {
       id: "rclone-settings",
       label: "rclone Program & Config\u2026",
       description: "Choose the rclone binary and rclone.conf, check the version, install the managed copy (Settings \u2192 rclone)",

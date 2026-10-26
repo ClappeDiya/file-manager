@@ -20,7 +20,7 @@ use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
 
 pub const OPEN_BACKUPS_EVENT: &str = "ufop://open-backups";
-const KEY_BACKGROUND: &str = "app.run_in_background";
+pub const KEY_BACKGROUND: &str = "app.run_in_background";
 
 /// Whether closing the window should hide it instead of exiting.
 #[derive(Clone, Default)]

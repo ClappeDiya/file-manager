@@ -36,6 +36,7 @@ pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod reset;
 pub mod startup;
 pub mod tray;
 pub mod tray_labels;
@@ -733,6 +734,7 @@ pub fn run() {
             desktop_commands::set_ui_language,
             desktop_commands::get_startup_settings,
             desktop_commands::set_startup_settings,
+            desktop_commands::reset_settings,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,

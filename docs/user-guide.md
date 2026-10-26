@@ -892,6 +892,17 @@ Theme switching is instant with no restart required. The theme applies immediate
 - **Size units** - *Decimal* (default; 1 KB = 1,000 bytes, as macOS and disk makers count) or *Binary* (1 KiB = 1,024 bytes, labelled KiB, MiB, GiB). Every size in the app follows it: file lists, transfers, sync, backups, mounts and drives. Sizes already on screen in a panel update the next time it redraws.
 - **Backup times** - show the times of backup versions, runs and files in this computer's time zone (default) or in UTC (marked "UTC"). Schedules keep their own time zone; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
 
+### Reset settings
+
+**Settings → Reset** (or *Reset Settings…* in the command palette) puts preferences back to the defaults. Choose what to reset:
+
+- **Appearance and layout** - theme, accent colour, language, text size, units, Simple/Advanced mode, toolbar, sidebar, panels, table columns, drag-and-drop confirmation, default download and upload folders.
+- **Startup, tray and notifications** (desktop app) - start at login is turned off, the window opens at start, the tray icon shows, desktop notifications go back to their defaults.
+- **Sync and transfer defaults** (desktop app) - global sync defaults, the bandwidth timetable and how long failed transfers are kept.
+- **Welcome tour and tips** - shows the welcome wizard and the feature tips again (not chosen unless you tick it).
+
+Connections, sync pairs, backup jobs, mounts, favorites, history, saved passwords and keys are never reset, nor are the local web server, chat control, metrics, rclone, proxy and console settings. You are asked to confirm first, and the reset is recorded in the security audit log.
+
 ### Startup and tray
 
 **Settings → Startup & Tray** (desktop app; also *Startup & Tray Settings…* in the command palette):

@@ -202,6 +202,12 @@ impl Repository {
             .await
     }
 
+    /// Remove a setting (its default applies again). `true` if it was set.
+    pub async fn delete_config(&self, key: &str) -> Result<bool, AppError> {
+        let key = key.to_string();
+        self.pool.execute(move |conn| Ok(conn.execute("DELETE FROM config WHERE key = ?1", rusqlite::params![key])? > 0)).await
+    }
+
     // ── Bookmark operations ──
 
     pub async fn list_bookmarks(&self) -> Result<Vec<Bookmark>, AppError> {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-const KEY_STARTUP: &str = "app.startup";
+pub const KEY_STARTUP: &str = "app.startup";
 
 /// The stored choices (start-at-login and close-to-tray live elsewhere, see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

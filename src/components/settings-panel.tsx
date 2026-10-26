@@ -39,6 +39,7 @@ import { LocalServerSection } from "@/components/local-server-section";
 import { FolderField } from "@/components/remote-folder-picker";
 import { useT } from "@/lib/i18n";
 import { StartupTraySection } from "@/components/startup-tray-section";
+import { ResetSettingsSection } from "@/components/reset-settings-section";
 
 // ── Types ──
 
@@ -1358,6 +1359,8 @@ export default function SettingsPanel({
   focusSection?: string | null;
 }) {
   const t = useT();
+  // Bumped by a reset: the sections remount and read their settings again.
+  const [resetEpoch, setResetEpoch] = useState(0);
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
   const portable = usePortableStatus();
 
@@ -1383,7 +1386,7 @@ export default function SettingsPanel({
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div key={resetEpoch} className="flex-1 overflow-y-auto p-4 space-y-3">
         <Section title={t("settings.appearance")} defaultOpen>
           <AppearanceSettings />
         </Section>
@@ -1532,6 +1535,10 @@ export default function SettingsPanel({
               Run Diagnostics
             </button>
           </div>
+        </Section>
+
+        <Section title={t("settings.reset")} id="reset" focus={focusSection === "reset"} defaultOpen={resetEpoch > 0}>
+          <ResetSettingsSection onReset={() => setResetEpoch((n) => n + 1)} justReset={resetEpoch > 0} />
         </Section>
       </div>
     </div>

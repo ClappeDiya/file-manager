@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Interface (WS-G, RcloneView parity)**:
+  - **Reset settings** (Settings → Reset, palette *Reset Settings…*; `reset_settings`): appearance and layout, startup/tray/notifications, sync and transfer defaults, and the welcome tour, each optional, after a confirmation; only listed preference keys are removed (`reset::ResetScope::keys`) and the running app takes the defaults at once; data, saved passwords and integrations are kept; audited.
   - **Startup & Tray** (Settings; `get_startup_settings` / `set_startup_settings`): start at login (optionally in the tray), start minimised, minimise to the tray, close to the tray (the Backups screen's setting) and show/hide the tray icon; without a tray icon (hidden, or the desktop has none) nothing hides the window (`startup::effective`).
   - **Language** (Settings → Appearance and the onboarding welcome page): System default or one of the eight translations; the context menu, sidebar, Settings headings, navigation buttons, palette prompt and the tray menu (`set_ui_language`, `tray_labels`) follow it, `<html lang>` is set, and text without a translation falls back to English instead of showing the key.
   - **Accent colour** (Settings → Appearance): nine presets or any custom colour, applied to the design tokens and every `blue-*` utility through one generated stylesheet (OKLCH shades with Tailwind blue's lightness steps); high contrast is unchanged.
