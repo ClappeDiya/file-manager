@@ -169,4 +169,15 @@ describe("moves and opening connection files", () => {
       expect(isRunnableName(n), n).toBe(false);
     }
   });
+
+  // Regression (WS-Z2): Windows file types that run code were missing, and
+  // Windows ignores a trailing dot or space ("evil.exe." runs as .exe).
+  it("knows the Windows file types that run code, however the name ends", () => {
+    for (const n of ["console.msc", "help.chm", "report.docm", "book.xlsm", "deck.pptm", "addin.xlam", "disk.iso", "disk.img", "drive.vhdx", "note.one", "plugin.xll", "ctl.ocx", "update.msu", "x.settingcontent-ms", "lib.library-ms", "a.appref-ms", "s.ws", "s.wsc", "s.psc1", "evil.exe.", "evil.exe  ", "evil.EXE . "]) {
+      expect(isRunnableName(n), n).toBe(true);
+    }
+    for (const n of ["notes.txt", "photo.jpg", "report.docx", "data.xlsx", "exe", "readme"]) {
+      expect(isRunnableName(n), n).toBe(false);
+    }
+  });
 });

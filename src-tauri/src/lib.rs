@@ -36,14 +36,19 @@ pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod app_lock;
+pub mod cloud_folders;
+pub mod reset;
+pub mod startup;
 pub mod tray;
+pub mod tray_labels;
 
 use ai_engine::AiAssistant;
 use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
+use commands::{ai_commands, app_lock_commands, archive_commands, compat_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, desktop_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -99,6 +104,8 @@ struct AppState {
     /// Optional loopback Prometheus exporter (Settings → Advanced; off by default).
     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
+    startup: startup::StartupState,
+    app_lock: app_lock::AppLock,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
@@ -150,6 +157,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
             queued_jobs.len()
         );
         transfer_mgr.restore_jobs(queued_jobs).await;
+    }
+    if let Ok(Some(json)) = repo.get_config(PENDING_MOVES_KEY).await {
+        match serde_json::from_str::<Vec<transfer_engine::location::MoveGroup>>(&json) {
+            Ok(moves) => transfer_mgr.restore_moves(moves).await,
+            Err(e) => tracing::warn!("Pending moves not restored: {e}"),
+        }
+        let _ = repo.delete_config(PENDING_MOVES_KEY).await;
     }
 
     // Initialize credential store and connection manager
@@ -323,6 +337,8 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // The scheduler starts in Tauri's `setup` hook: this function runs on a
     // throwaway runtime whose spawned tasks die when it is dropped.
     let background_mode = tray::load_background_mode(&repo).await;
+    let startup = startup::load(&repo).await;
+    let app_lock = app_lock::AppLock::load(&repo, master_pw_mgr.is_master_password_set(&repo).await.unwrap_or(false)).await;
 
     Ok(AppState {
         repo,
@@ -358,6 +374,8 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         fleet_agent,
         embedded_server,
         background_mode,
+        startup,
+        app_lock,
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
@@ -430,7 +448,19 @@ async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) 
     } else {
         tracing::info!("Transfer queue persisted ({} job(s))", jobs.len());
     }
+    // The moves among them, so a restored job still removes its original.
+    let moves = transfer_mgr.snapshot_moves().await;
+    let saved = match serde_json::to_string(&moves) {
+        Ok(json) if !moves.is_empty() => repo.set_config(PENDING_MOVES_KEY, &json).await,
+        _ => repo.delete_config(PENDING_MOVES_KEY).await.map(|_| ()),
+    };
+    if let Err(e) = saved {
+        tracing::error!("Failed to persist pending moves on shutdown: {e}");
+    }
 }
+
+/// Moves not finished when the app quit (`TransferManager::snapshot_moves`).
+const PENDING_MOVES_KEY: &str = "transfer.pending_moves";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -551,6 +581,8 @@ pub fn run() {
                     fleet_agent,
                     embedded_server,
                     background_mode: tray::BackgroundMode::default(),
+                    startup: startup::StartupState::default(),
+                    app_lock: app_lock::AppLock::default(),
                     audit_trail,
                 }
             }
@@ -569,6 +601,10 @@ pub fn run() {
     let shutdown_repo = app_state.repo.clone();
     let setup_backup_mgr = app_state.backup_mgr.clone();
     let close_mode = app_state.background_mode.clone();
+    let window_startup = app_state.startup.clone();
+    let setup_startup = app_state.startup.clone();
+    let ipc_lock = app_state.app_lock.clone();
+    let setup_lock = app_state.app_lock.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
     let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
@@ -648,13 +684,27 @@ pub fn run() {
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
             commands::mount_commands::forward_mount_changes(app.handle().clone(), &app.state::<MountManager>());
-            if let Err(e) = tray::setup(app, mgr) {
-                tracing::warn!("System tray unavailable (non-fatal): {e}");
+            app_lock::spawn_idle_watch(app.handle().clone(), setup_lock.clone());
+            match tray::setup(app, mgr) {
+                Ok(()) => setup_startup.set_tray_created(true),
+                Err(e) => tracing::warn!("System tray unavailable (non-fatal): {e}"),
             }
-            // Launched at login: start hidden in the tray.
-            if std::env::args().any(|a| a == "--background") {
-                for w in app.webview_windows().values() {
-                    let _ = w.hide();
+            // Settings → Startup & Tray: tray icon, and the window at launch
+            // (hidden at login, or every launch when asked).
+            let prefs = setup_startup.get();
+            if let Some(tray) = app.tray_by_id("ufop") {
+                let _ = tray.set_visible(prefs.show_tray_icon);
+            }
+            let launch = setup_startup.effective(app.state::<tray::BackgroundMode>().enabled()).launch;
+            for w in app.webview_windows().values() {
+                match launch {
+                    startup::LaunchWindow::Show => {}
+                    startup::LaunchWindow::Hide => {
+                        let _ = w.hide();
+                    }
+                    startup::LaunchWindow::Minimize => {
+                        let _ = w.minimize();
+                    }
                 }
             }
             Ok(())
@@ -692,13 +742,16 @@ pub fn run() {
         .manage(app_state.embedded_server)
         .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
+        .manage(app_state.startup)
+        .manage(app_state.app_lock)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
         .manage(app_state.thumbnails)
         .manage(app_state.office_renderer)
         .manage(app_state.credential_store)
-        .invoke_handler(tauri::generate_handler![
+        // While the app lock is on, only the lock screen's commands run.
+        .invoke_handler(app_lock::gate(ipc_lock, tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
             audit_commands::export_audit_log,
@@ -708,6 +761,22 @@ pub fn run() {
             system_commands::greet,
             system_commands::get_app_version,
             system_commands::get_portable_status,
+            desktop_commands::set_ui_language,
+            desktop_commands::get_startup_settings,
+            desktop_commands::set_startup_settings,
+            desktop_commands::reset_settings,
+            desktop_commands::detect_cloud_folders,
+            desktop_commands::open_new_window,
+            app_lock_commands::app_lock_status,
+            app_lock_commands::app_lock_set_settings,
+            app_lock_commands::app_lock_now,
+            app_lock_commands::app_lock_unlock,
+            app_lock_commands::app_lock_activity,
+            compat_commands::compat_profiles,
+            compat_commands::compat_scan_folder,
+            compat_commands::compat_fix_names,
+            compat_commands::compat_list_renames,
+            compat_commands::compat_restore_names,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
@@ -1440,18 +1509,33 @@ pub fn run() {
             safety_commands::safety_confirm_intent,
             // Operation Narrator (plain-language cross-engine story per correlation trace)
             narrator_commands::narrator_narrate_operation,
-        ])
+        ]))
         .on_window_event(move |window, event| {
             // "Keep running in the tray": closing hides the window so
             // scheduled backups continue.
+            // Other windows (File → New Window) just close.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if close_mode.enabled() {
+                if window.label() == "main" && window_startup.effective(close_mode.enabled()).close_to_tray {
                     api.prevent_close();
                     let _ = window.hide();
                     return;
                 }
             }
+            // "Minimise to the tray": the minimised main window leaves the
+            // taskbar (the tray's Open brings back the main window only, so
+            // other windows stay in the taskbar).
+            if let tauri::WindowEvent::Resized(_) = event {
+                if window.label() == "main" && window_startup.effective(close_mode.enabled()).minimize_to_tray && window.is_minimized().unwrap_or(false) {
+                    let _ = window.hide();
+                }
+            }
+            // The app ends with its last window: only then stop and persist.
             if let tauri::WindowEvent::Destroyed = event {
+                use tauri::Manager;
+                let open: Vec<String> = window.app_handle().webview_windows().keys().cloned().collect();
+                if !startup::is_last_window(window.label(), open.iter().map(String::as_str)) {
+                    return;
+                }
                 tracing::info!("Window closing, persisting state...");
                 // Running backups stop at a safe point (partial version,
                 // repository lock released) before the app exits.
@@ -1500,6 +1584,12 @@ mod tests {
         assert!(!compare_engine::apply::is_staging("/b/.x.txt.ufop-compare-notahex!"));
         assert!(!compare_engine::apply::is_staging("/b/x.txt.ufop-compare-0a1b2c3d"), "not hidden");
         assert!(compare_engine::apply::is_staging("C:\\b\\.x.ufop-compare-0A1B2C3D"));
+        // Review: a long name's staging file stays within 255 bytes and is
+        // still recognised as staging.
+        let long = std::path::PathBuf::from("/b").join(format!("{}.txt", "y".repeat(248)));
+        let staging = compare_engine::apply::staging_for(&long);
+        assert!(staging.file_name().unwrap().len() <= 255, "{}", staging.display());
+        assert!(compare_engine::apply::is_staging(&staging.to_string_lossy()));
     }
 
     /// The stored rclone settings become the ones every rclone call uses.

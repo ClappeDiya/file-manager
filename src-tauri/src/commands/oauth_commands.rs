@@ -23,6 +23,10 @@ pub struct OAuthSignedIn {
     pub provider: OAuthProvider,
     /// The account signed in (e-mail or name), as the service reports it.
     pub account: Option<String>,
+    /// Signed in, but the service could not be reached to check it (the
+    /// tokens are kept; it connects once the service answers).
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// The app's OAuth connector instances (shared with the connector registry).
@@ -72,6 +76,17 @@ async fn oauth_profile(manager: &ConnectionManager, connection_id: &str) -> Resu
     Ok((profile, provider))
 }
 
+/// A sign-in with your own app: remember it, so the next sign-in uses it too.
+fn remember_own_app(profile: &mut ConnectionProfile, provider: OAuthProvider, grant: &OAuthGrant) {
+    if let OAuthGrant::Token { client_id: Some(id), .. } = grant {
+        let builtin = provider.builtin_client().map(|(b, _)| b);
+        if builtin.as_deref() != Some(id.as_str()) {
+            let o = profile.extras.oauth.get_or_insert_with(OAuthSettings::default);
+            o.client_id = Some(id.clone());
+        }
+    }
+}
+
 /// Check `grant` by connecting with it, then store it (with the tokens the
 /// connect may have renewed) as the connection's credential. Nothing is
 /// stored when the service refuses it.
@@ -79,19 +94,27 @@ pub async fn finish_sign_in(manager: &ConnectionManager, cloud: &CloudConnectors
     let mut profile = manager.get_connection(connection_id).await?.ok_or_else(|| AppError::not_found("The connection no longer exists"))?;
     let provider = OAuthProvider::from_protocol(profile.protocol).ok_or_else(|| AppError::validation("This connection does not sign in with OAuth"))?;
     let connector = cloud.connector(provider);
-    connector.connect_with_secret(&profile, Some(grant.to_json()?)).await?;
-    let stored = cloud.grant(provider).await.unwrap_or(grant);
-    // A sign-in with your own app: remember it, so the next sign-in uses it too.
-    if let OAuthGrant::Token { client_id: Some(id), .. } = &stored {
-        let builtin = provider.builtin_client().map(|(b, _)| b);
-        if builtin.as_deref() != Some(id.as_str()) {
-            let o = profile.extras.oauth.get_or_insert_with(OAuthSettings::default);
-            o.client_id = Some(id.clone());
+    if let Err(e) = connector.connect_with_secret(&profile, Some(grant.to_json()?)).await {
+        // A refused credential is not stored (the caller shows why).
+        if e.is_auth_failure() {
+            return Err(e);
         }
+        // Anything else (no network, a server error) says nothing about the
+        // tokens, and the code they came from cannot be used again: keep them.
+        remember_own_app(&mut profile, provider, &grant);
+        manager.save_connection(profile, Some(grant.to_json()?)).await?;
+        return Ok(OAuthSignedIn {
+            connection_id: connection_id.to_string(),
+            provider,
+            account: None,
+            warning: Some(format!("Signed in, but connecting to check it failed ({}). The sign-in is kept; it is used at the next connect.", e.user_message())),
+        });
     }
+    let stored = cloud.grant(provider).await.unwrap_or(grant);
+    remember_own_app(&mut profile, provider, &stored);
     // Saving stores the credential and clears any credentials-rejected flag.
     manager.save_connection(profile, Some(stored.to_json()?)).await?;
-    Ok(OAuthSignedIn { connection_id: connection_id.to_string(), provider, account: cloud.account(provider) })
+    Ok(OAuthSignedIn { connection_id: connection_id.to_string(), provider, account: cloud.account(provider), warning: None })
 }
 
 /// What the sign-in screen should say about a provider (is there a

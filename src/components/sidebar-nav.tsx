@@ -21,6 +21,14 @@ import type { FileEntryData } from "./file-list";
 import { SmartSpacesSection } from "./smart-spaces-section";
 import type { SmartSpace } from "@/stores/spaces-store";
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
+import { useT } from "@/lib/i18n";
+
+/** Mirrors `cloud_folders::CloudFolder`. */
+export interface CloudFolder {
+  provider: string;
+  label: string;
+  path: string;
+}
 
 // ──────────────────────────────────────────────
 // Types
@@ -80,6 +88,7 @@ export function SidebarNav({
   onOpenConnection,
   className,
 }: SidebarNavProps) {
+  const t = useT();
   const connections = useConnectionsStore((s) => s.connections);
   const connectionStatuses = useConnectionsStore((s) => s.statuses);
   useEffect(() => {
@@ -106,8 +115,17 @@ export function SidebarNav({
     return () => clearInterval(interval);
   }, []);
 
+  // Folders kept in sync by Dropbox, OneDrive, Google Drive, iCloud… (desktop app).
+  const [cloudFolders, setCloudFolders] = useState<CloudFolder[]>([]);
+  useEffect(() => {
+    const detect = () => void tauriInvokeSafe<CloudFolder[]>("detect_cloud_folders", undefined, []).then(setCloudFolders);
+    detect();
+    const interval = setInterval(detect, 5 * 60_000);
+    return () => clearInterval(interval);
+  }, []);
+
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
-    new Set(["smart-spaces", "smart-locations", "favorites", "devices", "connections"]),
+    new Set(["smart-spaces", "smart-locations", "favorites", "devices", "cloud-folders", "connections"]),
   );
 
   const toggleSection = useCallback((section: string) => {
@@ -163,7 +181,7 @@ export function SidebarNav({
         {/* Smart Locations — frecency-ranked from operation ledger */}
         {smartLocations.length > 0 && (
           <SidebarSection
-            title="Smart"
+            title={t("fileManager.smart")}
             icon={<Sparkles className="h-4 w-4" aria-hidden="true" />}
             expanded={expandedSections.has("smart-locations")}
             onToggle={() => toggleSection("smart-locations")}
@@ -192,7 +210,7 @@ export function SidebarNav({
 
         {/* Favorites Section */}
         <SidebarSection
-          title="Favorites"
+          title={t("fileManager.favorites")}
           icon={<Star className="h-4 w-4" aria-hidden="true" />}
           expanded={expandedSections.has("favorites")}
           onToggle={() => toggleSection("favorites")}
@@ -218,7 +236,7 @@ export function SidebarNav({
 
         {/* Devices Section */}
         <SidebarSection
-          title="Devices"
+          title={t("fileManager.devices")}
           icon={<HardDrive className="h-4 w-4" aria-hidden="true" />}
           expanded={expandedSections.has("devices")}
           onToggle={() => toggleSection("devices")}
@@ -241,10 +259,39 @@ export function SidebarNav({
           )}
         </SidebarSection>
 
+        {/* Cloud folders: synced by the services' own apps */}
+        {cloudFolders.length > 0 && (
+          <SidebarSection
+            title={t("fileManager.cloudFolders")}
+            icon={<Cloud className="h-4 w-4" aria-hidden="true" />}
+            expanded={expandedSections.has("cloud-folders")}
+            onToggle={() => toggleSection("cloud-folders")}
+            testId="sidebar-cloud-folders"
+          >
+            {cloudFolders.map((f) => (
+              <button
+                key={f.path}
+                className={cn(
+                  "flex items-center gap-2 w-full px-4 py-1.5 text-left",
+                  "text-[length:var(--font-size-xs)] text-[color:var(--color-text-secondary)]",
+                  "hover:bg-[var(--color-hover-bg)] transition-theme",
+                  "focus-visible:outline-2 focus-visible:outline-inset focus-visible:outline-[var(--color-focus-ring)]",
+                )}
+                onClick={() => onNavigate(f.path)}
+                title={f.path}
+                data-testid={`sidebar-cloud-folder-${f.provider}`}
+              >
+                <Cloud className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                <span className="truncate">{f.label}</span>
+              </button>
+            ))}
+          </SidebarSection>
+        )}
+
         {/* Saved connections: open one in the active pane */}
         {onOpenConnection && (
           <SidebarSection
-            title="Connections"
+            title={t("connections.title")}
             icon={<Cloud className="h-4 w-4" aria-hidden="true" />}
             expanded={expandedSections.has("connections")}
             onToggle={() => toggleSection("connections")}
@@ -283,7 +330,7 @@ export function SidebarNav({
 
         {/* Tree View Section */}
         <SidebarSection
-          title="Folders"
+          title={t("fileManager.folders")}
           icon={<Folder className="h-4 w-4" aria-hidden="true" />}
           expanded={expandedSections.has("folders")}
           onToggle={() => toggleSection("folders")}
@@ -304,7 +351,7 @@ export function SidebarNav({
 
         {/* Recent Locations */}
         <SidebarSection
-          title="Recent"
+          title={t("fileManager.recent")}
           icon={<Clock className="h-4 w-4" aria-hidden="true" />}
           expanded={expandedSections.has("recent")}
           onToggle={() => toggleSection("recent")}

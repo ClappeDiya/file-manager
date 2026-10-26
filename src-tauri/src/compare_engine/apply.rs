@@ -25,7 +25,8 @@
 //! - Local deletes go through the file manager's own delete (Trash unless
 //!   permanent, and not on Windows yet); connection deletes through the
 //!   connector's remove, which most protocols cannot undo. A folder is
-//!   removed only once nothing is left in it.
+//!   removed only once nothing is left in it (a local one atomically, so
+//!   never to the Trash: it is empty).
 //!
 //! Everything is recorded in the operation ledger. Local copies of new files
 //! and local folders created are recorded as `fs` copy / create-folder
@@ -369,10 +370,10 @@ async fn remote_exists(target: &ResolvedSide, rel: &str, cache: &mut HashMap<Str
 const STAGING_MARK: &str = ".ufop-compare-";
 
 /// Hidden sibling a local copy is written to before it is moved into place.
-fn staging_for(dest: &Path) -> PathBuf {
+pub(crate) fn staging_for(dest: &Path) -> PathBuf {
     let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    dest.with_file_name(format!(".{name}{STAGING_MARK}{tag}"))
+    dest.with_file_name(crate::connectors::staging_name(&name, &format!("{STAGING_MARK}{tag}")))
 }
 
 /// Whether `path` is a staging file of a local copy
@@ -618,12 +619,31 @@ async fn delete_dir(target: &ResolvedSide, rel: &str, env: &ApplyEnv<'_>) -> Res
             if !path.exists() {
                 return Ok(true);
             }
-            let empty = std::fs::read_dir(&path).map(|mut d| d.next().is_none()).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-            if !empty {
-                return Ok(false);
+            #[cfg(test)]
+            before_empty_folder_delete(&path);
+            // `remove_dir` removes the folder only while it is empty, in one
+            // step: a file saved into it meanwhile keeps the folder (a check
+            // first and a recursive delete after could take that file along).
+            // So an empty folder is removed, not moved to the Trash, even
+            // without "permanent": it holds nothing to restore, and the Trash
+            // has no "only if empty" move.
+            match std::fs::remove_dir(&path) {
+                Ok(()) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    record_fs_ok(env.ledger, "delete_permanent", &[path.to_string_lossy().to_string()], &[], &id).await;
+                    Ok(true)
+                }
+                Err(e) => {
+                    let has_entries = std::fs::read_dir(&path).map(|mut d| d.next().is_some()).unwrap_or(false);
+                    if has_entries {
+                        Ok(false)
+                    } else if !path.exists() {
+                        Ok(true)
+                    } else {
+                        Err(format!("Cannot delete {}: {e}", path.display()))
+                    }
+                }
             }
-            delete_files_impl(vec![path.to_string_lossy().to_string()], env.permanent, env.ledger).await.map_err(|e| e.to_string())?;
-            Ok(true)
         }
         ResolvedSide::Remote { connector, .. } => {
             let abs = target.abs(rel)?;
@@ -753,4 +773,18 @@ pub async fn refresh(left: &ResolvedSide, right: &ResolvedSide, opts: &CompareOp
 /// Every path an action covers (for re-comparing): the steps' paths.
 pub fn touched_by(plan: &ActionPlan) -> HashSet<String> {
     plan.steps.iter().map(|s| s.path().to_string()).collect()
+}
+
+/// Tests: runs just before an empty local folder is removed (to put a file
+/// in it at the worst moment).
+#[cfg(test)]
+pub(crate) static BEFORE_EMPTY_FOLDER_DELETE: std::sync::Mutex<Option<FolderHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) type FolderHook = Box<dyn Fn(&Path) + Send>;
+
+#[cfg(test)]
+fn before_empty_folder_delete(path: &Path) {
+    if let Some(f) = BEFORE_EMPTY_FOLDER_DELETE.lock().unwrap().as_ref() {
+        f(path);
+    }
 }

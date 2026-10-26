@@ -36,6 +36,14 @@ macro; if you add a new one here, register it there too.
 - `ai_set_feature_toggles`
 - `ai_set_ollama_model`
 
+## `app_lock_commands` (5 commands)
+
+- `app_lock_activity`
+- `app_lock_now`
+- `app_lock_set_settings`
+- `app_lock_status`
+- `app_lock_unlock`
+
 ## `archive_commands` (4 commands)
 
 - `archive_browse`
@@ -221,6 +229,14 @@ macro; if you add a new one here, register it there too.
 - `compare_plan_action`
 - `compare_release`
 
+## `compat_commands` (5 commands)
+
+- `compat_fix_names`
+- `compat_list_renames`
+- `compat_profiles`
+- `compat_restore_names`
+- `compat_scan_folder`
+
 ## `confirmation_commands` (1 command)
 
 - `request_destructive_confirmation`
@@ -282,6 +298,15 @@ macro; if you add a new one here, register it there too.
 - `generate_script`
 - `list_custom_commands`
 - `save_custom_command`
+
+## `desktop_commands` (6 commands)
+
+- `detect_cloud_folders`
+- `get_startup_settings`
+- `open_new_window`
+- `reset_settings`
+- `set_startup_settings`
+- `set_ui_language`
 
 ## `drive_commands` (6 commands)
 
@@ -861,4 +886,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 672 commands across 58 modules.
+**Surface:** 688 commands across 61 modules.

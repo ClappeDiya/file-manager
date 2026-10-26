@@ -1028,7 +1028,7 @@ impl PeerManager {
                             tokio::fs::create_dir_all(parent).await?;
                         }
                         let target = unique_path(&target);
-                        let part = target.with_file_name(format!(".{}{}", target.file_name().unwrap_or_default().to_string_lossy(), super::STAGING_SUFFIX));
+                        let part = target.with_file_name(super::staging_name(&target.file_name().unwrap_or_default().to_string_lossy(), super::STAGING_SUFFIX));
                         let f = tokio::fs::File::create(&part).await?;
                         current = Some((index, part, f, sha2::Sha256::new(), entry.size, target));
                         Ok(false)

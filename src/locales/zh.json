@@ -115,7 +115,15 @@
     "diskFull": "\u78c1\u76d8\u7a7a\u95f4\u4e0d\u8db3",
     "copyingFiles": "\u6b63\u5728\u590d\u5236 {{count}} \u4e2a\u6587\u4ef6...",
     "movingFiles": "\u6b63\u5728\u79fb\u52a8 {{count}} \u4e2a\u6587\u4ef6...",
-    "deletingFiles": "\u6b63\u5728\u5220\u9664 {{count}} \u4e2a\u6587\u4ef6..."
+    "deletingFiles": "\u6b63\u5728\u5220\u9664 {{count}} \u4e2a\u6587\u4ef6...",
+    "folders": "\u6587\u4ef6\u5939",
+    "smart": "\u667a\u80fd",
+    "copyPath": "\u590d\u5236\u8def\u5f84",
+    "deletePermanently": "\u6c38\u4e45\u5220\u9664",
+    "openWith": "\u6253\u5f00\u65b9\u5f0f...",
+    "extractHere": "\u89e3\u538b\u5230\u6b64\u5904",
+    "openInNewWindow": "\u5728\u65b0\u7a97\u53e3\u4e2d\u6253\u5f00",
+    "cloudFolders": "\u4e91\u6587\u4ef6\u5939"
   },
   "transfer": {
     "title": "\u4f20\u8f93",
@@ -268,7 +276,17 @@
     "rollback": "\u56de\u6eda\u5230\u4e0a\u4e00\u7248\u672c",
     "rollbackConfirm": "\u786e\u5b9a\u8981\u56de\u6eda\u5230\u4e0a\u4e00\u7248\u672c\u5417\uff1f",
     "rollbackSuccess": "\u56de\u6eda\u6210\u529f\u3002\u91cd\u542f\u4ee5\u5e94\u7528\u3002",
-    "rollbackFailed": "\u56de\u6eda\u5931\u8d25: {{error}}"
+    "rollbackFailed": "\u56de\u6eda\u5931\u8d25: {{error}}",
+    "languageSystem": "\u7cfb\u7edf\u9ed8\u8ba4 ({{name}})",
+    "languageHint": "\u83dc\u5355\u3001\u4fa7\u8fb9\u680f\u3001\u8bbe\u7f6e\u6807\u9898\u548c\u6258\u76d8\u83dc\u5355\u4f7f\u7528\u6b64\u8bed\u8a00\uff1b\u5176\u4ed6\u6587\u672c\u4ecd\u4e3a\u82f1\u6587\u3002",
+    "notifications": "\u901a\u77e5",
+    "privacy": "\u9690\u79c1",
+    "network": "\u7f51\u7edc",
+    "logging": "\u65e5\u5fd7",
+    "startupTray": "\u542f\u52a8\u4e0e\u6258\u76d8",
+    "appLock": "\u5e94\u7528\u9501",
+    "reset": "\u91cd\u7f6e",
+    "accentColor": "\u5f3a\u8c03\u8272"
   },
   "onboarding": {
     "welcome": "\u6b22\u8fce\u4f7f\u7528\u7edf\u4e00\u6587\u4ef6\u64cd\u4f5c\u5e73\u53f0",
@@ -361,5 +379,11 @@
     "rollbackDescription": "\u5982\u679c\u5f53\u524d\u7248\u672c\u6709\u95ee\u9898\uff0c\u60a8\u53ef\u4ee5\u56de\u6eda\u5230\u4e0a\u4e00\u7248\u672c\u3002",
     "differentialUpdate": "\u6b63\u5728\u4e0b\u8f7d\u5dee\u5206\u66f4\u65b0...",
     "fullUpdate": "\u6b63\u5728\u4e0b\u8f7d\u5b8c\u6574\u66f4\u65b0..."
+  },
+  "nav": {
+    "back": "\u540e\u9000",
+    "forward": "\u524d\u8fdb",
+    "up": "\u8f6c\u5230\u4e0a\u7ea7\u6587\u4ef6\u5939",
+    "root": "\u8f6c\u5230\u6839\u76ee\u5f55"
   }
 }

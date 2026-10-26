@@ -260,13 +260,23 @@ const RUNNABLE_EXTENSIONS = new Set([
   "lnk", "url", "scf", "jar", "jnlp", "application", "gadget",
   "sh", "bash", "zsh", "csh", "ksh", "command", "tool", "desktop", "run", "bin", "appimage",
   "app", "pkg", "dmg", "workflow", "scpt", "deb", "rpm", "py", "pyw", "pl", "rb", "php",
+  // Windows: consoles, help, installers, controls, shell links, scripts.
+  "msc", "chm", "msu", "mst", "msh", "msh1", "msh2", "mshxml", "ocx", "drv", "xll", "ws", "wsc",
+  "psc1", "psc2", "ps1xml", "ps2", "ps2xml", "vb", "vbscript", "shb", "shs", "ade", "adp", "mde",
+  "accde", "isp", "ins", "website", "xbap", "appref-ms", "settingcontent-ms", "library-ms",
+  "searchconnector-ms", "diagcab", "theme", "themepack",
+  // Office files with macros, OneNote, and images that open as drives.
+  "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "ppsm", "sldm", "one",
+  "iso", "img", "vhd", "vhdx",
 ]);
 
-/** Whether opening a file of this name may run a program or script. */
+/** Whether opening a file of this name may run a program or script.
+ *  Windows ignores trailing dots and spaces, so `evil.exe.` counts as `.exe`. */
 export function isRunnableName(name: string): boolean {
-  const dot = name.lastIndexOf(".");
+  const trimmed = name.replace(/[. ]+$/, "");
+  const dot = trimmed.lastIndexOf(".");
   if (dot <= 0) return false;
-  return RUNNABLE_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
+  return RUNNABLE_EXTENSIONS.has(trimmed.slice(dot + 1).toLowerCase());
 }
 
 /** Mirrors `FolderSize`. */

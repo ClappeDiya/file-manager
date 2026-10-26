@@ -490,7 +490,7 @@ pub fn at_path(entry: &FileEntry, path: &str) -> bool {
 pub fn local_staging_path(dest: &str, tag: impl std::fmt::Display) -> String {
     let p = std::path::Path::new(dest);
     let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    p.with_file_name(format!(".{name}.{tag}{}", crate::connectors::STAGING_SUFFIX)).to_string_lossy().to_string()
+    p.with_file_name(crate::connectors::staging_name(&name, &format!(".{tag}{}", crate::connectors::STAGING_SUFFIX))).to_string_lossy().to_string()
 }
 
 /// Run one file job between two locations (at least one remote); returns the
@@ -711,7 +711,7 @@ pub async fn remove_empty_dir(dir: &Location, resolver: &dyn RemoteResolver) -> 
 
 /// The jobs of one move: sources are deleted as their copies complete; the
 /// source folders once every job completed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MoveGroup {
     /// Jobs not finished yet, with the source each one moves.
     pub pending: HashMap<Uuid, String>,
@@ -999,6 +999,26 @@ pub(crate) mod tests {
         // A folder cannot go inside itself.
         let into_self = Location::Remote { connection_id: id, path: "/src/sub".into() };
         assert!(plan_transfer(&items[1..], &into_self, &resolver).await.is_err());
+    }
+
+    // Regression (WS-Z2): the staging name added 48 bytes (`.`, `.<job id>`,
+    // `.ufop-part`), so a remote file with a long name could not be
+    // downloaded ("File name too long").
+    #[tokio::test]
+    async fn a_file_with_a_long_name_downloads() {
+        let id = Uuid::new_v4();
+        let name = format!("{}.txt", "x".repeat(240));
+        let conn = Arc::new(MemConnector::with(&[(&format!("/r/{name}"), "long")], &["/r"]));
+        let resolver = MemResolver(HashMap::from([(id, conn)]));
+        let local = tempfile::tempdir().unwrap();
+        let dest = local.path().join(&name).to_string_lossy().to_string();
+        let job = Uuid::new_v4();
+        let staging = local_staging_path(&dest, job);
+        assert!(std::path::Path::new(&staging).file_name().unwrap().len() <= 255);
+        let from = Location::Remote { connection_id: id, path: format!("/r/{name}") };
+        assert_eq!(transfer_file(job, &from, &Location::Local(dest.clone()), &resolver).await.unwrap(), 4);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "long");
+        assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 1, "no staging file left");
     }
 
     #[tokio::test]

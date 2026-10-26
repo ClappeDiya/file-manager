@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { isSecondaryWindow, sharedWindowStorage } from "@/lib/app-window";
 import { locationLabel } from "@/lib/location";
 import { useConnectionsStore } from "@/stores/connections-store";
 
@@ -521,6 +522,11 @@ const MAX_SELECTION_STASHES = 20;
 // ──────────────────────────────────────────────
 // Store
 // ──────────────────────────────────────────────
+
+export const FILE_MANAGER_STORAGE_KEY = "ufop-file-manager-state";
+
+/** What each window has for itself; everything else persisted is shared by all windows. */
+export const WINDOW_FIELDS = ["panes", "activePaneIndex", "singlePaneMode", "paneSplitPercent", "paneOrientation", "syncBrowsing", "recentlyClosedTabs", "selectionStashes"] as const;
 
 export const useFileManagerStore = create<FileManagerState>()(
   persist(
@@ -1431,7 +1437,9 @@ export const useFileManagerStore = create<FileManagerState>()(
       },
     }),
     {
-      name: "ufop-file-manager-state",
+      name: FILE_MANAGER_STORAGE_KEY,
+      // A second window keeps its own panes and layout (see `app-window.ts`).
+      storage: createJSONStorage(() => sharedWindowStorage(localStorage, WINDOW_FIELDS, isSecondaryWindow())),
       partialize: (state) => ({
         panes: state.panes,
         singlePaneMode: state.singlePaneMode,

@@ -10,7 +10,7 @@ use crate::sync::planner;
 use crate::sync::rollback::RollbackManager;
 use crate::sync::versions::{StoredVersion, VersionIndex};
 use crate::sync_types::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1019,6 +1019,33 @@ impl ListedNames {
     }
 }
 
+/// Refuse to delete a file that changed after the plan saw it (an edit made
+/// while the run was going): it is kept, reported, and synced next run.
+/// Folders, and entries the plan has no size for, are not compared.
+fn unchanged_since_plan(path: &Path, size: Option<u64>, modified: Option<DateTime<Utc>>, rel_path: &str) -> Result<(), AppError> {
+    let Some(size) = size else { return Ok(()) };
+    // The plan saw a link itself or (followed, the default) its target.
+    let seen = [fs::symlink_metadata(path), fs::metadata(path)];
+    let mut any = false;
+    for meta in seen.into_iter().flatten() {
+        any = true;
+        if meta.is_dir() {
+            return Ok(());
+        }
+        let now_modified = meta.modified().ok().map(DateTime::<Utc>::from);
+        if meta.len() == size && (modified.is_none() || now_modified == modified) {
+            return Ok(());
+        }
+    }
+    if !any {
+        return Ok(());
+    }
+    Err(AppError::Sync {
+        message: format!("Not deleted {rel_path}: it changed after this run was planned."),
+        advice: "It is kept; the next sync handles it as an edited file.".to_string(),
+    })
+}
+
 /// Execute a single file operation (add/modify/delete).
 fn execute_single_operation(
     pair: &SyncPair,
@@ -1048,6 +1075,7 @@ fn execute_single_operation(
             // Two-way: deleted in the destination since the last sync.
             if source_file.exists() {
                 listed.check_delete(&source_file, &entry.relative_path)?;
+                unchanged_since_plan(&source_file, entry.source_size, entry.source_modified, &entry.relative_path)?;
                 rollback.snapshot_on(SyncSide::Source, &entry.relative_path, &source_file)?;
                 fs::remove_file(&source_file).map_err(|e| AppError::Sync {
                     message: format!("Delete failed {}: {}", entry.relative_path, e),
@@ -1075,6 +1103,11 @@ fn execute_single_operation(
         "delete" => {
             if dest_file.exists() {
                 listed.check_delete(&dest_file, &entry.relative_path)?;
+                // A one-way trusted inventory holds the source's times, not
+                // the destination's (which may not keep them exactly): size only.
+                let inventory_times = pair.dest_state == DestStateMode::TrustedInventory && pair.mode != SyncMode::TwoWay;
+                let planned = if inventory_times { None } else { entry.dest_modified };
+                unchanged_since_plan(&dest_file, entry.dest_size, planned, &entry.relative_path)?;
                 // Take pre-destructive snapshot
                 rollback.snapshot_file(&entry.relative_path, &dest_file)?;
 
@@ -2920,6 +2953,87 @@ mod tests {
             *baseline = Some(b.clone());
         }
         outcome
+    }
+
+    /// Regression (WS-Z1): a two-way delete removed whatever had the name
+    /// when it ran, so a file edited between planning and that step was
+    /// deleted with its edit. It is now kept and reported.
+    #[test]
+    fn two_way_keeps_a_file_edited_after_the_plan_said_to_delete_it() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        fs::write(src.path().join("x.txt"), "v1").unwrap();
+        fs::write(src.path().join("y.txt"), "y").unwrap();
+        for k in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.path().join(k), "kept").unwrap();
+        }
+        let pair = two_way(src.path(), dst.path());
+        let mut base = None;
+        run_two_way(&pair, &mut base);
+        // Deleted in the destination: the plan deletes the source copies.
+        fs::remove_file(dst.path().join("x.txt")).unwrap();
+        fs::remove_file(dst.path().join("y.txt")).unwrap();
+        let edited = src.path().join("x.txt");
+        let hooks = RunHooks {
+            on_file: Some(Arc::new(move |ev: &FileEvent| {
+                if matches!(ev, FileEvent::Started(p) if p == "x.txt") {
+                    fs::write(&edited, "v2, edited while the sync ran").unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        let rollback = TempDir::new().unwrap().keep();
+        let out = execute_sync_with(&ExecutorConfig { baseline: base.clone(), rollback_dir: Some(rollback), ..cfg(pair.clone()) }, &hooks).unwrap();
+        assert_eq!(fs::read_to_string(src.path().join("x.txt")).unwrap(), "v2, edited while the sync ran", "the edit was deleted");
+        assert!(!src.path().join("y.txt").exists(), "an unchanged file is still deleted");
+        assert_eq!(out.report.files_deleted, 1);
+        assert_eq!(out.report.errors, 1);
+        assert!(out.report.error_messages.iter().any(|m| m.contains("x.txt") && m.contains("changed")), "{:?}", out.report.error_messages);
+    }
+
+    // Review of the change above: the planner records a followed link's
+    // target (the default symlink mode), so the check must not compare the
+    // link itself, or the link is never deleted and errs every run.
+    #[cfg(unix)]
+    #[test]
+    fn mirror_still_deletes_an_extra_linked_file() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        for k in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.path().join(k), "kept").unwrap();
+        }
+        fs::write(elsewhere.path().join("t.txt"), "a longer target file").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+        execute_sync(&cfg(pair.clone())).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("t.txt"), dst.path().join("extra.txt")).unwrap();
+        let r = execute_sync(&cfg(pair)).unwrap();
+        assert_eq!(r.errors, 0, "{:?}", r.error_messages);
+        assert!(fs::symlink_metadata(dst.path().join("extra.txt")).is_err(), "the extra link is removed");
+        assert!(elsewhere.path().join("t.txt").exists(), "its target is not");
+    }
+
+    // Review of the change above: a trusted inventory records the source's
+    // times as the destination's; a destination that does not keep times
+    // exactly (FAT, some NAS) then never matched, so a file removed from the
+    // source stayed at the destination and the run failed every time.
+    #[test]
+    fn trusted_inventory_mirror_deletes_despite_other_destination_times() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for k in ["a.txt", "b.txt", "c.txt", "gone.txt"] {
+            fs::write(src.path().join(k), k).unwrap();
+        }
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+        pair.dest_state = DestStateMode::TrustedInventory;
+        execute_sync(&cfg(pair.clone())).unwrap();
+        set_age_days(&dst.path().join("gone.txt"), 1);
+        fs::remove_file(src.path().join("gone.txt")).unwrap();
+        let r = execute_sync(&cfg(pair)).unwrap();
+        assert_eq!(r.errors, 0, "{:?}", r.error_messages);
+        assert!(!dst.path().join("gone.txt").exists());
     }
 
     /// Regression (review): the baseline was read from both sides after the

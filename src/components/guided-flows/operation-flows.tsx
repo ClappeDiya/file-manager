@@ -10,11 +10,13 @@
  * Each wizard provides step-by-step guidance with validation
  * and contextual help.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
 import { pickFolder } from "@/lib/folder-picker";
+import { errorText } from "@/lib/error-text";
+import { createSyncPair, fixNames, listInterrupted, resolveInterrupted, scanNames, startTransfer, compatProfiles, type CompatIssue, type CompatScan, type Resolution, type TransferJobLite } from "@/lib/guided-actions";
 import {
   ArrowUpDown,
   FolderOpen,
@@ -70,10 +72,11 @@ export function StartTransferWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        const outcome = await startTransfer(sourcePath, destPath, transferMode, verifyAfter);
         addActivity({
           type: "transfer",
-          summary: `Started ${transferMode === "copy" ? "copying" : "moving"} files from "${sourcePath}" to "${destPath}".`,
+          summary: `${transferMode === "copy" ? "Copy" : "Move"} of "${sourcePath}" to "${destPath}": ${outcome}`,
           paths: [sourcePath, destPath],
           undoable: transferMode === "move",
         });
@@ -194,6 +197,7 @@ export function StartTransferWizard() {
             </div>
           )}
 
+          {transferMode === "copy" && (
           <label className="flex items-center gap-3 p-3 rounded-lg bg-[var(--color-bg-secondary)] cursor-pointer">
             <input
               type="checkbox"
@@ -204,10 +208,11 @@ export function StartTransferWizard() {
             <div>
               <span className="text-sm text-[color:var(--color-text)]">Verify files after transfer</span>
               <p className="text-xs text-[color:var(--color-text-secondary)] mt-0.5">
-                Checks that every file was copied correctly. Takes longer but ensures accuracy.
+                Compares every copied file with its original by checksum. Takes longer but proves the copy is exact.
               </p>
             </div>
           </label>
+          )}
         </div>
       )}
 
@@ -228,7 +233,7 @@ export function StartTransferWizard() {
             <div className="p-3 rounded-lg bg-[var(--color-bg-secondary)]">
               <span className="text-xs font-medium text-[color:var(--color-text-secondary)]">Action</span>
               <p className="text-sm text-[color:var(--color-text)] mt-0.5 capitalize">{transferMode}</p>
-              {verifyAfter && <p className="text-xs text-[color:var(--color-primary)] mt-0.5">With verification</p>}
+              {verifyAfter && transferMode === "copy" && <p className="text-xs text-[color:var(--color-primary)] mt-0.5">With verification</p>}
             </div>
           </div>
         </div>
@@ -285,10 +290,11 @@ export function CreateSyncWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        await createSyncPair({ name, source: sourcePath, dest: destPath, mode: "one-way", schedule });
         addActivity({
           type: "sync",
-          summary: `Created sync pair "${name}" between "${sourcePath}" and "${destPath}" (${schedule}).`,
+          summary: `Created sync pair "${name}" between "${sourcePath}" and "${destPath}" (${schedule}). It is in the Sync panel.`,
           paths: [sourcePath, destPath],
           undoable: false,
         });
@@ -413,18 +419,36 @@ export function ResolveInterruptionWizard() {
   const addActivity = useUIStore((s) => s.addActivity);
   const setActiveGuidedFlow = useUIStore((s) => s.setActiveGuidedFlow);
   const [step, setStep] = useState(0);
-  const [resolution, setResolution] = useState<"resume" | "restart" | "skip" | "cancel">("resume");
+  const [resolution, setResolution] = useState<Resolution>("resume");
+  const [jobs, setJobs] = useState<TransferJobLite[] | null>(null);
+  const [chosen, setChosen] = useState<Set<string>>(new Set());
 
+  useEffect(() => {
+    let live = true;
+    void listInterrupted()
+      .then((list) => {
+        if (!live) return;
+        setJobs(list);
+        setChosen(new Set(list.map((j) => j.id)));
+      })
+      .catch(() => live && setJobs([]));
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const picked = (jobs ?? []).filter((j) => chosen.has(j.id));
   const steps: WizardStepDef[] = [
     {
       id: "explain",
       label: "What Happened",
-      helpText: "This wizard helps you recover from an interrupted transfer or sync operation.",
+      helpText: "Transfers that were paused or stopped with an error are listed here. Choose the ones to deal with.",
+      validate: () => (picked.length > 0 ? null : jobs && jobs.length === 0 ? "Nothing is waiting: every transfer finished." : "Choose at least one transfer."),
     },
     {
       id: "choose",
       label: "Choose Action",
-      helpText: "Pick how to handle the interrupted operation.",
+      helpText: "Pick how to handle the interrupted transfers.",
     },
     {
       id: "confirm",
@@ -435,15 +459,24 @@ export function ResolveInterruptionWizard() {
   return (
     <WizardShell
       title="Interrupted Operation"
-      subtitle="A file operation was interrupted and needs your attention"
+      subtitle="Transfers that stopped before the end"
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        const failed: string[] = [];
+        for (const job of picked) {
+          try {
+            await resolveInterrupted(job, resolution);
+          } catch (e) {
+            failed.push(`${baseName(job.source_path)}: ${errorText(e)}`);
+          }
+        }
+        if (failed.length === picked.length) throw new Error(failed.join("; "));
         addActivity({
           type: resolution === "cancel" ? "error" : "transfer",
-          summary: `Resolved interrupted operation: chose to ${resolution}.`,
-          paths: [],
+          summary: `${resolution === "cancel" ? "Cancelled" : "Resumed"} ${picked.length - failed.length} interrupted transfer(s)${failed.length ? `; ${failed.length} could not be: ${failed.join("; ")}` : ""}.`,
+          paths: picked.map((j) => j.source_path),
           undoable: false,
         });
         setActiveGuidedFlow(null);
@@ -455,25 +488,40 @@ export function ResolveInterruptionWizard() {
         <div>
           <div className="flex items-start gap-3 p-4 rounded-lg bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/20 mb-4">
             <AlertTriangle className="h-5 w-5 text-[color:var(--color-warning)] shrink-0 mt-0.5" aria-hidden="true" />
-            <div>
-              <p className="text-sm font-medium text-[color:var(--color-text)]">
-                A transfer was interrupted
-              </p>
-              <p className="text-xs text-[color:var(--color-text-secondary)] mt-1">
-                <strong>What happened:</strong> The operation stopped before all
-                files were transferred. This can happen if the computer went to
-                sleep, the network disconnected, or a drive was removed.
-              </p>
-              <p className="text-xs text-[color:var(--color-text-secondary)] mt-1">
-                <strong>What we did:</strong> The app saved your progress. Files
-                that were already transferred are safe. No partial files were left
-                behind.
-              </p>
-              <p className="text-xs text-[color:var(--color-primary)] mt-1">
-                <strong>What you can do:</strong> Choose how to proceed on the
-                next step.
-              </p>
-            </div>
+            <p className="text-xs text-[color:var(--color-text-secondary)]">
+              <strong>What happened:</strong> these transfers stopped before all of the data arrived: they were paused, or the computer slept, the
+              network dropped or a drive went away. <strong>What we did:</strong> the progress was saved, so a resumed transfer continues from where it
+              stopped and is checked when it completes.
+            </p>
+          </div>
+          {jobs === null && <p className="text-sm text-[color:var(--color-text-secondary)]">Looking for interrupted transfers…</p>}
+          {jobs?.length === 0 && <p className="text-sm text-[color:var(--color-text-secondary)]" data-testid="wizard-no-interrupted">Nothing is waiting: every transfer finished.</p>}
+          <div className="space-y-1">
+            {(jobs ?? []).map((j) => (
+              <label key={j.id} className="flex items-start gap-2 p-2 rounded border border-[var(--color-border)] text-xs" data-testid="wizard-interrupted-job">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={chosen.has(j.id)}
+                  onChange={(e) =>
+                    setChosen((prev) => {
+                      const next = new Set(prev);
+                      if (e.target.checked) next.add(j.id);
+                      else next.delete(j.id);
+                      return next;
+                    })
+                  }
+                />
+                <span className="min-w-0">
+                  <span className="block font-mono truncate text-[color:var(--color-text)]">{j.source_path}</span>
+                  <span className="block text-[color:var(--color-text-secondary)]">
+                    {j.status === "paused" ? "Paused" : "Failed"}
+                    {j.total_bytes > 0 ? ` at ${Math.floor((j.transferred_bytes / j.total_bytes) * 100)}%` : ""}
+                    {j.error_message ? ` — ${j.error_message}` : ""}
+                  </span>
+                </span>
+              </label>
+            ))}
           </div>
         </div>
       )}
@@ -485,10 +533,8 @@ export function ResolveInterruptionWizard() {
           </h3>
           <div className="space-y-2">
             {[
-              { id: "resume" as const, label: "Resume where it stopped", desc: "Continue transferring the remaining files. Already-transferred files are skipped.", icon: <RotateCcw className="h-5 w-5" /> },
-              { id: "restart" as const, label: "Start over", desc: "Re-transfer everything from the beginning. Existing files will be overwritten.", icon: <RefreshCw className="h-5 w-5" /> },
-              { id: "skip" as const, label: "Skip failed files", desc: "Mark the remaining files as skipped and consider the operation complete.", icon: <Check className="h-5 w-5" /> },
-              { id: "cancel" as const, label: "Cancel entirely", desc: "Abandon the operation. Already-transferred files will remain at the destination.", icon: <AlertTriangle className="h-5 w-5" /> },
+              { id: "resume" as const, label: "Resume where it stopped", desc: "Paused transfers continue; failed ones are tried again, continuing from the saved progress.", icon: <RotateCcw className="h-5 w-5" /> },
+              { id: "cancel" as const, label: "Cancel", desc: "Stop for good. Files that already arrived stay at the destination; a partly written file is removed.", icon: <AlertTriangle className="h-5 w-5" /> },
             ].map((r) => (
               <button
                 key={r.id}
@@ -499,6 +545,7 @@ export function ResolveInterruptionWizard() {
                     : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
                 )}
                 onClick={() => setResolution(r.id)}
+                aria-pressed={resolution === r.id}
               >
                 <div className={cn("shrink-0 mt-0.5", resolution === r.id ? "text-[color:var(--color-primary)]" : "text-[color:var(--color-text-secondary)]")}>
                   {r.icon}
@@ -519,10 +566,9 @@ export function ResolveInterruptionWizard() {
             Confirm your choice
           </h3>
           <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm">
-            {resolution === "resume" && "The operation will resume from where it stopped. Files already transferred will be skipped."}
-            {resolution === "restart" && "The operation will start over from the beginning. This may take longer."}
-            {resolution === "skip" && "Remaining files will be skipped. The operation will be marked as complete with some files missing."}
-            {resolution === "cancel" && "The operation will be cancelled. Files already at the destination will remain there."}
+            {resolution === "resume"
+              ? `${picked.length} transfer(s) will continue from where they stopped.`
+              : `${picked.length} transfer(s) will be cancelled. Files already at the destination stay there.`}
           </p>
         </div>
       )}
@@ -538,121 +584,195 @@ export function HandleCompatWarningWizard() {
   const addActivity = useUIStore((s) => s.addActivity);
   const setActiveGuidedFlow = useUIStore((s) => s.setActiveGuidedFlow);
   const [step, setStep] = useState(0);
-  const [action, setAction] = useState<"rename" | "skip" | "proceed">("rename");
+  const [folder, setFolder] = useState("");
+  const [profiles, setProfiles] = useState<{ id: string; name: string; description: string }[]>([]);
+  const [profileId, setProfileId] = useState("windows-ntfs");
+  const [scan, setScan] = useState<CompatScan | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [action, setAction] = useState<"rename" | "skip">("rename");
 
-  const sampleIssues = [
-    { name: "project:final.doc", issue: 'Contains ":" which is not allowed on Windows' },
-    { name: "CON.txt", issue: '"CON" is a reserved name on Windows' },
-    { name: "file with trailing space .pdf", issue: "Has a trailing space before the extension" },
-  ];
+  useEffect(() => {
+    void compatProfiles().then(setProfiles).catch(() => setProfiles([]));
+  }, []);
 
+  const runScan = async () => {
+    setScanning(true);
+    setScanError(null);
+    try {
+      setScan(await scanNames(folder, profileId));
+    } catch (e) {
+      setScan(null);
+      setScanError(errorText(e));
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const fixable: CompatIssue[] = (scan?.issues ?? []).filter((i) => i.fixable);
   const steps: WizardStepDef[] = [
     {
-      id: "explain",
-      label: "Issues Found",
-      helpText: "Some filenames in this transfer contain characters or patterns that might cause problems on the destination system.",
+      id: "where",
+      label: "Folder",
+      helpText: "Choose the folder you are about to copy, and where it is going. Names that place cannot store are found before the copy fails on them.",
+      validate: () => (folder ? null : "Choose a folder."),
     },
     {
-      id: "choose",
+      id: "scan",
+      label: "What We Found",
+      helpText: "Names with characters, lengths or reserved words the destination does not allow.",
+      validate: () => (scan ? null : scanning ? "Still checking…" : "Check the folder first."),
+    },
+    {
+      id: "action",
       label: "Choose Fix",
-      helpText: "Decide how to handle the problematic filenames.",
-    },
-    {
-      id: "confirm",
-      label: "Apply",
+      helpText: "Rename to the suggested names now (you can restore the original names later), or leave the files as they are.",
     },
   ];
 
   return (
     <WizardShell
-      title="File Name Compatibility"
-      subtitle="Some file names may not work on the destination system"
+      title="Fix File Name Issues"
+      subtitle="Find names another system cannot store, and fix them before copying"
       steps={steps}
       currentStep={step}
-      onStepChange={setStep}
-      onComplete={() => {
-        addActivity({
-          type: "rename",
-          summary: `Resolved ${sampleIssues.length} compatibility issues: chose to ${action} affected files.`,
-          paths: sampleIssues.map((i) => i.name),
-          undoable: action === "rename",
-        });
+      onStepChange={(i) => {
+        setStep(i);
+        if (i === 1 && !scan && !scanning) void runScan();
+      }}
+      onComplete={async () => {
+        if (action === "rename" && fixable.length > 0) {
+          const report = await fixNames(fixable.map((i) => ({ path: i.path, new_name: i.suggested_name })), profileId);
+          if (report.renamed.length === 0 && report.failed.length > 0) throw new Error(report.failed.map((f) => `${baseName(f.path)}: ${f.reason}`).join("; "));
+          addActivity({
+            type: "rename",
+            summary: `Renamed ${report.renamed.length} item(s) in "${folder}" for ${profiles.find((p) => p.id === profileId)?.name ?? profileId}${report.failed.length ? `; ${report.failed.length} could not be renamed` : ""}. Restore Original Names undoes it.`,
+            paths: report.renamed.map(([, to]) => to),
+            undoable: true,
+          });
+        }
         setActiveGuidedFlow(null);
       }}
       onCancel={() => setActiveGuidedFlow(null)}
-      completeLabel="Apply Fix"
+      completeLabel={action === "rename" && fixable.length > 0 ? "Rename Files" : "Done"}
     >
       {step === 0 && (
-        <div>
-          <div className="p-4 rounded-lg bg-[var(--color-warning)]/10 border border-[var(--color-warning)]/20 mb-4">
-            <div className="flex items-start gap-3">
-              <Shield className="h-5 w-5 text-[color:var(--color-warning)] shrink-0 mt-0.5" aria-hidden="true" />
-              <div>
-                <p className="text-sm font-medium text-[color:var(--color-text)]">
-                  {sampleIssues.length} file names may cause problems
-                </p>
-                <p className="text-xs text-[color:var(--color-text-secondary)] mt-1">
-                  The destination uses a different file system that has stricter
-                  naming rules. The following files need attention.
-                </p>
-              </div>
+        <div className="space-y-4">
+          <label className="block">
+            <span className="text-xs font-medium text-[color:var(--color-text)]">Folder to check</span>
+            <div className="flex gap-2 mt-1">
+              <input
+                type="text"
+                value={folder}
+                onChange={(e) => {
+                  setFolder(e.target.value);
+                  setScan(null);
+                }}
+                placeholder="/Users/you/Documents"
+                className="flex-1 px-3 py-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] text-sm text-[color:var(--color-text)]"
+                data-testid="wizard-compat-folder"
+              />
+              <button
+                type="button"
+                className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
+                onClick={async () => {
+                  const p = await pickFolder("Folder to check").catch(() => null);
+                  if (p) {
+                    setFolder(p);
+                    setScan(null);
+                  }
+                }}
+                title="Browse for folder"
+              >
+                <FolderOpen className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
-          </div>
-
-          <div className="space-y-2">
-            {sampleIssues.map((issue, i) => (
-              <div key={i} className="p-3 rounded-lg bg-[var(--color-bg-secondary)]">
-                <p className="text-sm font-mono text-[color:var(--color-text)]">{issue.name}</p>
-                <p className="text-xs text-[color:var(--color-text-secondary)] mt-0.5">{issue.issue}</p>
-              </div>
-            ))}
-          </div>
+          </label>
+          <label className="block">
+            <span className="text-xs font-medium text-[color:var(--color-text)]">It is going to</span>
+            <select
+              value={profileId}
+              onChange={(e) => {
+                setProfileId(e.target.value);
+                setScan(null);
+              }}
+              className="mt-1 w-full px-3 py-2.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] text-sm text-[color:var(--color-text)]"
+              data-testid="wizard-compat-profile"
+            >
+              {(profiles.length ? profiles : [{ id: "windows-ntfs", name: "Windows NTFS", description: "" }]).map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
       )}
 
       {step === 1 && (
         <div>
-          <h3 className="text-base font-semibold text-[color:var(--color-text)] mb-4">
-            How should we handle these files?
-          </h3>
-          <div className="space-y-2">
-            {[
-              { id: "rename" as const, label: "Automatically fix names", desc: "The app will rename files to be compatible. Original names are saved so you can restore them later." },
-              { id: "skip" as const, label: "Skip these files", desc: "Transfer everything else and leave these files behind." },
-              { id: "proceed" as const, label: "Transfer anyway", desc: "Copy the files as-is. They may not open correctly on the destination system." },
-            ].map((a) => (
-              <button
-                key={a.id}
-                className={cn(
-                  "flex items-start gap-3 w-full p-4 rounded-lg border transition-all text-left",
-                  action === a.id
-                    ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
-                    : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
-                )}
-                onClick={() => setAction(a.id)}
-              >
-                <div>
-                  <span className="text-sm font-medium text-[color:var(--color-text)] block">{a.label}</span>
-                  <span className="text-xs text-[color:var(--color-text-secondary)] block mt-0.5">{a.desc}</span>
-                </div>
-              </button>
-            ))}
-          </div>
+          {scanning && <p className="text-sm text-[color:var(--color-text-secondary)]">Checking the names in "{folder}"…</p>}
+          {scanError && (
+            <p role="alert" className="text-sm text-[color:var(--color-error)]">
+              {scanError}
+            </p>
+          )}
+          {scan && scan.issues.length === 0 && (
+            <div className="flex items-center gap-2 text-sm text-[color:var(--color-text)]" data-testid="wizard-compat-clean">
+              <Check className="h-4 w-4 text-[color:var(--color-success)]" aria-hidden="true" />
+              All {scan.scanned} names can be stored there.
+            </div>
+          )}
+          {scan && scan.issues.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-sm text-[color:var(--color-text)]">
+                {scan.issues.length} name(s) need attention{scan.truncated ? " (the list was cut short; check again after fixing these)" : ""}; {fixable.length} can be renamed automatically.
+              </p>
+              <ul className="max-h-56 overflow-y-auto space-y-1">
+                {scan.issues.slice(0, 200).map((i) => (
+                  <li key={i.path} className="p-2 rounded border border-[var(--color-border)] text-xs" data-testid="wizard-compat-issue">
+                    <span className="font-mono text-[color:var(--color-text)]">{i.name}</span>
+                    {i.fixable ? (
+                      <span className="text-[color:var(--color-text-secondary)]"> → <span className="font-mono">{i.suggested_name}</span></span>
+                    ) : (
+                      <span className="text-[color:var(--color-warning)]"> — needs a manual rename</span>
+                    )}
+                    {i.rules.length > 0 && <span className="block text-[color:var(--color-text-tertiary)]">{i.rules.join("; ")}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 
       {step === 2 && (
-        <div className="flex flex-col items-center text-center py-6">
-          <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">
-            Ready to apply
-          </h3>
-          <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm">
-            {action === "rename" && "Files will be renamed to be compatible. You can restore original names anytime from the Activity feed."}
-            {action === "skip" && `${sampleIssues.length} files will be skipped. Everything else will be transferred normally.`}
-            {action === "proceed" && "Files will be transferred with their original names. They may not work correctly on the destination."}
-          </p>
+        <div className="space-y-2">
+          {[
+            { id: "rename" as const, label: `Rename ${fixable.length} item(s) to the suggested names`, desc: "Recorded, so Restore Original Names can put the old names back." },
+            { id: "skip" as const, label: "Leave them as they are", desc: "Nothing is changed. Copying may fail for these files." },
+          ].map((a) => (
+            <button
+              key={a.id}
+              className={cn(
+                "flex items-start gap-3 w-full p-4 rounded-lg border transition-all text-left",
+                action === a.id ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5" : "border-[var(--color-border)] hover:border-[var(--color-text-tertiary)]",
+              )}
+              onClick={() => setAction(a.id)}
+              aria-pressed={action === a.id}
+              disabled={a.id === "rename" && fixable.length === 0}
+            >
+              <Shield className="h-5 w-5 shrink-0 mt-0.5 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
+              <div>
+                <span className="text-sm font-medium text-[color:var(--color-text)] block">{a.label}</span>
+                <span className="text-xs text-[color:var(--color-text-secondary)] block mt-0.5">{a.desc}</span>
+              </div>
+            </button>
+          ))}
         </div>
       )}
     </WizardShell>
   );
 }
+
+const baseName = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;

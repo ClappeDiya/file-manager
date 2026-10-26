@@ -126,9 +126,15 @@ Files can be displayed in four modes (set per pane in Advanced mode):
 ### Navigation
 
 - **Breadcrumb Bar** - Click any segment to navigate up the directory tree
+- **Parent folder** - The ↑ button next to Back/Forward, **Alt+↑** (Windows, Linux), **⌘↑** (macOS) or **Backspace** (when no text field has focus) opens the folder one level up, locally and on a connection. It stops at the top: `/`, a drive (`C:\`), a network share (`\\server\share`) or the connection's root. Also in the command palette: *Go to Parent Folder*.
 - **Tab Bar** - Open multiple directories in tabs (Advanced mode). Tabs can be pinned, reordered, and closed.
 - **Favorites** - Star any folder for quick access from the sidebar
+- **Cloud folders** - Folders that a cloud service's own app keeps in sync on this computer are listed in the sidebar and open like any local folder: Dropbox (personal and business, also when moved), OneDrive (personal and work accounts), Google Drive for desktop, iCloud Drive, Box, pCloud Drive, MEGA, Nextcloud and ownCloud (every sync folder in the client's settings), Synology Drive and Proton Drive. They are found from the apps' own settings and default folders (on macOS, `~/Library/CloudStorage`); UFOP does not contact the services. The list refreshes every few minutes and the section is hidden when none is found.
 - **Recent Locations** - The last 20 visited paths are remembered
+
+### Several windows
+
+**New Window** (**Ctrl+N**, **⌘N** on macOS; command palette; tray menu) opens another window at the active pane's folder, and **Open in New Window** in a folder's context menu opens that folder. Each window has its own panes, tabs and layout; favorites, recent places, saved searches, workspaces and every setting are shared, and a change made in one window (theme, accent colour, language, a new favorite) shows in the others. The first window keeps its layout for the next start. Closing another window just closes it; *Keep running in the tray* applies to the first window, and the app stops (running backups end at a safe point) only when its last window closes.
 
 ### Selection
 
@@ -479,12 +485,18 @@ rclone receives option values on its command line while a remote is created or c
 
 ### Guided Wizards
 
-Simple mode provides step-by-step wizards for:
+Step-by-step wizards do the real work, each through the same commands as the full screens, and say what they did in the Activity feed. Simple mode lists them; in every mode the command palette has them all (search for the name, or "guided"):
 
-- Connect OneDrive / Google Drive / Dropbox (save, sign in, choose where it opens, check it by listing it) and Google Cloud Storage (HMAC keys, checked by listing the buckets)
-- Set up local sync
-- Connect to Windows Share (SMB)
-- Connect via SFTP
+- **Connect OneDrive / Google Drive / Dropbox** (save, sign in, choose where it opens, check it by listing it) and **Google Cloud Storage** (HMAC keys, checked by listing the buckets).
+- **Connect to Windows Share (SMB)** and **Connect via SFTP** - *Test Connection* saves the connection, signs in and lists the folder, so a wrong password or share name shows here; the connection is then in the Connection Manager. SFTP with *SSH Key* uses the keys your SSH agent holds.
+- **Set Up Local Sync** and **Create Sync Pair** - *Test Folders* checks both folders exist; the pair (one-way, two-way or mirror; manual, hourly, daily at 02:00 or real-time) appears in the Sync panel.
+- **Transfer Files** - copies or moves a file or folder (also to or from a connection, through the transfer queue); *Verify files after transfer* compares every copied file with its original by checksum.
+- **Resolve Interrupted Operation** - lists the paused and failed transfers; resume them (failed ones are retried from the saved progress) or cancel them.
+- **Fix File Name Issues** - checks a folder against where it is going (Windows, FAT32, macOS, OneDrive, Google Drive, Dropbox, S3, Backblaze B2…), lists the names that place cannot store with the suggested names, and renames the ones that can be fixed. **Restore Original Names** lists those renames and gives the files their original names back.
+- **Export Report** - saves the transfer history or the activity log as CSV or JSON, or the security audit log as signed JSON lines, where you choose.
+- **Send to Another Computer** and **Move to a New Computer** - pick a computer on this network running UFOP and the folders to send (or your Documents, Desktop, Pictures, Music, Videos, Downloads); the other computer approves the transfer.
+- **Copy to External Drive** - copies a folder onto an external drive after checking there is room. **Migrate Drive** copies everything from one drive into a folder of its own on another (nothing there is replaced) and, unless turned off, checks every file by checksum.
+- **Back Up Folder** - creates a backup job (encrypted with a passphrase unless you choose otherwise; now only, daily or weekly) and runs the first backup.
 
 ---
 
@@ -885,9 +897,42 @@ Theme switching is instant with no restart required. The theme applies immediate
 **Settings → Appearance** collects the display preferences. They are stored with the other window preferences on this computer and apply at once:
 
 - **Theme** - the same choices as the toolbar theme switcher.
+- **Language** - *System default* (the computer's language) or English, Español, Français, Deutsch, Português, 日本語, 简体中文 or 한국어. It applies at once to the menus, the sidebar, the Settings headings, the navigation buttons and the tray menu, and is also offered on the first page of the onboarding wizard. Text that has no translation yet stays in English. A language chosen here is kept even when it is the same as English on a computer set to another language.
+- **Accent colour** - Blue (default), Indigo, Violet, Pink, Rose, Orange, Green, Teal or Graphite, or **Custom** for any colour. It recolours buttons, selected items, links, progress bars and focus outlines in the light and dark themes; shades are derived in OKLCH from the chosen colour so text on them stays as readable as on the default blue. High contrast keeps its own colours.
 - **Text size** - Small (87.5%), Default, Large (112.5%) or Larger (125%). It scales the root font size, so text, spacing and controls sized in `rem` grow together. Shortcuts: **Ctrl/Cmd + +** (larger), **Ctrl/Cmd + -** (smaller), **Ctrl/Cmd + 0** (default); they are also in the command palette and the `?` cheat sheet. Ctrl/Cmd + = (without Shift) stays *Compare files*. The webview's own zoom keys are off in the desktop app, so these replace them.
 - **Size units** - *Decimal* (default; 1 KB = 1,000 bytes, as macOS and disk makers count) or *Binary* (1 KiB = 1,024 bytes, labelled KiB, MiB, GiB). Every size in the app follows it: file lists, transfers, sync, backups, mounts and drives. Sizes already on screen in a panel update the next time it redraws.
 - **Backup times** - show the times of backup versions, runs and files in this computer's time zone (default) or in UTC (marked "UTC"). Schedules keep their own time zone; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
+
+### App lock
+
+**Settings → App Lock** locks UFOP's windows with the master password:
+
+- **Lock UFOP with the master password** - the first time, choose a master password (at least 8 characters; it also protects saved credentials and cannot be recovered). Afterwards every change here asks for it.
+- **Lock when UFOP starts** and **Lock when not used** - never, or after 1, 5, 10, 15, 30 or 60 minutes without using any UFOP window.
+- **Lock now** - also *Lock UFOP* in the command palette and the tray menu.
+
+While locked, every window shows the lock screen and nothing can be read or changed through the app: the desktop app refuses every request except unlocking. Scheduled backups, syncs, automations and transfers keep running. After too many wrong passwords the lock screen waits a few minutes before accepting another one. Locking, unlocking and wrong passwords are recorded in the security audit log.
+
+### Reset settings
+
+**Settings → Reset** (or *Reset Settings…* in the command palette) puts preferences back to the defaults. Choose what to reset:
+
+- **Appearance and layout** - theme, accent colour, language, text size, units, Simple/Advanced mode, toolbar, sidebar, panels, table columns, drag-and-drop confirmation, default download and upload folders.
+- **Startup, tray and notifications** (desktop app) - start at login is turned off, the window opens at start, the tray icon shows, desktop notifications go back to their defaults.
+- **Sync and transfer defaults** (desktop app) - global sync defaults, the bandwidth timetable and how long failed transfers are kept.
+- **Welcome tour and tips** - shows the welcome wizard and the feature tips again (not chosen unless you tick it).
+
+Connections, sync pairs, backup jobs, mounts, favorites, history, saved passwords and keys are never reset, nor are the app lock, the local web server, chat control, metrics, rclone, proxy and console settings. You are asked to confirm first, and the reset is recorded in the security audit log.
+
+### Startup and tray
+
+**Settings → Startup & Tray** (desktop app; also *Startup & Tray Settings…* in the command palette):
+
+- **Start UFOP when I log in**, and **…in the tray, without opening the window** (on by default, as before).
+- **Start minimised** - every start keeps the window in the tray until you open it from the tray menu.
+- **Keep running in the tray when the window is closed** - scheduled backups, syncs and automations keep running; quit from the tray menu. The same setting is on the Backups screen.
+- **Minimise to the tray** - minimising the window removes it from the taskbar or Dock; open it again from the tray.
+- **Show the tray icon** - with the icon hidden nothing can hide the window: closing quits, minimising stays in the taskbar, and *Start minimised* starts minimised in the taskbar. The same applies when the desktop has no tray (some Linux desktops).
 
 ### Accessibility
 

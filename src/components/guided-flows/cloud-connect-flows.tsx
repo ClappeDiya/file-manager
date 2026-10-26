@@ -261,7 +261,13 @@ function CloudConnectWizard({ provider }: { provider: CloudProvider }) {
               <Check className="h-4 w-4 text-[color:var(--color-primary)]" aria-hidden="true" />
               Signed in{signedIn.account ? ` as ${signedIn.account}` : ""}.
             </p>
-          ) : (
+          ) : null}
+          {signedIn?.warning ? (
+            <p role="status" className="text-xs text-[color:var(--color-warning)]" data-testid="cloud-signed-in-warning">
+              {signedIn.warning}
+            </p>
+          ) : null}
+          {signedIn ? null : (
             <OAuthSignIn connectionId={saved.id} protocol={info.protocol} onSignedIn={(s) => void handleSignedIn(s)} />
           )}
           <p className="text-xs text-[color:var(--color-text-tertiary)]">

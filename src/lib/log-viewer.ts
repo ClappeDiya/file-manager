@@ -65,6 +65,35 @@ export function logQuery(f: LogFilters, extra: Record<string, unknown> = {}): { 
 /** Records oldest first (a page arrives newest first). */
 export const oldestFirst = (page: LogRecord[]): LogRecord[] => [...page].reverse();
 
+/** How many pages one live-tail poll reads at most. */
+export const TAIL_MAX_PAGES = 20;
+
+/**
+ * Everything logged since `since` (newest first): page back through the
+ * cursor until a page is not full, so a burst of more lines than one page
+ * between two polls leaves no gap. `complete` is false when it stopped at
+ * `maxPages` (older lines of the burst were skipped).
+ */
+export async function fetchTail(
+  query: (q: Record<string, unknown>) => Promise<LogPage>,
+  filtersQuery: Record<string, unknown>,
+  since: string | null,
+  limit: number,
+  maxPages = TAIL_MAX_PAGES,
+): Promise<{ records: LogRecord[]; complete: boolean }> {
+  const records: LogRecord[] = [];
+  let cursor: string | null = null;
+  for (let i = 0; i < maxPages; i++) {
+    const page = await query({ ...filtersQuery, limit, ...(since ? { since } : {}), ...(cursor ? { cursor } : {}) });
+    records.push(...page.records);
+    // Without a starting point (an empty view), one page is enough.
+    // A short page is the end, unless the scan budget cut it short.
+    if (!since || !page.next_cursor || (page.records.length < limit && !page.scan_limited)) return { records, complete: true };
+    cursor = page.next_cursor;
+  }
+  return { records, complete: false };
+}
+
 /** Adds records a live tail fetched, dropping ones already shown (the tail re-asks from the newest record's time). */
 export function mergeTail(shown: LogRecord[], fetchedNewestFirst: LogRecord[]): LogRecord[] {
   if (fetchedNewestFirst.length === 0) return shown;

@@ -43,6 +43,18 @@ export function trialOutcomeShort(pm: boolean | null): string {
   return 'check in the billing portal that a payment method is on file to keep the subscription';
 }
 
+/**
+ * The line above the plans: the free trial (when this organization gets one)
+ * and the promotion-code field (when checkout shows it,
+ * `BILLING_ALLOW_PROMOTION_CODES`); null when neither applies.
+ */
+export function checkoutNote(trial: { days: number; eligible: boolean }, promotionCodes: boolean): string | null {
+  const parts: string[] = [];
+  if (trial.eligible && trial.days > 0) parts.push(`Your first subscription starts with a ${trial.days}-day free trial; no card is needed to start.`);
+  if (promotionCodes) parts.push('Have a promotion code? Enter it at checkout.');
+  return parts.length ? parts.join(' ') : null;
+}
+
 /** "20% off" / "$5.00 off", for the billing page. */
 export function discountAmount(d: Discount): string {
   if (d.percentOff != null) return `${Number(d.percentOff.toFixed(2))}% off`;

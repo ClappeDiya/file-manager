@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { GUIDED_FLOW_IDS, GUIDED_FLOW_META } from "@/components/guided-flows/flow-meta";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useAiStore, type AiExecutionResult, type ParsedJobConfig } from "@/stores/ai-store";
@@ -42,6 +44,9 @@ import {
   Sparkles,
   ArrowRight,
   ArrowLeftRight,
+  FolderUp,
+  AppWindow,
+  Lock,
   Shield,
   Filter,
   FolderSync,
@@ -494,7 +499,7 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
             placeholder={
               ollamaAvailable
                 ? "Type a command or describe what you want..."
-                : "Type a command..."
+                : t("commandPalette.placeholder")
             }
             className={cn(
               "flex-1 h-12 bg-transparent border-none outline-none",
@@ -766,10 +771,19 @@ export function getDefaultCommands(actions: {
   onOpenConnections?: () => void;
   /** Turn the active pane's breadcrumb into the editable address field. */
   onEditAddress?: () => void;
+  onGoToParentFolder?: () => void;
+  /** Open another app window at the active pane's folder. */
+  onNewWindow?: () => void;
+  /** Show the lock screen in every window (when the app lock is on). */
+  onLockApp?: () => void;
+  /** Start a guided wizard (`GUIDED_FLOW_IDS`). */
+  onOpenGuidedFlow?: (id: string) => void;
   /** Open the Connection Manager on its rclone remote manager. */
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
   onOpenRcloneSettings?: () => void;
+  /** Open Settings at one section (`startup`, `app-lock`, `reset`…). */
+  onOpenSettingsSection?: (section: string) => void;
   /** Open the Sync Panel \u2014 sync-pair health indicators,
    *  create-pair wizard, dry-run preview, conflict resolution,
    *  reports, and rollback. Iter 28 surfaces the long-orphaned
@@ -1519,6 +1533,26 @@ export function getDefaultCommands(actions: {
       keywords: ["address", "path", "go to", "location", "breadcrumb", "type path", "cloud", "connection"],
     },
     {
+      id: "new-window",
+      label: "New Window",
+      description: "Open another UFOP window at the active pane's folder (each window has its own panes and tabs)",
+      icon: <AppWindow className="h-4 w-4" />,
+      shortcut: `${cmd}N`,
+      category: "Navigation",
+      action: actions.onNewWindow || (() => {}),
+      keywords: ["window", "new window", "another window", "second window", "multiple windows", "open window"],
+    },
+    {
+      id: "go-to-parent-folder",
+      label: "Go to Parent Folder",
+      description: "Open the folder that contains the active pane's folder",
+      icon: <FolderUp className="h-4 w-4" />,
+      shortcut: isMac ? `${cmd}\u2191` : "Alt+\u2191",
+      category: "Navigation",
+      action: actions.onGoToParentFolder || (() => {}),
+      keywords: ["up", "parent", "back up", "folder up", "..", "backspace", "go up"],
+    },
+    {
       id: "open-rclone-remotes",
       label: "rclone Remotes\u2026",
       description: "Create, edit, test and delete rclone remotes (Box, pCloud, MEGA, S3, SFTP, 70+ providers)",
@@ -1526,6 +1560,33 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: actions.onOpenRcloneRemotes || (() => {}),
       keywords: ["rclone", "remote", "remotes", "rclone config", "box", "pcloud", "mega", "crypt", "provider", "cloud"],
+    },
+    {
+      id: "startup-tray-settings",
+      label: "Startup & Tray Settings\u2026",
+      description: "Start at login, start minimised, minimise or close to the tray, show the tray icon",
+      icon: <Settings className="h-4 w-4" />,
+      category: "Navigation",
+      action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("startup") : actions.onOpenSettings?.()),
+      keywords: ["startup", "login", "autostart", "tray", "minimise", "minimize", "close", "background", "menu bar"],
+    },
+    {
+      id: "lock-app",
+      label: "Lock UFOP",
+      description: "Show the lock screen in every window until the master password is entered (turn it on in Settings \u2192 App Lock)",
+      icon: <Lock className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onLockApp || (() => actions.onOpenSettingsSection?.("app-lock")),
+      keywords: ["lock", "app lock", "password", "privacy", "away", "screen lock"],
+    },
+    {
+      id: "reset-settings",
+      label: "Reset Settings\u2026",
+      description: "Put appearance, startup and tray, and sync defaults back to the defaults (data is kept)",
+      icon: <RotateCcw className="h-4 w-4" />,
+      category: "Navigation",
+      action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("reset") : actions.onOpenSettings?.()),
+      keywords: ["reset", "defaults", "factory", "restore settings", "start over", "preferences"],
     },
     {
       id: "rclone-settings",
@@ -1987,6 +2048,23 @@ export function getDefaultCommands(actions: {
       ],
     },
   ];
+
+  // Every guided wizard, by name (Simple mode also lists them).
+  if (actions.onOpenGuidedFlow) {
+    const open = actions.onOpenGuidedFlow;
+    for (const id of GUIDED_FLOW_IDS) {
+      const meta = GUIDED_FLOW_META[id];
+      commands.push({
+        id: `guided-${id}`,
+        label: `${meta.label} (guided)`,
+        description: meta.description,
+        icon: <Sparkles className="h-4 w-4" />,
+        category: "Guided",
+        action: () => open(id),
+        keywords: ["wizard", "guided", "step by step", "help me", meta.category.toLowerCase()],
+      });
+    }
+  }
 
   // Inject the first nine bookmarks as their own palette entries so the
   // user can fuzzy-search them by name without remembering slot numbers.

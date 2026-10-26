@@ -307,7 +307,8 @@ export function optionExamples(o: RcloneOption, values: Record<string, string>):
 /**
  * The `key=value` parameters to send: on create, the values that differ
  * from the default; on update, those that differ from the stored ones.
- * A blank secret is never sent (blank = keep / unset).
+ * A blank secret is never sent (blank = keep / unset); any other blank
+ * field means its default (never an empty `key=` that replaces it).
  */
 export function changedParams(options: RcloneOption[], values: Record<string, string>, stored?: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -318,15 +319,16 @@ export function changedParams(options: RcloneOption[], values: Record<string, st
       if (v !== "") out[o.name] = v;
       continue;
     }
+    const value = v === "" ? o.default : v;
     const before = stored ? stored[o.name] ?? o.default : o.default;
-    if (v !== before) out[o.name] = v;
+    if (value !== before) out[o.name] = value;
   }
   return out;
 }
 
 /** Required options left empty (a stored secret counts as filled). */
 export function missingRequired(options: RcloneOption[], values: Record<string, string>, secretsSet: string[] = []): RcloneOption[] {
-  return options.filter((o) => o.required && !(values[o.name] ?? o.default) && !secretsSet.includes(o.name));
+  return options.filter((o) => o.required && !(values[o.name] || o.default) && !secretsSet.includes(o.name));
 }
 
 // ── Crypt ──

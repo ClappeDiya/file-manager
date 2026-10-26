@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { setDefaultByteUnits, type ByteUnits } from "@/lib/format-bytes";
 import { setDefaultTimeDisplay } from "@/lib/backup-time";
+import { applyAccentToDocument, DEFAULT_ACCENT, isAccent, type Accent } from "@/lib/accent";
 
 export type { ByteUnits };
 
@@ -138,6 +139,9 @@ export interface UIState {
   // Size units (K123): applied app-wide through formatBytes
   byteUnits: ByteUnits;
   setByteUnits: (units: ByteUnits) => void;
+  /** Accent colour: a preset id (`blue` by default) or a custom `#rrggbb`. */
+  accentColor: Accent;
+  setAccentColor: (accent: Accent) => void;
   /** Timestamps in the backup screens: this computer's time zone or UTC. */
   timeDisplay: TimeDisplay;
   setTimeDisplay: (t: TimeDisplay) => void;
@@ -340,6 +344,7 @@ export function migrateUIState(persisted: unknown, version: number): Partial<UIS
 function sanitizeAppearance(state: Partial<UIState>): Partial<UIState> {
   const out = { ...state };
   if ("fontScale" in out && !isFontScale(out.fontScale)) delete out.fontScale;
+  if ("accentColor" in out && !isAccent(out.accentColor)) delete out.accentColor;
   if ("byteUnits" in out && out.byteUnits !== "binary" && out.byteUnits !== "decimal") delete out.byteUnits;
   if ("timeDisplay" in out && out.timeDisplay !== "local" && out.timeDisplay !== "utc") delete out.timeDisplay;
   if ("tableViews" in out) {
@@ -375,6 +380,12 @@ export const useUIStore = create<UIState>()(
       stepFontScale: (step) => get().setFontScale(nextFontScale(get().fontScale, step)),
 
       // Size units and timestamps
+      accentColor: DEFAULT_ACCENT,
+      setAccentColor: (accent: Accent) => {
+        const next = isAccent(accent) ? accent : DEFAULT_ACCENT;
+        applyAccentToDocument(next);
+        set({ accentColor: next });
+      },
       byteUnits: "decimal",
       setByteUnits: (units: ByteUnits) => {
         const next: ByteUnits = units === "binary" ? "binary" : "decimal";
@@ -543,6 +554,7 @@ export const useUIStore = create<UIState>()(
       partialize: (state) => ({
         theme: state.theme,
         fontScale: state.fontScale,
+        accentColor: state.accentColor,
         tableViews: state.tableViews,
         byteUnits: state.byteUnits,
         timeDisplay: state.timeDisplay,
@@ -572,6 +584,7 @@ export const useUIStore = create<UIState>()(
             applyThemeToDocument(resolved);
             state.resolvedTheme = resolved;
             applyFontScaleToDocument(isFontScale(state.fontScale) ? state.fontScale : 1);
+            applyAccentToDocument(isAccent(state.accentColor) ? state.accentColor : DEFAULT_ACCENT);
             setDefaultByteUnits(state.byteUnits);
             setDefaultTimeDisplay(state.timeDisplay);
           }

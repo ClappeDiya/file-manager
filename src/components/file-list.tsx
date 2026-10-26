@@ -779,6 +779,8 @@ function FileTableView({
     (e: React.KeyboardEvent) => {
       const maxIndex = rows.length - 1;
       let newIndex = focusedIndex;
+      // Alt/⌘+↑ goes to the parent folder (the pane's handler).
+      if (e.key === "ArrowUp" && (e.altKey || e.metaKey)) return;
 
       switch (e.key) {
         case "ArrowDown":
@@ -1250,6 +1252,8 @@ function FileGridView({
       const cols = columnCount;
       const maxIndex = files.length - 1;
       let newIndex = focusedIndex;
+      // Alt/⌘+↑ goes to the parent folder (the pane's handler).
+      if (e.key === "ArrowUp" && (e.altKey || e.metaKey)) return;
 
       switch (e.key) {
         case "ArrowRight":

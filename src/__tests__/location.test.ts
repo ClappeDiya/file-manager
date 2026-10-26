@@ -3,6 +3,7 @@ import {
   clearRemoteNames,
   formatAddress,
   isRemotePath,
+  isTopFolder,
   joinLocation,
   locationLabel,
   locationRoot,
@@ -123,5 +124,44 @@ describe("pane locations", () => {
     expect(splitAddressForCompletion("Drive:/Re")).toEqual({ parent: "Drive:/", partial: "Re" });
     expect(formatAddress(`conn://${ID}/Docs`, () => "Work Drive")).toBe("Work Drive:/Docs");
     expect(formatAddress("/home")).toBe("/home");
+  });
+
+  // Regression: the parent of `C:\Users` was `C:` (the drive's current
+  // folder, not its root), and the parent of OneDrive's `/drive/root:` was
+  // `/drive`, a path the connector cannot list.
+  it("goes up to drive, share and connection roots and stops there", () => {
+    expect(parentLocation("C:\\Users")).toBe("C:\\");
+    expect(parentLocation("C:\\Users\\me")).toBe("C:\\Users");
+    expect(parentLocation("C:\\")).toBe("C:\\");
+    expect(parentLocation("C:/Users")).toBe("C:/");
+    expect(parentLocation("\\\\nas\\share\\docs")).toBe("\\\\nas\\share");
+    expect(parentLocation("\\\\nas\\share")).toBe("\\\\nas\\share");
+    expect(parentLocation("/")).toBe("/");
+    expect(parentLocation(`conn://${ID}/drive/root:/Docs`)).toBe(`conn://${ID}/drive/root:`);
+    expect(parentLocation(`conn://${ID}/drive/root:`)).toBe(`conn://${ID}/drive/root:`);
+    expect(parentLocation(`conn://${ID}/drives/b!x/root:`)).toBe(`conn://${ID}/drives/b!x/root:`);
+  });
+
+  it("knows the top folder of a location", () => {
+    expect(isTopFolder("/")).toBe(true);
+    expect(isTopFolder("/home")).toBe(false);
+    expect(isTopFolder("C:\\")).toBe(true);
+    expect(isTopFolder("D:")).toBe(true);
+    expect(isTopFolder("C:\\Users")).toBe(false);
+    expect(isTopFolder("\\\\nas\\share")).toBe(true);
+    expect(isTopFolder(`conn://${ID}/`)).toBe(true);
+    expect(isTopFolder(`conn://${ID}`)).toBe(true);
+    expect(isTopFolder(`conn://${ID}/drive/root:`)).toBe(true);
+    expect(isTopFolder(`conn://${ID}/a`)).toBe(false);
+  });
+
+  // Regression (WS-Z2): a local path with ":" in a name was read as
+  // "<connection name>:path" and refused.
+  it("takes full local paths with a colon in a name as local", () => {
+    const conns = [{ id: ID, name: "Work Drive" }];
+    expect(parseAddressInput("/home/me/notes:2024", conns)).toEqual({ ok: true, path: "/home/me/notes:2024" });
+    expect(parseAddressInput("/Volumes/Backup 10:30/", conns)).toEqual({ ok: true, path: "/Volumes/Backup 10:30" });
+    expect(parseAddressInput("\\\\nas\\share\\a:b", conns)).toEqual({ ok: true, path: "\\\\nas\\share\\a:b" });
+    expect(parseAddressInput("Work Drive:/Docs", conns)).toEqual({ ok: true, path: `conn://${ID}/Docs` });
   });
 });

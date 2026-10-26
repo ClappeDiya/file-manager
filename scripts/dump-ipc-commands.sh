@@ -120,7 +120,8 @@ extract_handler_names() {
   local in_block=0 line trimmed name
   while IFS= read -r line; do
     if [[ $in_block -eq 0 ]]; then
-      [[ "$line" == *".invoke_handler(tauri::generate_handler!["* ]] && in_block=1
+      # Also when wrapped: `.invoke_handler(app_lock::gate(lock, tauri::generate_handler![`.
+      [[ "$line" == *".invoke_handler("*"tauri::generate_handler!["* ]] && in_block=1
       continue
     fi
     trimmed="${line#"${line%%[![:space:]]*}"}"

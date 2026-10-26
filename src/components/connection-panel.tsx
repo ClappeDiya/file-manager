@@ -3025,7 +3025,7 @@ export function ConnectionPanel({
                 const id = signInFor.id;
                 setSignInFor(null);
                 setSignedIn((prev) => ({ ...prev, [id]: true }));
-                setTransferStatus(r.account ? `Signed in as ${r.account}.` : "Signed in.");
+                setTransferStatus(r.warning ?? (r.account ? `Signed in as ${r.account}.` : "Signed in."));
                 refresh();
                 void handleConnect(id);
               }}

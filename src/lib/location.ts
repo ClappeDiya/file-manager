@@ -52,15 +52,41 @@ export function joinLocation(dir: string, name: string): string {
   return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
 }
 
-/** The folder containing `p` (a connection's root has itself as parent). */
+/** The root a local path starts with: `C:\`, `\\server\share`, or `/`. */
+function localRoot(p: string): string {
+  const drive = /^([A-Za-z]:)([\\/]?)/.exec(p);
+  if (drive) return `${drive[1]}${drive[2] || "\\"}`;
+  const unc = /^(\\\\[^\\/]+[\\/][^\\/]+)/.exec(p);
+  if (unc) return unc[1];
+  return "/";
+}
+
+/**
+ * Whether `p` is the top of its location (`/`, a drive, a network share, a
+ * connection's root), where going to the parent folder stays put.
+ */
+export function isTopFolder(p: string): boolean {
+  const loc = parseLocation(p);
+  if (loc.kind === "remote") return normalizeRemoteFolder(loc.path) === "/";
+  const root = localRoot(p);
+  const trimmed = p.replace(/[\\/]+$/, "");
+  return trimmed === "" || trimmed === root.replace(/[\\/]+$/, "");
+}
+
+/** The folder containing `p` (a root — `/`, `C:\`, a share, a connection's root — has itself as parent). */
 export function parentLocation(p: string): string {
   const loc = parseLocation(p);
   if (loc.kind === "remote") {
+    if (normalizeRemoteFolder(loc.path) === "/") return p;
     const trimmed = loc.path.replace(/\/+$/, "");
     const cut = trimmed.lastIndexOf("/");
     return remoteLocation(loc.connectionId, cut <= 0 ? "/" : trimmed.slice(0, cut));
   }
-  return p.replace(/[\\/][^\\/]*$/, "") || "/";
+  if (isTopFolder(p)) return /^[A-Za-z]:$/.test(p) ? `${p}\\` : p;
+  const parent = p.replace(/[\\/]+$/, "").replace(/[\\/][^\\/]*$/, "");
+  if (!parent) return "/";
+  const root = localRoot(p);
+  return parent.length < root.length || parent === root.replace(/[\\/]+$/, "") ? root : parent;
 }
 
 /**
@@ -204,7 +230,9 @@ export function parseAddressInput(text: string, connections: ReadonlyArray<Addre
     if (!connections.some((c) => c.id === loc.connectionId)) return { ok: false, error: "No saved connection has that id" };
     return { ok: true, path: remoteLocation(loc.connectionId, loc.path) };
   }
-  const colon = t.indexOf(":");
+  // A full local path stays local even with ":" in a name (`/notes:2024`).
+  const absoluteLocal = t.startsWith("/") || t.startsWith("\\\\");
+  const colon = absoluteLocal ? -1 : t.indexOf(":");
   if (colon > 0) {
     const name = t.slice(0, colon);
     const rest = t.slice(colon + 1);
@@ -215,7 +243,7 @@ export function parseAddressInput(text: string, connections: ReadonlyArray<Addre
     if (windowsDrive) return { ok: true, path: rest === "" ? `${name}:\\` : t };
     return { ok: false, error: `No saved connection is named "${name}"` };
   }
-  if (t.startsWith("/") || t.startsWith("\\\\")) return { ok: true, path: t.length > 1 ? t.replace(/[\\/]+$/, "") || "/" : t };
+  if (absoluteLocal) return { ok: true, path: t.length > 1 ? t.replace(/[\\/]+$/, "") || "/" : t };
   return { ok: false, error: "Type a full path (starting with /), or <connection name>:path" };
 }
 

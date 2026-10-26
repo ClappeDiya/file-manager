@@ -184,6 +184,45 @@ impl MappingDb {
             .await
     }
 
+    /// One mapping by id.
+    pub async fn get(&self, id: &str) -> Result<Option<MappingRecord>, AppError> {
+        let id = id.to_string();
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, original_name, translated_name, source_path, dest_path,
+                            profile_id, rules_applied, timestamp, reversible, tier
+                     FROM compat_mapping_records WHERE id = ?1",
+                )?;
+                match stmt.query_row(rusqlite::params![id], row_to_record) {
+                    Ok(record) => Ok(Some(record)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(AppError::from(e)),
+                }
+            })
+            .await
+    }
+
+    /// A folder moved from `old` to `new`: records of renames inside it follow.
+    pub async fn rebase_dest(&self, old: &str, new: &str) -> Result<usize, AppError> {
+        let (old, new) = (old.to_string(), new.to_string());
+        self.pool
+            .execute(move |conn| {
+                Ok(conn.execute(
+                    "UPDATE compat_mapping_records SET dest_path = ?2 || substr(dest_path, length(?1) + 1)
+                     WHERE dest_path = ?1 OR substr(dest_path, 1, length(?1) + 1) IN (?1 || '/', ?1 || '\\')",
+                    rusqlite::params![old, new],
+                )?)
+            })
+            .await
+    }
+
+    /// Forget a mapping (its file got its original name back).
+    pub async fn delete(&self, id: &str) -> Result<bool, AppError> {
+        let id = id.to_string();
+        self.pool.execute(move |conn| Ok(conn.execute("DELETE FROM compat_mapping_records WHERE id = ?1", rusqlite::params![id])? > 0)).await
+    }
+
     /// Search mappings by original or translated name (substring match).
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<MappingRecord>, AppError> {
         let query = format!("%{query}%");

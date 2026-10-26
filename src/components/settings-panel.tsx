@@ -37,6 +37,10 @@ import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-sect
 import { AdvancedOnly } from "@/components/backup/advanced-only";
 import { LocalServerSection } from "@/components/local-server-section";
 import { FolderField } from "@/components/remote-folder-picker";
+import { useT } from "@/lib/i18n";
+import { StartupTraySection } from "@/components/startup-tray-section";
+import { ResetSettingsSection } from "@/components/reset-settings-section";
+import { AppLockSection } from "@/components/app-lock-section";
 
 // ── Types ──
 
@@ -1355,6 +1359,9 @@ export default function SettingsPanel({
   /** Open with this section expanded and scrolled to (`"rclone"`). */
   focusSection?: string | null;
 }) {
+  const t = useT();
+  // Bumped by a reset: the sections remount and read their settings again.
+  const [resetEpoch, setResetEpoch] = useState(0);
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
   const portable = usePortableStatus();
 
@@ -1375,18 +1382,26 @@ export default function SettingsPanel({
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-        <h2 className="text-sm font-semibold">Settings</h2>
+        <h2 className="text-sm font-semibold">{t("settings.title")}</h2>
         <PortableModeBadge status={portable} />
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        <Section title="Appearance" defaultOpen>
+      <div key={resetEpoch} className="flex-1 overflow-y-auto p-4 space-y-3">
+        <Section title={t("settings.appearance")} defaultOpen>
           <AppearanceSettings />
         </Section>
 
-        <Section title="General" id="general" focus={focusSection === "general"}>
+        <Section title={t("settings.general")} id="general" focus={focusSection === "general"}>
           <GeneralSection />
+        </Section>
+
+        <Section title={t("settings.startupTray")} id="startup" focus={focusSection === "startup"}>
+          <StartupTraySection />
+        </Section>
+
+        <Section title={t("settings.appLock")} id="app-lock" focus={focusSection === "app-lock"}>
+          <AppLockSection />
         </Section>
 
         {/* Export */}
@@ -1415,12 +1430,12 @@ export default function SettingsPanel({
         </Section>
 
         {/* Notifications */}
-        <Section title="Notifications">
+        <Section title={t("settings.notifications")}>
           <NotificationSection />
         </Section>
 
         {/* Privacy */}
-        <Section title="Privacy">
+        <Section title={t("settings.privacy")}>
           <PrivacySection />
         </Section>
 
@@ -1430,7 +1445,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Log Controls */}
-        <Section title="Logging">
+        <Section title={t("settings.logging")}>
           <LogControlsSection />
           <DiagnosticsSection />
         </Section>
@@ -1495,7 +1510,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Advanced: local monitoring (Prometheus exporter, off by default) */}
-        <Section title="Advanced">
+        <Section title={t("settings.advanced")}>
           <div className="pt-3" />
           <AdvancedOnly hint>
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
@@ -1512,7 +1527,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Network Diagnostics */}
-        <Section title="Network">
+        <Section title={t("settings.network")}>
           <div className="pt-3">
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
               Run network diagnostics to troubleshoot connection issues.
@@ -1525,6 +1540,10 @@ export default function SettingsPanel({
               Run Diagnostics
             </button>
           </div>
+        </Section>
+
+        <Section title={t("settings.reset")} id="reset" focus={focusSection === "reset"} defaultOpen={resetEpoch > 0}>
+          <ResetSettingsSection onReset={() => setResetEpoch((n) => n + 1)} justReset={resetEpoch > 0} />
         </Section>
       </div>
     </div>

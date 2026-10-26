@@ -14,7 +14,7 @@ import { useTerminalStore } from "@/stores/terminal-store";
 import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
 import { assessBeforeExecute, confirmIntent, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
-import { formatAddress, isRemotePath, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
+import { formatAddress, isRemotePath, isTopFolder, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
 import {
   connectionQuota,
   dragDropMode,
@@ -53,7 +53,9 @@ import {
 import { archiveExtractDest } from "@/lib/archive-paths";
 import { pickFolder } from "@/lib/folder-picker";
 import { planPaneCopy, awaitPaneCopyJobs } from "@/lib/pane-copy";
-import { resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey } from "@/lib/file-action-keys";
+import { isTextEntry, resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveNewWindowKey, resolveParentFolderKey } from "@/lib/file-action-keys";
+import { isSecondaryWindow, openNewWindow } from "@/lib/app-window";
+import { useAppLockStore } from "@/stores/app-lock-store";
 import {
   useDriveSpace,
   useAllDrives,
@@ -1836,6 +1838,12 @@ export function FileManager() {
           store.jumpToFavoriteByIndex(store.activePaneIndex, index);
         }
       }
+      // Cmd/Ctrl+N: a new window at the active pane's folder (⌘⇧N stays New Folder).
+      if (resolveNewWindowKey(e, isTextEntry(document.activeElement))) {
+        e.preventDefault();
+        const fm = useFileManagerStore.getState();
+        void openNewWindow(fm.getActivePath(fm.singlePaneMode ? 0 : fm.activePaneIndex)).catch((err) => console.error("New window failed:", err));
+      }
       // Cmd+[ or Alt+ArrowLeft to navigate back
       if (
         ((e.metaKey || e.ctrlKey) && e.key === "[") ||
@@ -1866,6 +1874,8 @@ export function FileManager() {
   // "last seen" marker. Zero value shown on fresh installs.
   const [sinceSummary, setSinceSummary] = useState<LedgerSinceSummary | null>(null);
   useEffect(() => {
+    // Once per session: a second window does not consume the marker.
+    if (isSecondaryWindow()) return;
     let cancelled = false;
     (async () => {
       const summary = await tauriInvokeSafe<LedgerSinceSummary | null>(
@@ -2250,11 +2260,37 @@ export function FileManager() {
           setSettingsFocus("rclone");
           setSettingsOpen(true);
         },
+        onOpenSettingsSection: (section: string) => {
+          setSettingsFocus(section);
+          setSettingsOpen(true);
+        },
         onOpenConnections: () => {
           setConnectionsOpen(true);
         },
         onEditAddress: () => {
           window.dispatchEvent(new CustomEvent(EDIT_ADDRESS_EVENT, { detail: { paneIndex: useFileManagerStore.getState().activePaneIndex } }));
+        },
+        onOpenGuidedFlow: (id: string) => useUIStore.getState().setActiveGuidedFlow(id),
+        onLockApp: () => {
+          const lock = useAppLockStore.getState();
+          if (lock.status?.enabled) void lock.lockNow().catch((e) => console.error("Lock failed:", e));
+          else {
+            setSettingsFocus("app-lock");
+            setSettingsOpen(true);
+          }
+        },
+        onNewWindow: () => {
+          const fm = useFileManagerStore.getState();
+          void openNewWindow(fm.getActivePath(fm.singlePaneMode ? 0 : fm.activePaneIndex)).catch((e) => console.error("New window failed:", e));
+        },
+        onGoToParentFolder: () => {
+          const fm = useFileManagerStore.getState();
+          const pane = fm.singlePaneMode ? 0 : fm.activePaneIndex;
+          const tab = fm.getActiveTab(pane);
+          if (tab && !isTopFolder(tab.path)) {
+            const up = parentLocation(tab.path);
+            fm.navigateTab(pane, tab.id, up, paneLabel(up));
+          }
         },
         onOpenRcloneRemotes: () => {
           useRcloneUi.getState().openManager();
@@ -4029,6 +4065,7 @@ function FilePane({
   const { handleDragOver, handleDrop } = useFileDragDrop(pane.id);
 
   // Navigation
+  const paneRootRef = useRef<HTMLDivElement>(null);
   const handleNavigate = useCallback(
     (path: string) => {
       if (activeTab) {
@@ -5153,6 +5190,7 @@ function FilePane({
           aiStore.explainError("file_operation", `Operation on ${entry.name}`, "Check file permissions and try again");
           aiStore.setPanelOpen(true);
         },
+        onOpenInNewWindow: entry.is_dir ? () => void openNewWindow(entry.path).catch((e) => console.error("New window failed:", e)) : undefined,
         onOpenInTerminal: entry.is_dir
           ? () => {
               const termStore = useTerminalStore.getState();
@@ -5307,6 +5345,16 @@ function FilePane({
           setAddressEditing(true);
         }
       }
+      // Alt+↑ / ⌘+↑ / Backspace: the parent folder, when the focus is in
+      // this pane (or nowhere) — not in a panel, list box or dialog.
+      const focusHere = !activeEl || activeEl === document.body || !!paneRootRef.current?.contains(activeEl);
+      if (resolveParentFolderKey(e, inTextEntry || activeEl?.tagName === "SELECT") && focusHere && !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+        const fmState = useFileManagerStore.getState();
+        if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
+          e.preventDefault();
+          if (!isTopFolder(currentPath)) handleNavigate(parentLocation(currentPath));
+        }
+      }
       const transferKey = resolveFileTransferKey(e, inTextEntry);
       if (transferKey) {
         const fmState = useFileManagerStore.getState();
@@ -5347,10 +5395,11 @@ function FilePane({
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleNewFolder, selectAll, paneIndex]);
+  }, [selectedPaths, handleCompareFiles, handleDelete, handleRename, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleNewFolder, selectAll, paneIndex, currentPath, handleNavigate]);
 
   return (
     <div
+      ref={paneRootRef}
       className="flex flex-col h-full relative data-[os-drop-hover]:ring-2 data-[os-drop-hover]:ring-inset data-[os-drop-hover]:ring-[var(--color-primary)]"
       {...{ [OS_DROP_ATTR]: currentPath }}
       onDragOver={handleDragOver}
@@ -5407,6 +5456,8 @@ function FilePane({
         onForward={() => useFileManagerStore.getState().navigateForward(paneIndex)}
         canGoBack={useFileManagerStore.getState().canNavigateBack(paneIndex)}
         canGoForward={useFileManagerStore.getState().canNavigateForward(paneIndex)}
+        onUp={() => handleNavigate(parentLocation(currentPath))}
+        canGoUp={!isTopFolder(currentPath)}
         connectionName={nameOfConnection}
         address={addressProps}
         editing={addressEditing}
