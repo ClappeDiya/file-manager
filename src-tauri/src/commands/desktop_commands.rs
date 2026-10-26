@@ -1,5 +1,5 @@
 //! Desktop shell settings: the language of the shell's own texts (tray),
-//! startup and tray behaviour.
+//! startup and tray behaviour, reset, cloud-synced folders.
 
 use crate::core::error::AppError;
 
@@ -77,4 +77,13 @@ pub async fn reset_settings(
     }
     crate::security::audit::SecurityAudit::log(repo.inner(), "settings.reset", "user", "settings", &format!("{scopes:?}")).await;
     Ok(report)
+}
+
+/// Folders on this computer kept in sync by a cloud service's own app
+/// (Dropbox, OneDrive, Google Drive, iCloud Drive…), for the sidebar.
+#[tauri::command]
+pub async fn detect_cloud_folders() -> Result<Vec<crate::cloud_folders::CloudFolder>, AppError> {
+    tokio::task::spawn_blocking(|| crate::cloud_folders::Probe::current().map(|p| crate::cloud_folders::detect(&p)).unwrap_or_default())
+        .await
+        .map_err(|e| AppError::internal(format!("Cloud folder detection failed: {e}")))
 }

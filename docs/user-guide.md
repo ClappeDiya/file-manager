@@ -129,6 +129,7 @@ Files can be displayed in four modes (set per pane in Advanced mode):
 - **Parent folder** - The ↑ button next to Back/Forward, **Alt+↑** (Windows, Linux), **⌘↑** (macOS) or **Backspace** (when no text field has focus) opens the folder one level up, locally and on a connection. It stops at the top: `/`, a drive (`C:\`), a network share (`\\server\share`) or the connection's root. Also in the command palette: *Go to Parent Folder*.
 - **Tab Bar** - Open multiple directories in tabs (Advanced mode). Tabs can be pinned, reordered, and closed.
 - **Favorites** - Star any folder for quick access from the sidebar
+- **Cloud folders** - Folders that a cloud service's own app keeps in sync on this computer are listed in the sidebar and open like any local folder: Dropbox (personal and business, also when moved), OneDrive (personal and work accounts), Google Drive for desktop, iCloud Drive, Box, pCloud Drive, MEGA, Nextcloud and ownCloud (every sync folder in the client's settings), Synology Drive and Proton Drive. They are found from the apps' own settings and default folders (on macOS, `~/Library/CloudStorage`); UFOP does not contact the services. The list refreshes every few minutes and the section is hidden when none is found.
 - **Recent Locations** - The last 20 visited paths are remembered
 
 ### Selection

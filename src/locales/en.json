@@ -122,7 +122,8 @@
     "deletePermanently": "Delete Permanently",
     "openWith": "Open With...",
     "extractHere": "Extract Here",
-    "openInNewWindow": "Open in New Window"
+    "openInNewWindow": "Open in New Window",
+    "cloudFolders": "Cloud folders"
   },
   "transfer": {
     "title": "Transfer",

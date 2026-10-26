@@ -122,7 +122,8 @@
     "deletePermanently": "Endg\u00fcltig l\u00f6schen",
     "openWith": "\u00d6ffnen mit...",
     "extractHere": "Hier entpacken",
-    "openInNewWindow": "In neuem Fenster \u00f6ffnen"
+    "openInNewWindow": "In neuem Fenster \u00f6ffnen",
+    "cloudFolders": "Cloud-Ordner"
   },
   "transfer": {
     "title": "\u00dcbertragung",

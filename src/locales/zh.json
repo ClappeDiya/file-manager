@@ -122,7 +122,8 @@
     "deletePermanently": "\u6c38\u4e45\u5220\u9664",
     "openWith": "\u6253\u5f00\u65b9\u5f0f...",
     "extractHere": "\u89e3\u538b\u5230\u6b64\u5904",
-    "openInNewWindow": "\u5728\u65b0\u7a97\u53e3\u4e2d\u6253\u5f00"
+    "openInNewWindow": "\u5728\u65b0\u7a97\u53e3\u4e2d\u6253\u5f00",
+    "cloudFolders": "\u4e91\u6587\u4ef6\u5939"
   },
   "transfer": {
     "title": "\u4f20\u8f93",

@@ -122,7 +122,8 @@
     "deletePermanently": "Excluir permanentemente",
     "openWith": "Abrir com...",
     "extractHere": "Extrair aqui",
-    "openInNewWindow": "Abrir em nova janela"
+    "openInNewWindow": "Abrir em nova janela",
+    "cloudFolders": "Pastas na nuvem"
   },
   "transfer": {
     "title": "Transfer\u00eancia",
