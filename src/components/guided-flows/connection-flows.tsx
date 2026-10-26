@@ -8,13 +8,14 @@
  *
  * Each wizard provides step-by-step guidance with validation.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
 import { pickFolder } from "@/lib/folder-picker";
 import { checkFolders, createSyncPair, saveAndTestConnection } from "@/lib/guided-actions";
 import { errorText } from "@/lib/error-text";
+import { tauriInvoke } from "@/hooks/use-tauri";
 import {
   FolderOpen,
   Check,
@@ -45,7 +46,11 @@ function useConnectionTest() {
     setTesting(false);
     return problem;
   };
-  return { run, testing, error, connectionId };
+  /** Cancelled: remove the connection the tests saved (with its password). */
+  const discard = async () => {
+    if (connectionId) await tauriInvoke("delete_connection", { connectionId }).catch(() => {});
+  };
+  return { run, testing, error, connectionId, discard };
 }
 
 // ──────────────────────────────────────────────
@@ -322,6 +327,8 @@ export function ConnectSMBWizard() {
   const [password, setPassword] = useState("");
   const [testPassed, setTestPassed] = useState(false);
   const conn = useConnectionTest();
+  // A passed test is for the values tested: any change needs a new one.
+  useEffect(() => setTestPassed(false), [host, shareName, username, password]);
   const test = () =>
     conn.run({ name: `${shareName} on ${host}`, protocol: "smb", host, port: null, username: username || null, password: password || null, remotePath: `/${shareName.replace(/^[\\/]+/, "")}` }).then((problem) => {
       setTestPassed(!problem);
@@ -371,7 +378,7 @@ export function ConnectSMBWizard() {
         });
         setActiveGuidedFlow(null);
       }}
-      onCancel={() => setActiveGuidedFlow(null)}
+      onCancel={() => void conn.discard().finally(() => setActiveGuidedFlow(null))}
       completeLabel="Connect"
     >
       {step === 0 && (
@@ -515,6 +522,7 @@ export function ConnectSFTPWizard() {
   const [remotePath, setRemotePath] = useState("/");
   const [testPassed, setTestPassed] = useState(false);
   const conn = useConnectionTest();
+  useEffect(() => setTestPassed(false), [host, port, username, authMethod, password, remotePath]);
   const test = () =>
     conn.run({ name: `${username}@${host}`, protocol: "sftp", host, port: Number(port) || 22, username, password: authMethod === "password" ? password : null, remotePath: remotePath || "/" }).then((problem) => {
       setTestPassed(!problem);
@@ -567,7 +575,7 @@ export function ConnectSFTPWizard() {
         });
         setActiveGuidedFlow(null);
       }}
-      onCancel={() => setActiveGuidedFlow(null)}
+      onCancel={() => void conn.discard().finally(() => setActiveGuidedFlow(null))}
       completeLabel="Connect"
     >
       {step === 0 && (

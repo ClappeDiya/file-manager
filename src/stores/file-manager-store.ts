@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
-import { isSecondaryWindow, windowScopedStorage } from "@/lib/app-window";
+import { isSecondaryWindow, sharedWindowStorage } from "@/lib/app-window";
 import { locationLabel } from "@/lib/location";
 import { useConnectionsStore } from "@/stores/connections-store";
 
@@ -1439,7 +1439,7 @@ export const useFileManagerStore = create<FileManagerState>()(
     {
       name: FILE_MANAGER_STORAGE_KEY,
       // A second window keeps its own panes and layout (see `app-window.ts`).
-      storage: createJSONStorage(() => (isSecondaryWindow() ? windowScopedStorage(localStorage, WINDOW_FIELDS) : localStorage)),
+      storage: createJSONStorage(() => sharedWindowStorage(localStorage, WINDOW_FIELDS, isSecondaryWindow())),
       partialize: (state) => ({
         panes: state.panes,
         singlePaneMode: state.singlePaneMode,

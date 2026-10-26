@@ -151,8 +151,8 @@ export function resolveNewWindowKey(e: KeyGesture, textEntryFocused: boolean): b
   return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n";
 }
 
-/** Whether `el` is a text field (input, textarea, contenteditable). */
+/** Whether `el` takes typing (input, textarea, select, contenteditable). */
 export function isTextEntry(el: Element | null): boolean {
   const h = el as HTMLElement | null;
-  return h?.tagName === "INPUT" || h?.tagName === "TEXTAREA" || h?.isContentEditable === true;
+  return h?.tagName === "INPUT" || h?.tagName === "TEXTAREA" || h?.tagName === "SELECT" || h?.isContentEditable === true;
 }

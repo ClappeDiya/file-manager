@@ -209,6 +209,44 @@ describe("server wizards", () => {
     expect(lastActivity()).toContain("Connection Manager");
   });
 
+  // Review finding: a passed test stayed passed after the host changed, so
+  // Finish kept the old server while the summary named the new one.
+  it("changing a field after a passed test tests again on Finish", async () => {
+    render(<ConnectSMBWizard />);
+    type("office-nas or 192.168.1.100", "nas-a");
+    next();
+    type("SharedFiles", "S");
+    next();
+    next();
+    fireEvent.click(screen.getByTestId("wizard-test-connection"));
+    await screen.findByText("Connected successfully");
+    fireEvent.click(screen.getByRole("button", { name: /Back/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Back/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Back/ }));
+    type("office-nas or 192.168.1.100", "nas-b");
+    next();
+    next();
+    next();
+    next(/^Connect$/);
+    await closed();
+    expect(calls("save_connection").map((a) => a.host)).toEqual(["nas-a", "nas-b"]);
+    expect(lastActivity()).toContain("nas-b");
+  });
+
+  it("cancelling removes the connection a test saved", async () => {
+    render(<ConnectSMBWizard />);
+    type("office-nas or 192.168.1.100", "nas");
+    next();
+    type("SharedFiles", "S");
+    next();
+    next();
+    fireEvent.click(screen.getByTestId("wizard-test-connection"));
+    await screen.findByText("Connected successfully");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await closed();
+    expect(calls("delete_connection")).toEqual([{ connectionId: "c1" }]);
+  });
+
   it("SFTP with an SSH key sends no password", async () => {
     render(<ConnectSFTPWizard />);
     type("server.example.com", "srv");

@@ -1502,9 +1502,11 @@ pub fn run() {
                     return;
                 }
             }
-            // "Minimise to the tray": a minimised window leaves the taskbar.
+            // "Minimise to the tray": the minimised main window leaves the
+            // taskbar (the tray's Open brings back the main window only, so
+            // other windows stay in the taskbar).
             if let tauri::WindowEvent::Resized(_) = event {
-                if window_startup.effective(close_mode.enabled()).minimize_to_tray && window.is_minimized().unwrap_or(false) {
+                if window.label() == "main" && window_startup.effective(close_mode.enabled()).minimize_to_tray && window.is_minimized().unwrap_or(false) {
                     let _ = window.hide();
                 }
             }

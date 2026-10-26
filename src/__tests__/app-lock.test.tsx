@@ -69,6 +69,7 @@ describe("app lock: commands wait while locked", () => {
   });
 
   it("a command the backend refused as locked runs again after the unlock", async () => {
+    status = { ...status, locked: true };
     let refuse = true;
     const base = mockInvoke.getMockImplementation()!;
     mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
@@ -137,6 +138,53 @@ describe("app lock: the lock screen", () => {
     fireEvent.keyDown(window, { key: "b" });
     expect(calls("app_lock_activity")).toHaveLength(2);
     vi.useRealTimers();
+  });
+});
+
+describe("app lock: review fixes", () => {
+  // Review finding: a call refused as locked set only the IPC flag; the lock
+  // screen never showed, and the window waited forever.
+  it("a call refused as locked shows the lock screen even when the event was missed", async () => {
+    render(<AppLockGate>content</AppLockGate>);
+    await waitFor(() => expect(useAppLockStore.getState().status?.locked).toBe(false));
+    // Locked by the idle timer; this window never got the event.
+    status = { ...status, locked: true };
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_directory" && status.locked) throw { error_type: "app_locked", message: "UFOP is locked", advice: "" };
+      return base(cmd, args);
+    });
+    const p = tauriInvoke<string[]>("list_directory", { path: "/y" });
+    expect(await screen.findByTestId("app-lock-screen")).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("app-lock-password"), { target: { value: PASSWORD } });
+    fireEvent.click(screen.getByTestId("app-lock-unlock"));
+    expect(await p).toEqual(["listing of /y"]);
+  });
+
+  // Review finding: with lock-on-start the app showed (tabs, favorites)
+  // until the state arrived.
+  it("shows nothing of the app until the lock state is known", async () => {
+    let answer: (s: AppLockStatus) => void = () => {};
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "app_lock_status" ? new Promise((r) => (answer = r)) : base(cmd, args),
+    );
+    render(<AppLockGate>secret tabs</AppLockGate>);
+    expect(screen.getByTestId("app-lock-content")).toHaveClass("invisible");
+    expect(screen.getByTestId("app-lock-content")).toHaveAttribute("inert");
+    await waitFor(() => expect(calls("app_lock_status").length).toBeGreaterThan(0));
+    act(() => answer({ ...status, locked: true }));
+    expect(await screen.findByTestId("app-lock-screen")).toBeInTheDocument();
+  });
+
+  it("an unanswered status never hides the app for good", async () => {
+    const base = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "app_lock_status") throw new Error("unknown command");
+      return base(cmd, args);
+    });
+    render(<AppLockGate>visible</AppLockGate>);
+    await waitFor(() => expect(screen.getByTestId("app-lock-content")).not.toHaveClass("invisible"));
   });
 });
 

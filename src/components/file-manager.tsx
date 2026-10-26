@@ -4065,6 +4065,7 @@ function FilePane({
   const { handleDragOver, handleDrop } = useFileDragDrop(pane.id);
 
   // Navigation
+  const paneRootRef = useRef<HTMLDivElement>(null);
   const handleNavigate = useCallback(
     (path: string) => {
       if (activeTab) {
@@ -5344,8 +5345,10 @@ function FilePane({
           setAddressEditing(true);
         }
       }
-      // Alt+↑ / ⌘+↑ / Backspace: the parent folder (not while a dialog is open).
-      if (resolveParentFolderKey(e, inTextEntry) && !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+      // Alt+↑ / ⌘+↑ / Backspace: the parent folder, when the focus is in
+      // this pane (or nowhere) — not in a panel, list box or dialog.
+      const focusHere = !activeEl || activeEl === document.body || !!paneRootRef.current?.contains(activeEl);
+      if (resolveParentFolderKey(e, inTextEntry || activeEl?.tagName === "SELECT") && focusHere && !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
         const fmState = useFileManagerStore.getState();
         if (fmState.singlePaneMode || fmState.activePaneIndex === paneIndex) {
           e.preventDefault();
@@ -5396,6 +5399,7 @@ function FilePane({
 
   return (
     <div
+      ref={paneRootRef}
       className="flex flex-col h-full relative data-[os-drop-hover]:ring-2 data-[os-drop-hover]:ring-inset data-[os-drop-hover]:ring-[var(--color-primary)]"
       {...{ [OS_DROP_ATTR]: currentPath }}
       onDragOver={handleDragOver}

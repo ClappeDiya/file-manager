@@ -44,43 +44,54 @@ export async function openNewWindow(path?: string | null): Promise<void> {
 }
 
 /**
- * Storage for a store whose `windowFields` belong to one window: they are
- * neither read from nor written to the shared copy, every other field is.
+ * Storage shared by the windows. `windowFields` belong to one window: the
+ * first window stores its own (they reopen next start), another window keeps
+ * them to itself (`secondary`). Every other field is shared, and a window
+ * writes only the shared fields it changed since it last read them, so a
+ * window that has not heard of another's change yet cannot write an old
+ * value over it.
  */
-export function windowScopedStorage(base: Storage, windowFields: readonly string[]): StateStorage {
-  const strip = (state: Record<string, unknown>) => {
-    const out = { ...state };
-    for (const f of windowFields) delete out[f];
-    return out;
+export function sharedWindowStorage(base: Storage, windowFields: readonly string[], secondary: boolean): StateStorage {
+  // Per stored key: each field as this window last read or wrote it.
+  const seen = new Map<string, Map<string, string>>();
+  const parse = (raw: string | null) => {
+    try {
+      return raw ? (JSON.parse(raw) as { state?: Record<string, unknown>; version?: number }) : {};
+    } catch {
+      return {};
+    }
+  };
+  const remember = (name: string, state: Record<string, unknown>) => {
+    seen.set(name, new Map(Object.entries(state).map(([k, v]) => [k, JSON.stringify(v)])));
   };
   return {
     getItem: (name) => {
       const raw = base.getItem(name);
       if (!raw) return raw;
-      try {
-        const parsed = JSON.parse(raw) as { state?: Record<string, unknown>; version?: number };
-        return JSON.stringify({ ...parsed, state: strip(parsed.state ?? {}) });
-      } catch {
-        return null;
-      }
+      const parsed = parse(raw);
+      const state = { ...(parsed.state ?? {}) };
+      if (secondary) for (const f of windowFields) delete state[f];
+      remember(name, state);
+      return JSON.stringify({ ...parsed, state });
     },
     setItem: (name, value) => {
-      try {
-        const next = JSON.parse(value) as { state?: Record<string, unknown>; version?: number };
-        const cur = JSON.parse(base.getItem(name) ?? "{}") as { state?: Record<string, unknown> };
-        const merged = { ...next, state: { ...(cur.state ?? {}), ...strip(next.state ?? {}) } };
-        // Keep the shared copy's own window fields (the main window's panes).
-        for (const f of windowFields) {
-          if (cur.state && f in cur.state) merged.state[f] = cur.state[f];
-          else delete merged.state[f];
-        }
-        base.setItem(name, JSON.stringify(merged));
-      } catch {
-        // A broken shared copy: leave it for the main window to rewrite.
+      const next = parse(value);
+      const cur = parse(base.getItem(name)).state ?? {};
+      const last = seen.get(name) ?? new Map<string, string>();
+      const merged: Record<string, unknown> = { ...cur };
+      for (const [k, v] of Object.entries(next.state ?? {})) {
+        const own = windowFields.includes(k);
+        if (own && secondary) continue; // the first window's stay
+        const changedHere = !last.has(k) || last.get(k) !== JSON.stringify(v);
+        if (own || changedHere || !(k in cur)) merged[k] = v;
       }
+      const mine = { ...merged };
+      if (secondary) for (const f of windowFields) delete mine[f];
+      remember(name, mine);
+      base.setItem(name, JSON.stringify({ ...next, state: merged }));
     },
-    removeItem: () => {
-      // A secondary window never removes the shared copy.
+    removeItem: (name) => {
+      if (!secondary) base.removeItem(name);
     },
   };
 }

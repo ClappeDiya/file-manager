@@ -29,6 +29,7 @@ pub async fn app_lock_set_settings(
     mpw: State<'_, MasterPasswordManager>,
     repo: State<'_, Repository>,
 ) -> Result<AppLockStatus, AppError> {
+    AppLock::validate(&settings)?;
     let was = lock.settings();
     if was.enabled || settings.enabled {
         if has_password(&mpw, &repo).await {

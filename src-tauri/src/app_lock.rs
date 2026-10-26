@@ -114,11 +114,17 @@ impl AppLock {
         s.enabled && s.idle_minutes > 0 && !self.is_locked() && now.saturating_sub(self.last_activity.load(Ordering::SeqCst)) >= u64::from(s.idle_minutes) * 60
     }
 
-    /// Store new settings. Turning the lock off also unlocks.
-    pub async fn save(&self, repo: &Repository, settings: AppLockSettings) -> Result<(), AppError> {
+    /// Refuse settings the lock does not offer (before anything is changed).
+    pub fn validate(settings: &AppLockSettings) -> Result<(), AppError> {
         if !IDLE_CHOICES.contains(&settings.idle_minutes) {
             return Err(AppError::validation(format!("Lock after {} minutes is not offered; choose one of {:?}.", settings.idle_minutes, IDLE_CHOICES)));
         }
+        Ok(())
+    }
+
+    /// Store new settings. Turning the lock off also unlocks.
+    pub async fn save(&self, repo: &Repository, settings: AppLockSettings) -> Result<(), AppError> {
+        Self::validate(&settings)?;
         repo.set_config(SETTINGS_KEY, &serde_json::to_string(&settings)?).await?;
         if let Ok(mut s) = self.settings.write() {
             *s = settings;
@@ -280,6 +286,20 @@ mod tests {
         assert_eq!(call("app_lock_status"), Ok("status".to_string()));
         lock.unlock();
         assert_eq!(call("list_directory"), Ok("listing".to_string()));
+    }
+
+    /// The gate sees app commands only: plugin commands (`plugin:fs|…`) go
+    /// straight to the plugin. So the windows are granted no plugin command
+    /// that reads or changes anything (review finding: fs read/write/remove
+    /// over $HOME were granted and bypassed the lock).
+    #[test]
+    fn the_windows_are_granted_no_plugin_commands_the_lock_cannot_see() {
+        let caps: serde_json::Value = serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let ids: Vec<String> = caps["permissions"].as_array().unwrap().iter().map(|p| p.as_str().map(str::to_string).unwrap_or_else(|| p["identifier"].as_str().unwrap().to_string())).collect();
+        for id in &ids {
+            let family = id.split(':').next().unwrap();
+            assert!(matches!(family, "core" | "updater"), "{id} would bypass the app lock gate");
+        }
     }
 
     #[tokio::test]

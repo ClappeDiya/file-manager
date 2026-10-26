@@ -195,13 +195,14 @@ fn handle_mount_click(app: &AppHandle, action: MountAction) {
     });
 }
 
-fn show_main(app: &AppHandle) {
+/// Show the main window (or, when it was closed, another one); its label.
+fn show_main(app: &AppHandle) -> Option<String> {
     let windows = app.webview_windows();
-    if let Some(w) = windows.get("main").or_else(|| windows.values().next()) {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-    }
+    let w = windows.get("main").or_else(|| windows.values().next())?;
+    let _ = w.show();
+    let _ = w.unminimize();
+    let _ = w.set_focus();
+    Some(w.label().to_string())
 }
 
 /// One log line for "Back up all now".
@@ -279,7 +280,9 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     )?;
     let m2 = mgr.clone();
     let mut builder = TrayIconBuilder::with_id("ufop").tooltip("UFOP").menu(&menu).show_menu_on_left_click(true).on_menu_event(move |app, ev| match ev.id().as_ref() {
-        "open" => show_main(app),
+        "open" => {
+            show_main(app);
+        }
         "new_window" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -289,8 +292,9 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
             });
         }
         "backups" => {
-            show_main(app);
-            let _ = app.emit_to("main", OPEN_BACKUPS_EVENT, ());
+            if let Some(label) = show_main(app) {
+                let _ = app.emit_to(label.as_str(), OPEN_BACKUPS_EVENT, ());
+            }
         }
         "run_all" => {
             let m = m2.clone();

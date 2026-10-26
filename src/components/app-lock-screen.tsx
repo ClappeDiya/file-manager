@@ -89,20 +89,32 @@ export function LockScreen() {
 export function AppLockGate({ children }: { children: ReactNode }) {
   const status = useAppLockStore((s) => s.status);
   const locked = !!status?.locked;
+  // Until the state is known (lock at start), show nothing of the app.
+  const pending = isTauriAvailable() && status === null;
 
-  // Learn the state, and follow what the backend (or another window) does.
+  // Follow what the backend (or another window) does, then learn the state:
+  // listening first, so a lock in between is not missed.
   useEffect(() => {
     if (!isTauriAvailable()) return;
-    void useAppLockStore.getState().load().catch(() => {});
     let off: (() => void) | undefined;
     let live = true;
+    const unlockedDefault = { enabled: false, locked: false, lock_on_start: false, idle_minutes: 0, has_password: false };
+    const load = () =>
+      useAppLockStore
+        .getState()
+        .load()
+        .catch(() => {
+          // No answer: never leave the window hidden behind an unknown state.
+          if (!useAppLockStore.getState().status) useAppLockStore.setState({ status: unlockedDefault });
+        });
     void import("@tauri-apps/api/event")
       .then(({ listen }) => listen<{ locked: boolean }>(LOCK_EVENT, (e) => useAppLockStore.getState().setLocked(!!e.payload?.locked)))
       .then((un) => {
         if (live) off = un;
         else un();
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => void load());
     return () => {
       live = false;
       off?.();
@@ -127,7 +139,7 @@ export function AppLockGate({ children }: { children: ReactNode }) {
 
   return (
     <>
-      <div className="h-full" inert={locked} aria-hidden={locked || undefined} data-testid="app-lock-content">
+      <div className={pending ? "h-full invisible" : "h-full"} inert={locked || pending} aria-hidden={locked || pending || undefined} data-testid="app-lock-content">
         {children}
       </div>
       {locked && <LockScreen />}

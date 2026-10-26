@@ -146,11 +146,17 @@ pub fn scan(root: &Path, profile: &DestProfile) -> CompatScan {
     out
 }
 
+/// The rest of `path` when it is `folder` or inside it ("" or "/x/y").
+pub fn under<'a>(path: &'a str, folder: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(folder)?;
+    (rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')).then_some(rest)
+}
+
 /// Rename `fixes` (deepest first, so a folder is renamed after what is in
 /// it) and return the mapping records to store.
 pub fn apply_fixes(fixes: &[CompatFix], profile_id: &str) -> (CompatRenameReport, Vec<MappingRecord>) {
     let mut report = CompatRenameReport::default();
-    let mut records = Vec::new();
+    let mut records: Vec<MappingRecord> = Vec::new();
     let mut order: Vec<&CompatFix> = fixes.iter().collect();
     order.sort_by_key(|f| std::cmp::Reverse(Path::new(&f.path).components().count()));
     for fix in order {
@@ -180,8 +186,15 @@ pub fn apply_fixes(fixes: &[CompatFix], profile_id: &str) -> (CompatRenameReport
         match std::fs::rename(path, &target) {
             Ok(()) => {
                 let parent_s = parent.to_string_lossy().into_owned();
+                let target_s = target.to_string_lossy().into_owned();
+                // Renames already made inside this folder now live under its new name.
+                for r in records.iter_mut() {
+                    if let Some(rest) = under(&r.dest_path, &fix.path) {
+                        r.dest_path = format!("{target_s}{rest}");
+                    }
+                }
                 records.push(create_record(&old_name, &fix.new_name, &fix.path, &parent_s, profile_id, &[], 2));
-                report.renamed.push((fix.path.clone(), target.to_string_lossy().into_owned()));
+                report.renamed.push((fix.path.clone(), target_s));
             }
             Err(e) => report.failed.push(fail(&format!("Could not rename: {e}"))),
         }
@@ -240,13 +253,23 @@ pub async fn compat_list_renames(folder: Option<String>, repo: State<'_, Reposit
 /// Give renamed files their original names back (and forget those renames).
 #[tauri::command]
 pub async fn compat_restore_names(ids: Vec<String>, repo: State<'_, Repository>) -> Result<CompatRenameReport, AppError> {
-    let db = MappingDb::new(repo.pool().clone());
+    restore(&MappingDb::new(repo.pool().clone()), &ids).await
+}
+
+/// Restore the recorded renames `ids`, what is inside a folder before the folder.
+pub async fn restore(db: &MappingDb, ids: &[String]) -> Result<CompatRenameReport, AppError> {
     let mut report = CompatRenameReport::default();
+    let mut records = Vec::new();
     for id in ids {
-        let Some(r) = db.get(&id).await? else {
-            report.failed.push(CompatFailure { path: id, reason: "This rename is no longer recorded.".into() });
-            continue;
-        };
+        match db.get(id).await? {
+            Some(r) => records.push(r),
+            None => report.failed.push(CompatFailure { path: id.clone(), reason: "This rename is no longer recorded.".into() }),
+        }
+    }
+    records.sort_by_key(|r| std::cmp::Reverse(Path::new(&r.dest_path).join(&r.translated_name).components().count()));
+    for id in records.iter().map(|r| r.id.clone()).collect::<Vec<_>>() {
+        // Read again: restoring a folder moves the records inside it.
+        let Some(r) = db.get(&id).await? else { continue };
         let folder = Path::new(&r.dest_path);
         let (from, to) = (folder.join(&r.translated_name), folder.join(&r.original_name));
         let from_s = from.to_string_lossy().into_owned();
@@ -258,8 +281,10 @@ pub async fn compat_restore_names(ids: Vec<String>, repo: State<'_, Repository>)
         } else if let Err(e) = std::fs::rename(&from, &to) {
             report.failed.push(fail(format!("Could not rename (this computer may not allow the original name): {e}")));
         } else {
+            let to_s = to.to_string_lossy().into_owned();
             db.delete(&id).await?;
-            report.renamed.push((from_s.clone(), to.to_string_lossy().into_owned()));
+            db.rebase_dest(&from_s, &to_s).await?;
+            report.renamed.push((from_s.clone(), to_s));
         }
     }
     Ok(report)
@@ -341,6 +366,55 @@ mod tests {
         assert!(db.delete(&r.id).await.unwrap());
         assert_eq!(std::fs::read_to_string(t.path().join("a:b.txt")).unwrap(), "data");
         assert!(db.get(&r.id).await.unwrap().is_none());
+    }
+
+    /// Review finding: the record of a file inside a renamed folder named
+    /// the folder's old path, so the file showed as "no longer there".
+    #[tokio::test]
+    async fn a_folder_and_a_file_inside_it_are_both_restored_in_one_go() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("bad:dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x?.txt"), "x").unwrap();
+        let fixes = vec![
+            CompatFix { path: dir.to_string_lossy().into(), new_name: "bad_dir".into() },
+            CompatFix { path: dir.join("x?.txt").to_string_lossy().into(), new_name: "x_.txt".into() },
+        ];
+        let (_, records) = apply_fixes(&fixes, "windows-ntfs");
+        let db = MappingDb::new(repo.pool().clone());
+        db.store_batch(&records).await.unwrap();
+        let listed: Vec<CompatRenameRecord> = db.search("", 10).await.unwrap().iter().map(view).collect();
+        assert!(listed.iter().all(|r| r.exists && r.restorable), "{listed:?}");
+        // Folder first in the request: what is inside is still restored first.
+        let mut ids: Vec<String> = listed.iter().map(|r| r.id.clone()).collect();
+        ids.sort_by_key(|id| listed.iter().find(|r| &r.id == id).map(|r| r.original_name != "bad:dir"));
+        let report = restore(&db, &ids).await.unwrap();
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(std::fs::read_to_string(dir.join("x?.txt")).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn restoring_a_folder_moves_the_records_inside_it() {
+        let repo = Repository::open_in_memory().await.unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("bad:dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x?.txt"), "x").unwrap();
+        let fixes = vec![
+            CompatFix { path: dir.to_string_lossy().into(), new_name: "bad_dir".into() },
+            CompatFix { path: dir.join("x?.txt").to_string_lossy().into(), new_name: "x_.txt".into() },
+        ];
+        let (_, records) = apply_fixes(&fixes, "windows-ntfs");
+        let db = MappingDb::new(repo.pool().clone());
+        db.store_batch(&records).await.unwrap();
+        let folder_id = records.iter().find(|r| r.original_name == "bad:dir").unwrap().id.clone();
+        restore(&db, &[folder_id]).await.unwrap();
+        // The file's record follows its folder back to the old name.
+        let left: Vec<CompatRenameRecord> = db.search("", 10).await.unwrap().iter().map(view).collect();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].exists && left[0].restorable, "{left:?}");
+        assert!(under("/a/b/c", "/a/b") == Some("/c") && under("/a/bc", "/a/b").is_none() && under("/a/b", "/a/b") == Some(""));
     }
 
     #[test]

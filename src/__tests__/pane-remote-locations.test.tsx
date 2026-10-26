@@ -268,6 +268,28 @@ describe("connections in the panes", () => {
     await waitFor(() => expect(useFileManagerStore.getState().getActivePath(0)).toBe("/home"));
   });
 
+  // Review finding: Backspace with focus in a list box or a panel outside
+  // the pane (Settings has no dialog role) went up behind it.
+  it("Backspace in a list box or outside the pane does not go up", async () => {
+    setPanes("/home/me", "/home", true);
+    render(
+      <>
+        <FileManager />
+        <select data-testid="outside-select"><option>a</option></select>
+        <button data-testid="outside-button">x</button>
+      </>,
+    );
+    await screen.findByTestId("breadcrumb-up");
+    screen.getByTestId("outside-select").focus();
+    fireEvent.keyDown(window, { key: "Backspace" });
+    screen.getByTestId("outside-button").focus();
+    fireEvent.keyDown(window, { key: "Backspace" });
+    expect(useFileManagerStore.getState().getActivePath(0)).toBe("/home/me");
+    (document.activeElement as HTMLElement).blur();
+    fireEvent.keyDown(window, { key: "Backspace" });
+    await waitFor(() => expect(useFileManagerStore.getState().getActivePath(0)).toBe("/home"));
+  });
+
   it("Backspace in a text field types instead of going up", async () => {
     setPanes("/home", "/home", true);
     render(<FileManager />);

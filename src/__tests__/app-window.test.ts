@@ -10,7 +10,7 @@ import {
   openNewWindow,
   sharedFields,
   windowLabel,
-  windowScopedStorage,
+  sharedWindowStorage,
 } from "@/lib/app-window";
 import { resolveNewWindowKey } from "@/lib/file-action-keys";
 import { WINDOW_FIELDS } from "@/stores/file-manager-store";
@@ -45,7 +45,7 @@ describe("several windows", () => {
   it("a second window shares favorites but not the first window's panes", () => {
     const mainState = { panes: ["main-left", "main-right"], singlePaneMode: false, favorites: ["/a"], recentLocations: [] };
     localStorage.setItem(KEY, JSON.stringify({ state: mainState, version: 0 }));
-    const storage = windowScopedStorage(localStorage, WINDOW_FIELDS);
+    const storage = sharedWindowStorage(localStorage, WINDOW_FIELDS, true);
     // Reading: no panes, so the window starts with its own.
     expect(JSON.parse(storage.getItem(KEY) as string)).toEqual({ state: { favorites: ["/a"], recentLocations: [] }, version: 0 });
     // Writing its own panes and a new favorite keeps the first window's panes.
@@ -58,8 +58,26 @@ describe("several windows", () => {
     expect(localStorage.getItem(KEY)).not.toBeNull();
   });
 
+  // Review finding: every write carried all shared fields from that window's
+  // memory, so a window that had not heard of a new favorite yet removed it.
+  it("a window that has not heard of another's change does not write over it", () => {
+    localStorage.setItem(KEY, JSON.stringify({ state: { panes: ["main"], favorites: ["/a"] }, version: 0 }));
+    const main = sharedWindowStorage(localStorage, WINDOW_FIELDS, false);
+    const second = sharedWindowStorage(localStorage, WINDOW_FIELDS, true);
+    main.getItem(KEY);
+    second.getItem(KEY);
+    // The second window adds a favorite.
+    second.setItem(KEY, JSON.stringify({ state: { panes: ["second"], favorites: ["/a", "/b"] }, version: 0 }));
+    // The first window navigates; its memory still has the old favorites.
+    main.setItem(KEY, JSON.stringify({ state: { panes: ["main", "moved"], favorites: ["/a"] }, version: 0 }));
+    expect(JSON.parse(localStorage.getItem(KEY)!).state).toEqual({ panes: ["main", "moved"], favorites: ["/a", "/b"] });
+    // A favorite the first window itself removes is removed.
+    main.setItem(KEY, JSON.stringify({ state: { panes: ["main", "moved"], favorites: [] }, version: 0 }));
+    expect(JSON.parse(localStorage.getItem(KEY)!).state.favorites).toEqual([]);
+  });
+
   it("writes only shared fields when no window has saved panes yet", () => {
-    const storage = windowScopedStorage(localStorage, WINDOW_FIELDS);
+    const storage = sharedWindowStorage(localStorage, WINDOW_FIELDS, true);
     storage.setItem(KEY, JSON.stringify({ state: { panes: ["second"], favorites: ["/x"] }, version: 0 }));
     expect(JSON.parse(localStorage.getItem(KEY)!).state).toEqual({ favorites: ["/x"] });
     expect(sharedFields({ panes: 1, favorites: 2, activePaneIndex: 0 }, WINDOW_FIELDS)).toEqual({ favorites: 2 });

@@ -5,7 +5,7 @@
  * (`setIpcLocked`).
  */
 import { create } from "zustand";
-import { isTauriAvailable, setIpcLocked, tauriInvoke } from "@/hooks/use-tauri";
+import { isTauriAvailable, setIpcLocked, setLockRefusalListener, tauriInvoke } from "@/hooks/use-tauri";
 
 /** Mirrors `app_lock::AppLockStatus`. */
 export interface AppLockStatus {
@@ -70,3 +70,7 @@ export const useAppLockStore = create<AppLockState>()((set, get) => ({
     else void get().load();
   },
 }));
+
+// A call the backend refused as locked: learn the real state (the lock
+// screen shows when it is locked; a stale refusal just lets the calls go on).
+setLockRefusalListener(() => void useAppLockStore.getState().load().catch(() => {}));

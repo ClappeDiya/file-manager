@@ -41,6 +41,13 @@ export const ALLOWED_WHILE_LOCKED: ReadonlySet<string> = new Set(["app_lock_stat
 
 let ipcLocked = false;
 let unlockWaiters: Array<() => void> = [];
+let onRefusedAsLocked: (() => void) | null = null;
+
+/** Called when the backend refused a call as locked: the lock store asks
+ *  for the real state, so the lock screen shows (or the calls go on). */
+export function setLockRefusalListener(fn: (() => void) | null) {
+  onRefusedAsLocked = fn;
+}
 const waitingCalls = new Map<string, Promise<unknown>>();
 
 /** Set by the app lock store when the app locks or unlocks. */
@@ -87,6 +94,7 @@ async function invokeRaw<T>(command: string, args: Record<string, unknown> | und
       // Locked between our check and the backend's (another window, idle).
       if (!isLockedError(err)) throw err;
       ipcLocked = true;
+      onRefusedAsLocked?.();
     }
   }
 }
