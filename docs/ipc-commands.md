@@ -229,6 +229,14 @@ macro; if you add a new one here, register it there too.
 - `compare_plan_action`
 - `compare_release`
 
+## `compat_commands` (5 commands)
+
+- `compat_fix_names`
+- `compat_list_renames`
+- `compat_profiles`
+- `compat_restore_names`
+- `compat_scan_folder`
+
 ## `confirmation_commands` (1 command)
 
 - `request_destructive_confirmation`
@@ -878,4 +886,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 683 commands across 60 modules.
+**Surface:** 688 commands across 61 modules.

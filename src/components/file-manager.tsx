@@ -2270,6 +2270,7 @@ export function FileManager() {
         onEditAddress: () => {
           window.dispatchEvent(new CustomEvent(EDIT_ADDRESS_EVENT, { detail: { paneIndex: useFileManagerStore.getState().activePaneIndex } }));
         },
+        onOpenGuidedFlow: (id: string) => useUIStore.getState().setActiveGuidedFlow(id),
         onLockApp: () => {
           const lock = useAppLockStore.getState();
           if (lock.status?.enabled) void lock.lockNow().catch((e) => console.error("Lock failed:", e));

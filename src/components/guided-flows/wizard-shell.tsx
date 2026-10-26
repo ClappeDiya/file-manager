@@ -12,6 +12,7 @@
 import { useState, useCallback } from "react";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
+import { errorText } from "@/lib/error-text";
 import {
   ArrowLeft,
   ArrowRight,
@@ -45,8 +46,10 @@ interface WizardShellProps {
   currentStep: number;
   /** Callback to change step */
   onStepChange: (index: number) => void;
-  /** Callback when wizard completes (last step Next) */
-  onComplete: () => void;
+  /** Callback when wizard completes (last step Next). When it returns a
+   *  promise the button spins until it settles, and a rejection is shown as
+   *  the error (the wizard stays open to try again). */
+  onComplete: () => void | Promise<void>;
   /** Callback when wizard is cancelled */
   onCancel: () => void;
   /** Whether the wizard is processing (shows spinner on Next) */
@@ -78,6 +81,8 @@ export function WizardShell({
 }: WizardShellProps) {
   const [showHelp, setShowHelp] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [completing, setCompleting] = useState(false);
+  const busy = loading || completing;
 
   const isLastStep = currentStep === steps.length - 1;
   const isFirstStep = currentStep === 0;
@@ -95,7 +100,13 @@ export function WizardShell({
     setValidationError(null);
 
     if (isLastStep) {
-      onComplete();
+      const done = onComplete();
+      if (done && typeof (done as Promise<void>).then === "function") {
+        setCompleting(true);
+        (done as Promise<void>)
+          .catch((e: unknown) => setValidationError(errorText(e)))
+          .finally(() => setCompleting(false));
+      }
     } else {
       onStepChange(currentStep + 1);
     }
@@ -229,18 +240,18 @@ export function WizardShell({
         <div className="flex items-center justify-between px-6 py-4 border-t border-[var(--color-border)]">
           <div>
             {!isFirstStep && (
-              <Button variant="ghost" onClick={handleBack} disabled={loading}>
+              <Button variant="ghost" onClick={handleBack} disabled={busy}>
                 <ArrowLeft className="h-4 w-4 mr-2" aria-hidden="true" />
                 Back
               </Button>
             )}
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" onClick={onCancel} disabled={loading}>
+            <Button variant="ghost" onClick={onCancel} disabled={busy}>
               Cancel
             </Button>
-            <Button variant="default" onClick={handleNext} disabled={loading}>
-              {loading ? (
+            <Button variant="default" onClick={handleNext} disabled={busy}>
+              {busy ? (
                 <>
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden="true" />
                   Processing...

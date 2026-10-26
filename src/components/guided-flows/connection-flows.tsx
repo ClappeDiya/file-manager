@@ -13,6 +13,8 @@ import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
 import { pickFolder } from "@/lib/folder-picker";
+import { checkFolders, createSyncPair, saveAndTestConnection } from "@/lib/guided-actions";
+import { errorText } from "@/lib/error-text";
 import {
   FolderOpen,
   Check,
@@ -21,6 +23,30 @@ import {
   RefreshCw,
   AlertTriangle,
 } from "lucide-react";
+
+/** Save-and-test for the server wizards: the same connection is updated on each try. */
+function useConnectionTest() {
+  const [connectionId, setConnectionId] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  /** `null` when it worked, else what went wrong (also shown). */
+  const run = async (p: Omit<Parameters<typeof saveAndTestConnection>[0], "connectionId">): Promise<string | null> => {
+    setTesting(true);
+    setError(null);
+    let problem: string | null;
+    try {
+      const r = await saveAndTestConnection({ ...p, connectionId });
+      setConnectionId(r.connectionId);
+      problem = r.reachable ? null : (r.error ?? "The server could not be reached.");
+    } catch (e) {
+      problem = errorText(e);
+    }
+    setError(problem);
+    setTesting(false);
+    return problem;
+  };
+  return { run, testing, error, connectionId };
+}
 
 // ──────────────────────────────────────────────
 // Wizard 4: Connect Local Sync Pair
@@ -34,6 +60,7 @@ export function ConnectLocalSyncWizard() {
   const [destPath, setDestPath] = useState("");
   const [syncMode, setSyncMode] = useState<"one-way" | "two-way" | "mirror">("two-way");
   const [testPassed, setTestPassed] = useState(false);
+  const [testError, setTestError] = useState<string | null>(null);
 
   const steps: WizardStepDef[] = [
     {
@@ -71,10 +98,11 @@ export function ConnectLocalSyncWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        await createSyncPair({ name: "", source: sourcePath, dest: destPath, mode: syncMode, schedule: "manual" });
         addActivity({
           type: "sync",
-          summary: `Created local sync pair: "${sourcePath}" and "${destPath}" (${syncMode} mode).`,
+          summary: `Created local sync pair: "${sourcePath}" and "${destPath}" (${syncMode} mode). Run it from the Sync panel.`,
           paths: [sourcePath, destPath],
           undoable: false,
         });
@@ -253,7 +281,12 @@ export function ConnectLocalSyncWizard() {
                 ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5 text-[color:var(--color-primary)]"
                 : "border-[var(--color-border)] text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)]",
             )}
-            onClick={() => setTestPassed(true)}
+            onClick={async () => {
+              const problem = await checkFolders([sourcePath, destPath]);
+              setTestError(problem);
+              setTestPassed(!problem);
+            }}
+            data-testid="wizard-test-folders"
           >
             {testPassed ? (
               <span className="flex items-center justify-center gap-2">
@@ -264,6 +297,11 @@ export function ConnectLocalSyncWizard() {
               "Test Folders"
             )}
           </button>
+          {testError && (
+            <p role="alert" className="text-xs text-[color:var(--color-error)]">
+              {testError}
+            </p>
+          )}
         </div>
       )}
     </WizardShell>
@@ -283,6 +321,12 @@ export function ConnectSMBWizard() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [testPassed, setTestPassed] = useState(false);
+  const conn = useConnectionTest();
+  const test = () =>
+    conn.run({ name: `${shareName} on ${host}`, protocol: "smb", host, port: null, username: username || null, password: password || null, remotePath: `/${shareName.replace(/^[\\/]+/, "")}` }).then((problem) => {
+      setTestPassed(!problem);
+      return problem;
+    });
 
   const steps: WizardStepDef[] = [
     {
@@ -316,10 +360,12 @@ export function ConnectSMBWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        const problem = testPassed ? null : await test();
+        if (problem) throw new Error(problem);
         addActivity({
           type: "connect",
-          summary: `Connected to shared folder "${shareName}" on ${host}.`,
+          summary: `Connected to shared folder "${shareName}" on ${host}; it is in the Connection Manager.`,
           paths: [`//${host}/${shareName}`],
           undoable: false,
         });
@@ -427,17 +473,26 @@ export function ConnectSMBWizard() {
                 ? "bg-[var(--color-primary)]/10 text-[color:var(--color-primary)] border-2 border-[var(--color-primary)]"
                 : "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:opacity-90",
             )}
-            onClick={() => setTestPassed(true)}
+            onClick={() => void test()}
+            disabled={conn.testing}
+            data-testid="wizard-test-connection"
           >
             {testPassed ? (
               <span className="flex items-center gap-2">
                 <Check className="h-4 w-4" aria-hidden="true" />
                 Connected successfully
               </span>
+            ) : conn.testing ? (
+              "Testing…"
             ) : (
               "Test Connection"
             )}
           </button>
+          {conn.error && (
+            <p role="alert" className="mt-3 text-xs text-[color:var(--color-error)] max-w-sm">
+              {conn.error}
+            </p>
+          )}
         </div>
       )}
     </WizardShell>
@@ -459,6 +514,12 @@ export function ConnectSFTPWizard() {
   const [password, setPassword] = useState("");
   const [remotePath, setRemotePath] = useState("/");
   const [testPassed, setTestPassed] = useState(false);
+  const conn = useConnectionTest();
+  const test = () =>
+    conn.run({ name: `${username}@${host}`, protocol: "sftp", host, port: Number(port) || 22, username, password: authMethod === "password" ? password : null, remotePath: remotePath || "/" }).then((problem) => {
+      setTestPassed(!problem);
+      return problem;
+    });
 
   const steps: WizardStepDef[] = [
     {
@@ -495,10 +556,12 @@ export function ConnectSFTPWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        const problem = testPassed ? null : await test();
+        if (problem) throw new Error(problem);
         addActivity({
           type: "connect",
-          summary: `Connected to ${host} via SFTP as ${username}.`,
+          summary: `Connected to ${host} via SFTP as ${username}; it is in the Connection Manager.`,
           paths: [`sftp://${username}@${host}:${port}${remotePath}`],
           undoable: false,
         });
@@ -592,8 +655,8 @@ export function ConnectSFTPWizard() {
           {authMethod === "key" && (
             <div className="p-3 rounded-lg bg-[var(--color-bg-secondary)]">
               <p className="text-xs text-[color:var(--color-text-secondary)]">
-                The app will look for SSH keys in your ~/.ssh directory. If you
-                have an existing key, it will be used automatically.
+                The app signs in with the keys your SSH agent holds (run
+                ssh-add to add one), as the ssh command does.
               </p>
             </div>
           )}
@@ -637,17 +700,26 @@ export function ConnectSFTPWizard() {
                 ? "bg-[var(--color-primary)]/10 text-[color:var(--color-primary)] border-2 border-[var(--color-primary)]"
                 : "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:opacity-90",
             )}
-            onClick={() => setTestPassed(true)}
+            onClick={() => void test()}
+            disabled={conn.testing}
+            data-testid="wizard-test-connection"
           >
             {testPassed ? (
               <span className="flex items-center gap-2">
                 <Check className="h-4 w-4" aria-hidden="true" />
                 Connected successfully
               </span>
+            ) : conn.testing ? (
+              "Testing…"
             ) : (
               "Test Connection"
             )}
           </button>
+          {conn.error && (
+            <p role="alert" className="mt-3 text-xs text-[color:var(--color-error)] max-w-sm">
+              {conn.error}
+            </p>
+          )}
         </div>
       )}
     </WizardShell>

@@ -184,6 +184,31 @@ impl MappingDb {
             .await
     }
 
+    /// One mapping by id.
+    pub async fn get(&self, id: &str) -> Result<Option<MappingRecord>, AppError> {
+        let id = id.to_string();
+        self.pool
+            .execute(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, original_name, translated_name, source_path, dest_path,
+                            profile_id, rules_applied, timestamp, reversible, tier
+                     FROM compat_mapping_records WHERE id = ?1",
+                )?;
+                match stmt.query_row(rusqlite::params![id], row_to_record) {
+                    Ok(record) => Ok(Some(record)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(AppError::from(e)),
+                }
+            })
+            .await
+    }
+
+    /// Forget a mapping (its file got its original name back).
+    pub async fn delete(&self, id: &str) -> Result<bool, AppError> {
+        let id = id.to_string();
+        self.pool.execute(move |conn| Ok(conn.execute("DELETE FROM compat_mapping_records WHERE id = ?1", rusqlite::params![id])? > 0)).await
+    }
+
     /// Search mappings by original or translated name (substring match).
     pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<MappingRecord>, AppError> {
         let query = format!("%{query}%");

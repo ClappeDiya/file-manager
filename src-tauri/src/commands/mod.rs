@@ -51,6 +51,7 @@ pub mod ssh_key_commands;
 pub mod state_commands;
 pub mod sync_commands;
 pub mod app_lock_commands;
+pub mod compat_commands;
 pub mod desktop_commands;
 pub mod system_commands;
 pub mod terminal_commands;

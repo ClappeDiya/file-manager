@@ -485,12 +485,18 @@ rclone receives option values on its command line while a remote is created or c
 
 ### Guided Wizards
 
-Simple mode provides step-by-step wizards for:
+Step-by-step wizards do the real work, each through the same commands as the full screens, and say what they did in the Activity feed. Simple mode lists them; in every mode the command palette has them all (search for the name, or "guided"):
 
-- Connect OneDrive / Google Drive / Dropbox (save, sign in, choose where it opens, check it by listing it) and Google Cloud Storage (HMAC keys, checked by listing the buckets)
-- Set up local sync
-- Connect to Windows Share (SMB)
-- Connect via SFTP
+- **Connect OneDrive / Google Drive / Dropbox** (save, sign in, choose where it opens, check it by listing it) and **Google Cloud Storage** (HMAC keys, checked by listing the buckets).
+- **Connect to Windows Share (SMB)** and **Connect via SFTP** - *Test Connection* saves the connection, signs in and lists the folder, so a wrong password or share name shows here; the connection is then in the Connection Manager. SFTP with *SSH Key* uses the keys your SSH agent holds.
+- **Set Up Local Sync** and **Create Sync Pair** - *Test Folders* checks both folders exist; the pair (one-way, two-way or mirror; manual, hourly, daily at 02:00 or real-time) appears in the Sync panel.
+- **Transfer Files** - copies or moves a file or folder (also to or from a connection, through the transfer queue); *Verify files after transfer* compares every copied file with its original by checksum.
+- **Resolve Interrupted Operation** - lists the paused and failed transfers; resume them (failed ones are retried from the saved progress) or cancel them.
+- **Fix File Name Issues** - checks a folder against where it is going (Windows, FAT32, macOS, OneDrive, Google Drive, Dropbox, S3, Backblaze B2…), lists the names that place cannot store with the suggested names, and renames the ones that can be fixed. **Restore Original Names** lists those renames and gives the files their original names back.
+- **Export Report** - saves the transfer history or the activity log as CSV or JSON, or the security audit log as signed JSON lines, where you choose.
+- **Send to Another Computer** and **Move to a New Computer** - pick a computer on this network running UFOP and the folders to send (or your Documents, Desktop, Pictures, Music, Videos, Downloads); the other computer approves the transfer.
+- **Copy to External Drive** - copies a folder onto an external drive after checking there is room. **Migrate Drive** copies everything from one drive into a folder of its own on another (nothing there is replaced) and, unless turned off, checks every file by checksum.
+- **Back Up Folder** - creates a backup job (encrypted with a passphrase unless you choose otherwise; now only, daily or weekly) and runs the first backup.
 
 ---
 

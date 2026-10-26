@@ -1,4 +1,5 @@
 import { t } from "@/lib/i18n";
+import { GUIDED_FLOW_IDS, GUIDED_FLOW_META } from "@/components/guided-flows/flow-meta";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useAiStore, type AiExecutionResult, type ParsedJobConfig } from "@/stores/ai-store";
@@ -775,6 +776,8 @@ export function getDefaultCommands(actions: {
   onNewWindow?: () => void;
   /** Show the lock screen in every window (when the app lock is on). */
   onLockApp?: () => void;
+  /** Start a guided wizard (`GUIDED_FLOW_IDS`). */
+  onOpenGuidedFlow?: (id: string) => void;
   /** Open the Connection Manager on its rclone remote manager. */
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
@@ -2045,6 +2048,23 @@ export function getDefaultCommands(actions: {
       ],
     },
   ];
+
+  // Every guided wizard, by name (Simple mode also lists them).
+  if (actions.onOpenGuidedFlow) {
+    const open = actions.onOpenGuidedFlow;
+    for (const id of GUIDED_FLOW_IDS) {
+      const meta = GUIDED_FLOW_META[id];
+      commands.push({
+        id: `guided-${id}`,
+        label: `${meta.label} (guided)`,
+        description: meta.description,
+        icon: <Sparkles className="h-4 w-4" />,
+        category: "Guided",
+        action: () => open(id),
+        keywords: ["wizard", "guided", "step by step", "help me", meta.category.toLowerCase()],
+      });
+    }
+  }
 
   // Inject the first nine bookmarks as their own palette entries so the
   // user can fuzzy-search them by name without remembering slot numbers.

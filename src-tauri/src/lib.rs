@@ -48,7 +48,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, app_lock_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, desktop_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
+use commands::{ai_commands, app_lock_commands, archive_commands, compat_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, desktop_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -753,6 +753,11 @@ pub fn run() {
             app_lock_commands::app_lock_now,
             app_lock_commands::app_lock_unlock,
             app_lock_commands::app_lock_activity,
+            compat_commands::compat_profiles,
+            compat_commands::compat_scan_folder,
+            compat_commands::compat_fix_names,
+            compat_commands::compat_list_renames,
+            compat_commands::compat_restore_names,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
