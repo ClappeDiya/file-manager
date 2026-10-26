@@ -372,13 +372,40 @@ pub fn connected_as<C: Connector + ?Sized>(connector: &C, id: Option<uuid::Uuid>
 /// Suffix of a file still being uploaded (`.<name>.ufop-part`).
 pub const STAGING_SUFFIX: &str = ".ufop-part";
 
+/// The longest file name most file systems take (bytes on ext4/APFS, UTF-16
+/// units on NTFS, which is never fewer).
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// The hidden staging name `.{name}{tail}` of a file, kept within
+/// [`MAX_NAME_BYTES`]: a name too long for it is cut (at a character) and a
+/// hash of the whole name added, so two long names never share one.
+pub fn staging_name(name: &str, tail: &str) -> String {
+    let full = format!(".{name}{tail}");
+    if full.len() <= MAX_NAME_BYTES {
+        return full;
+    }
+    let hash = format!("~{:016x}", xxhash_rust::xxh3::xxh3_64(name.as_bytes()));
+    let mut keep = MAX_NAME_BYTES.saturating_sub(1 + hash.len() + tail.len());
+    while !name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!(".{}{hash}{tail}", &name[..keep])
+}
+
 /// Where an upload to `remote` is written before it is renamed into place:
 /// a hidden sibling, so watchers and readers never see a half-written file.
 pub fn staging_path(remote: &str) -> String {
     match remote.rsplit_once('/') {
-        Some((dir, name)) => format!("{dir}/.{name}{STAGING_SUFFIX}"),
-        None => format!(".{remote}{STAGING_SUFFIX}"),
+        Some((dir, name)) => format!("{dir}/{}", staging_name(name, STAGING_SUFFIX)),
+        None => staging_name(remote, STAGING_SUFFIX),
     }
+}
+
+/// [`staging_path`] of a local file (with the platform's separator).
+pub fn staging_path_local(local: &str) -> String {
+    let p = std::path::Path::new(local);
+    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    p.with_file_name(staging_name(&name, STAGING_SUFFIX)).to_string_lossy().to_string()
 }
 
 /// Upload via a temporary name, then rename into place. If the rename
@@ -521,6 +548,21 @@ mod tests {
     fn staging_names() {
         assert_eq!(staging_path("/in/report.pdf"), "/in/.report.pdf.ufop-part");
         assert_eq!(staging_path("report.pdf"), ".report.pdf.ufop-part");
+    }
+
+    // Regression (WS-Z2): a name near the 255-byte limit got a staging name
+    // past it, so the upload (or download) failed with "name too long".
+    #[test]
+    fn staging_names_of_long_names_fit_and_stay_apart() {
+        let long = |c: char| format!("{}{c}.txt", "é".repeat(124));
+        let (a, b) = (long('a'), long('b'));
+        assert!(a.len() > 250);
+        let (sa, sb) = (staging_path(&format!("/in/{a}")), staging_path(&format!("/in/{b}")));
+        let name = |s: &str| s.rsplit('/').next().unwrap().to_string();
+        assert!(name(&sa).len() <= MAX_NAME_BYTES, "{}", name(&sa).len());
+        assert!(name(&sa).starts_with(".é") && name(&sa).ends_with(STAGING_SUFFIX));
+        assert_ne!(sa, sb, "two long names that differ at the end get their own staging file");
+        assert_eq!(staging_name("a.txt", ".x"), ".a.txt.x");
     }
 
     #[tokio::test]

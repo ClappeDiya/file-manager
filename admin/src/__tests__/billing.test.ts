@@ -16,8 +16,8 @@ import { createLink, registerWithToken } from '@/lib/db/repos/machines';
 import { listOutbox } from '@/lib/db/repos/outbox';
 import { createSession } from '@/lib/db/repos/sessions';
 import { billingAccount, setBillingProvider, trialEligible } from '@/lib/billing';
-import { trialDaysLeft, discountAmount, discountDuration, hasPaymentMethod, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
-import { DEFAULT_TRIAL_DAYS } from '@/lib/billing/config';
+import { checkoutNote, trialDaysLeft, discountAmount, discountDuration, hasPaymentMethod, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
+import { DEFAULT_TRIAL_DAYS, promotionCodesEnabled } from '@/lib/billing/config';
 import { StripeProvider } from '@/lib/billing/stripe';
 import { json, makeUser, req } from './helpers';
 import * as billing from '@/app/api/billing/route';
@@ -797,6 +797,39 @@ describe('billing: marketing copy', () => {
     const monthly = Number(business.price.slice(1));
     const yearly = Number(business.annualPrice!.slice(1));
     expect(yearly).toBeCloseTo(monthly * 12 * (1 - ANNUAL_DISCOUNT_PERCENT / 100), 2);
+  });
+});
+
+// Regression (WS-Z2): the billing page ignored the promotion-code setting it
+// is sent, so it never said a code can be entered (or that it cannot), and
+// the marketing FAQ's promise was not checked against the default.
+describe('billing: checkout note follows the configuration', () => {
+  it('mentions the trial and promotion codes only as configured', () => {
+    expect(checkoutNote({ days: 14, eligible: true }, true)).toBe('Your first subscription starts with a 14-day free trial; no card is needed to start. Have a promotion code? Enter it at checkout.');
+    expect(checkoutNote({ days: 30, eligible: true }, false)).toBe('Your first subscription starts with a 30-day free trial; no card is needed to start.');
+    expect(checkoutNote({ days: 0, eligible: true }, true)).toBe('Have a promotion code? Enter it at checkout.');
+    expect(checkoutNote({ days: 14, eligible: false }, false)).toBeNull();
+  });
+
+  it('the marketing FAQ mentions promotion codes only while checkout offers them by default', async () => {
+    const before = process.env.BILLING_ALLOW_PROMOTION_CODES;
+    delete process.env.BILLING_ALLOW_PROMOTION_CODES;
+    try {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const faq = fs.readFileSync(path.resolve(process.cwd(), '..', 'marketing', 'src/app/pricing/page.tsx'), 'utf8');
+      expect(/promotion code/i.test(faq)).toBe(promotionCodesEnabled());
+    } finally {
+      if (before !== undefined) process.env.BILLING_ALLOW_PROMOTION_CODES = before;
+    }
+  });
+
+  it('the billing page shows the note from the API, not its own copy', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const page = fs.readFileSync(path.resolve(process.cwd(), 'src/app/billing/page.tsx'), 'utf8');
+    expect(page).toMatch(/checkoutNote\(data\.trial, data\.promotionCodes\)/);
+    expect(page).not.toMatch(/day free trial; no card/);
   });
 });
 

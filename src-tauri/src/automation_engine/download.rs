@@ -160,7 +160,7 @@ pub async fn run(d: &Download) -> Result<PathBuf, String> {
         .or_else(|| url_name(&url))
         .unwrap_or_else(|| "download".into());
     let name = safe_file_name(&name).ok_or_else(|| format!("Invalid file name '{name}'"))?;
-    let temp = d.dest_dir.join(format!(".{name}.ufop-part"));
+    let temp = d.dest_dir.join(crate::connectors::staging_name(&name, crate::connectors::STAGING_SUFFIX));
     let mut resp = resp;
     let write = async {
         let mut f = tokio::fs::File::create(&temp).await.map_err(|e| format!("Cannot write {}: {e}", temp.display()))?;

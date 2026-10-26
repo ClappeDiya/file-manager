@@ -18,7 +18,7 @@ import { formatDate } from '@/lib/utils/format';
 import type { BillingAccount } from '@/lib/billing';
 import { ANNUAL_DISCOUNT_PERCENT, type BillingInterval } from '@/lib/billing/plans';
 import type { Invoice } from '@/lib/billing/provider';
-import { discountAmount, discountDuration, hasPaymentMethod, trialDaysLeft, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
+import { checkoutNote, discountAmount, discountDuration, hasPaymentMethod, trialDaysLeft, trialEndsPhrase, trialOutcome } from '@/lib/billing/trial';
 import type { License } from '@/lib/db/repos/orgs';
 
 interface PlanView {
@@ -148,8 +148,8 @@ export default function BillingPage() {
           </div>
         )}
       </div>
-      {data.configured && data.trial.eligible && data.plans.some((p) => p.purchasable) && (
-        <p className="mb-4 text-sm text-foreground-secondary">Your first subscription starts with a {data.trial.days}-day free trial; no card is needed to start.</p>
+      {data.configured && !subscribed && data.plans.some((p) => p.purchasable) && checkoutNote(data.trial, data.promotionCodes) && (
+        <p className="mb-4 text-sm text-foreground-secondary">{checkoutNote(data.trial, data.promotionCodes)}</p>
       )}
       <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
         {data.plans.map((plan) => {

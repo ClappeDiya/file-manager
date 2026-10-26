@@ -67,6 +67,20 @@ describe("rclone schema helpers", () => {
     expect(fieldValue(opt("p", { is_password: true, default: "d" }), {})).toBe("");
   });
 
+  // Regression (WS-Z2): clearing a field that has a default sent `key=`,
+  // which rclone stores as an empty setting in place of the default.
+  it("a cleared field means the default and is not written as an empty setting", () => {
+    const options = visibleOptions(S3, { provider: "AWS" }, true);
+    // Create: chunk_size cleared, access_key_id left blank.
+    expect(changedParams(options, { provider: "AWS", access_key_id: "", chunk_size: "" })).toEqual({ provider: "AWS" });
+    // Update: a stored chunk size cleared goes back to the default.
+    expect(changedParams(options, { provider: "AWS", chunk_size: "" }, { provider: "AWS", chunk_size: "64Mi" })).toEqual({ chunk_size: "5Mi" });
+    // Nothing stored and nothing typed: nothing sent.
+    expect(changedParams(options, { provider: "AWS", region: "" }, { provider: "AWS" })).toEqual({});
+    // A cleared required field with a default is filled by it.
+    expect(missingRequired([opt("bucket", { required: true, default: "main" })], { bucket: "" })).toEqual([]);
+  });
+
   it("reports missing required values (stored secrets count)", () => {
     const options = [opt("remote", { required: true }), opt("password", { required: true, is_password: true })];
     expect(missingRequired(options, {}).map((o) => o.name)).toEqual(["remote", "password"]);

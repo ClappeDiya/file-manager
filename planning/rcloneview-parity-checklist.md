@@ -44,8 +44,8 @@ A box is ticked only when the engine code, its wiring (IPC / CLI / UI) and its t
 - [x] G9 Multiple windows — New Window (Ctrl/⌘+N, palette, context menu, tray); own panes per window, shared settings follow; shutdown only with the last window
 
 ## Follow-ups (from the reviewers' notes; tracked separately)
-- [ ] WS-Z1 — 25 backend fixes, mostly data safety and security (e.g. SMB password visible in the process list on macOS/Windows; two-way sync deleting a file edited between planning and running; compare folder-delete race; purge step following symlinked parents; OAuth tokens lost on a badly timed network error). The full list is in the reviewers' notes, not in this repository.
-- [ ] WS-Z2 — 21 polish fixes (e.g. rclone forms writing empty settings; billing labels and promo-code mentions; address bar rejecting local paths with `:`; long remote file names failing to download; an interrupted cloud move returning as a copy after a restart; a gap in the log viewer's live tail). Full list as above.
+- [ ] WS-Z1 — 25 backend fixes, mostly data safety and security (e.g. SMB password visible in the process list on macOS/Windows; two-way sync deleting a file edited between planning and running; compare folder-delete race; purge step following symlinked parents; OAuth tokens lost on a badly timed network error). The full list is in the reviewers' notes, not in this repository. **Done in this repository: the five named examples (each with a regression test). The other 20 are not listed here; they need the reviewers' notes.**
+- [ ] WS-Z2 — 21 polish fixes (e.g. rclone forms writing empty settings; billing labels and promo-code mentions; address bar rejecting local paths with `:`; long remote file names failing to download; an interrupted cloud move returning as a copy after a restart; a gap in the log viewer's live tail). Full list as above. **Done in this repository: the seven named examples, risky-file types included (each with a regression test). The other 14 need the reviewers' notes.**
 
 ## Final verification (WS-G)
 - [ ] src-tauri `cargo test --lib`, `cargo clippy --all-targets -D warnings`

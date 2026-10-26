@@ -774,7 +774,9 @@ pub fn touched_by(plan: &ActionPlan) -> HashSet<String> {
 /// Tests: runs just before an empty local folder is removed (to put a file
 /// in it at the worst moment).
 #[cfg(test)]
-pub(crate) static BEFORE_EMPTY_FOLDER_DELETE: std::sync::Mutex<Option<Box<dyn Fn(&Path) + Send>>> = std::sync::Mutex::new(None);
+pub(crate) static BEFORE_EMPTY_FOLDER_DELETE: std::sync::Mutex<Option<FolderHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) type FolderHook = Box<dyn Fn(&Path) + Send>;
 
 #[cfg(test)]
 fn before_empty_folder_delete(path: &Path) {
