@@ -144,3 +144,15 @@ export function resolveParentFolderKey(e: KeyGesture, textEntryFocused: boolean)
   if (e.key === "ArrowUp" && !e.shiftKey && !e.ctrlKey && (e.altKey !== e.metaKey)) return true;
   return e.key === "Backspace" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
 }
+
+/** ⌘/Ctrl+N (no Shift: ⌘⇧N is New Folder) → New Window. */
+export function resolveNewWindowKey(e: KeyGesture, textEntryFocused: boolean): boolean {
+  if (textEntryFocused) return false;
+  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n";
+}
+
+/** Whether `el` is a text field (input, textarea, contenteditable). */
+export function isTextEntry(el: Element | null): boolean {
+  const h = el as HTMLElement | null;
+  return h?.tagName === "INPUT" || h?.tagName === "TEXTAREA" || h?.isContentEditable === true;
+}

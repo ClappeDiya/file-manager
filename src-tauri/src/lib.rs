@@ -737,6 +737,7 @@ pub fn run() {
             desktop_commands::set_startup_settings,
             desktop_commands::reset_settings,
             desktop_commands::detect_cloud_folders,
+            desktop_commands::open_new_window,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
@@ -1473,8 +1474,9 @@ pub fn run() {
         .on_window_event(move |window, event| {
             // "Keep running in the tray": closing hides the window so
             // scheduled backups continue.
+            // Other windows (File → New Window) just close.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window_startup.effective(close_mode.enabled()).close_to_tray {
+                if window.label() == "main" && window_startup.effective(close_mode.enabled()).close_to_tray {
                     api.prevent_close();
                     let _ = window.hide();
                     return;
@@ -1486,7 +1488,13 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
+            // The app ends with its last window: only then stop and persist.
             if let tauri::WindowEvent::Destroyed = event {
+                use tauri::Manager;
+                let open: Vec<String> = window.app_handle().webview_windows().keys().cloned().collect();
+                if !startup::is_last_window(window.label(), open.iter().map(String::as_str)) {
+                    return;
+                }
                 tracing::info!("Window closing, persisting state...");
                 // Running backups stop at a safe point (partial version,
                 // repository lock released) before the app exits.

@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capability set for the main application window",
-  "windows": ["main"],
+  "windows": ["main", "win-*"],
   "permissions": [
     "core:default",
     "shell:allow-open",

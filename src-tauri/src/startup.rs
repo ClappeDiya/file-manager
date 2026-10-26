@@ -140,9 +140,25 @@ pub fn launched_at_login() -> bool {
     std::env::args().any(|a| a == "--background")
 }
 
+/// Whether the window `closing` is the last one (`open`: the windows still
+/// listed, which may or may not include it).
+pub fn is_last_window<'a>(closing: &str, open: impl Iterator<Item = &'a str>) -> bool {
+    open.filter(|l| *l != closing).count() == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_app_ends_with_its_last_window() {
+        assert!(is_last_window("main", ["main"].into_iter()));
+        assert!(is_last_window("main", std::iter::empty()));
+        assert!(!is_last_window("win-1", ["main", "win-1"].into_iter()));
+        // The main window closed, another is still open: keep running.
+        assert!(!is_last_window("main", ["win-1"].into_iter()));
+        assert!(is_last_window("win-1", ["win-1"].into_iter()));
+    }
 
     fn settings(f: impl FnOnce(&mut StartupSettings)) -> StartupSettings {
         let mut s = StartupSettings::new(StartupPrefs::default(), false, false);

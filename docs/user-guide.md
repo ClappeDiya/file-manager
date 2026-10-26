@@ -132,6 +132,10 @@ Files can be displayed in four modes (set per pane in Advanced mode):
 - **Cloud folders** - Folders that a cloud service's own app keeps in sync on this computer are listed in the sidebar and open like any local folder: Dropbox (personal and business, also when moved), OneDrive (personal and work accounts), Google Drive for desktop, iCloud Drive, Box, pCloud Drive, MEGA, Nextcloud and ownCloud (every sync folder in the client's settings), Synology Drive and Proton Drive. They are found from the apps' own settings and default folders (on macOS, `~/Library/CloudStorage`); UFOP does not contact the services. The list refreshes every few minutes and the section is hidden when none is found.
 - **Recent Locations** - The last 20 visited paths are remembered
 
+### Several windows
+
+**New Window** (**Ctrl+N**, **⌘N** on macOS; command palette; tray menu) opens another window at the active pane's folder, and **Open in New Window** in a folder's context menu opens that folder. Each window has its own panes, tabs and layout; favorites, recent places, saved searches, workspaces and every setting are shared, and a change made in one window (theme, accent colour, language, a new favorite) shows in the others. The first window keeps its layout for the next start. Closing another window just closes it; *Keep running in the tray* applies to the first window, and the app stops (running backups end at a safe point) only when its last window closes.
+
 ### Selection
 
 - Click to select a single file

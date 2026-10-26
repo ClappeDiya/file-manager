@@ -22,6 +22,7 @@ import {
   Calculator,
   ExternalLink,
   ArrowLeftRight,
+  AppWindow,
   GitBranch,
   Lock,
   Link,
@@ -336,6 +337,8 @@ export function getFileContextMenuItems(options: {
   onCompareFiles?: () => void;
   onExplainError?: () => void;
   onOpenInTerminal?: () => void;
+  /** Folders: open in another app window. */
+  onOpenInNewWindow?: () => void;
   onGitAdd?: () => void;
   onGitCommit?: () => void;
   onSetPermissions?: () => void;
@@ -475,6 +478,15 @@ export function getFileContextMenuItems(options: {
         icon: <ArrowLeftRight className="h-3.5 w-3.5" />,
         shortcut: `${cmdKey}=`,
         action: options.onCompareFiles,
+      });
+    }
+
+    if (options.onOpenInNewWindow && options.isDirectory && options.selectionCount <= 1) {
+      items.push({
+        id: "open-in-new-window",
+        label: t("fileManager.openInNewWindow"),
+        icon: <AppWindow className="h-3.5 w-3.5" />,
+        action: options.onOpenInNewWindow,
       });
     }
 

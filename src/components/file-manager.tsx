@@ -53,7 +53,8 @@ import {
 import { archiveExtractDest } from "@/lib/archive-paths";
 import { pickFolder } from "@/lib/folder-picker";
 import { planPaneCopy, awaitPaneCopyJobs } from "@/lib/pane-copy";
-import { resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveParentFolderKey } from "@/lib/file-action-keys";
+import { isTextEntry, resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveNewWindowKey, resolveParentFolderKey } from "@/lib/file-action-keys";
+import { isSecondaryWindow, openNewWindow } from "@/lib/app-window";
 import {
   useDriveSpace,
   useAllDrives,
@@ -1836,6 +1837,12 @@ export function FileManager() {
           store.jumpToFavoriteByIndex(store.activePaneIndex, index);
         }
       }
+      // Cmd/Ctrl+N: a new window at the active pane's folder (⌘⇧N stays New Folder).
+      if (resolveNewWindowKey(e, isTextEntry(document.activeElement))) {
+        e.preventDefault();
+        const fm = useFileManagerStore.getState();
+        void openNewWindow(fm.getActivePath(fm.singlePaneMode ? 0 : fm.activePaneIndex)).catch((err) => console.error("New window failed:", err));
+      }
       // Cmd+[ or Alt+ArrowLeft to navigate back
       if (
         ((e.metaKey || e.ctrlKey) && e.key === "[") ||
@@ -1866,6 +1873,8 @@ export function FileManager() {
   // "last seen" marker. Zero value shown on fresh installs.
   const [sinceSummary, setSinceSummary] = useState<LedgerSinceSummary | null>(null);
   useEffect(() => {
+    // Once per session: a second window does not consume the marker.
+    if (isSecondaryWindow()) return;
     let cancelled = false;
     (async () => {
       const summary = await tauriInvokeSafe<LedgerSinceSummary | null>(
@@ -2259,6 +2268,10 @@ export function FileManager() {
         },
         onEditAddress: () => {
           window.dispatchEvent(new CustomEvent(EDIT_ADDRESS_EVENT, { detail: { paneIndex: useFileManagerStore.getState().activePaneIndex } }));
+        },
+        onNewWindow: () => {
+          const fm = useFileManagerStore.getState();
+          void openNewWindow(fm.getActivePath(fm.singlePaneMode ? 0 : fm.activePaneIndex)).catch((e) => console.error("New window failed:", e));
         },
         onGoToParentFolder: () => {
           const fm = useFileManagerStore.getState();
@@ -5166,6 +5179,7 @@ function FilePane({
           aiStore.explainError("file_operation", `Operation on ${entry.name}`, "Check file permissions and try again");
           aiStore.setPanelOpen(true);
         },
+        onOpenInNewWindow: entry.is_dir ? () => void openNewWindow(entry.path).catch((e) => console.error("New window failed:", e)) : undefined,
         onOpenInTerminal: entry.is_dir
           ? () => {
               const termStore = useTerminalStore.getState();

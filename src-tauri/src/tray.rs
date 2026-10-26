@@ -196,7 +196,8 @@ fn handle_mount_click(app: &AppHandle, action: MountAction) {
 }
 
 fn show_main(app: &AppHandle) {
-    if let Some(w) = app.webview_windows().values().next() {
+    let windows = app.webview_windows();
+    if let Some(w) = windows.get("main").or_else(|| windows.values().next()) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -216,6 +217,7 @@ pub fn run_all_summary(r: &crate::backup_engine::runs::RunAllReport) -> String {
 /// The tray items whose text follows the app's language.
 pub struct TrayMenuItems {
     open: MenuItem<tauri::Wry>,
+    new_window: MenuItem<tauri::Wry>,
     backups: MenuItem<tauri::Wry>,
     run_all: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
@@ -229,6 +231,7 @@ impl TrayMenuItems {
     pub fn relabel(&self) {
         let t = crate::tray_labels::current();
         let _ = self.open.set_text(t.open);
+        let _ = self.new_window.set_text(t.new_window);
         let _ = self.backups.set_text(t.backups);
         let _ = self.run_all.set_text(t.run_all);
         let _ = self.pause.set_text(t.pause);
@@ -252,6 +255,7 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     // Shown only while a sync pair or automation rule has a schedule.
     let next_item = MenuItem::with_id(app, "next_other", "", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", text.open, true, None::<&str>)?;
+    let new_window = MenuItem::with_id(app, "new_window", text.new_window, true, None::<&str>)?;
     let backups = MenuItem::with_id(app, "backups", text.backups, true, None::<&str>)?;
     let run_all = MenuItem::with_id(app, "run_all", text.run_all, true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", text.pause, true, None::<&str>)?;
@@ -261,14 +265,22 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     rebuild_mounts_submenu(app.handle(), &mounts_menu, &MountsMenu::default())?;
     let menu = Menu::with_items(
         app,
-        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &backups, &mounts_menu, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &quit],
+        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &new_window, &backups, &mounts_menu, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &quit],
     )?;
     let m2 = mgr.clone();
     let mut builder = TrayIconBuilder::with_id("ufop").tooltip("UFOP").menu(&menu).show_menu_on_left_click(true).on_menu_event(move |app, ev| match ev.id().as_ref() {
         "open" => show_main(app),
+        "new_window" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::commands::desktop_commands::open_new_window(None, app).await {
+                    tracing::warn!("New window: {}", e.user_message());
+                }
+            });
+        }
         "backups" => {
             show_main(app);
-            let _ = app.emit(OPEN_BACKUPS_EVENT, ());
+            let _ = app.emit_to("main", OPEN_BACKUPS_EVENT, ());
         }
         "run_all" => {
             let m = m2.clone();
@@ -292,7 +304,7 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
-    app.manage(TrayMenuItems { open, backups, run_all, pause: pause.clone(), resume: resume.clone(), quit, mounts: mounts_menu.clone() });
+    app.manage(TrayMenuItems { open, new_window, backups, run_all, pause: pause.clone(), resume: resume.clone(), quit, mounts: mounts_menu.clone() });
     spawn_mounts_menu(app.handle().clone(), mounts_menu);
 
     // Refresh the status lines and tooltip.

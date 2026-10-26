@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Interface (WS-G, RcloneView parity)**:
+  - **Several windows** (`open_new_window`; Ctrl/⌘+N, palette *New Window*, folder context menu *Open in New Window*, tray *New window*): each window has its own panes and tabs (`windowScopedStorage` keeps them out of the shared copy), shares favorites, recents, workspaces and settings, and follows changes made in the others (`storage` events, re-read on focus). Capabilities cover `win-*` windows; the portable data store applies to every window.
   - **Cloud folders in the sidebar** (`detect_cloud_folders`, `cloud_folders`): local folders synced by Dropbox (`info.json`, personal/business/team), OneDrive (`OneDrive*` variables, CloudStorage), Google Drive (CloudStorage `My Drive`, Windows drive letter), iCloud Drive, Box, pCloud, MEGA, Nextcloud/ownCloud (`localPath` entries of the client `.cfg`), Synology Drive and Proton Drive; existing folders only, each once.
   - **Reset settings** (Settings → Reset, palette *Reset Settings…*; `reset_settings`): appearance and layout, startup/tray/notifications, sync and transfer defaults, and the welcome tour, each optional, after a confirmation; only listed preference keys are removed (`reset::ResetScope::keys`) and the running app takes the defaults at once; data, saved passwords and integrations are kept; audited.
   - **Startup & Tray** (Settings; `get_startup_settings` / `set_startup_settings`): start at login (optionally in the tray), start minimised, minimise to the tray, close to the tray (the Backups screen's setting) and show/hide the tray icon; without a tray icon (hidden, or the desktop has none) nothing hides the window (`startup::effective`).
@@ -162,6 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The window `Destroyed` handler stopped backups and saved the queue whenever any window closed; with several windows it now runs only when the last one closes, and the tray's *Backups…* opens the Backups screen in the first window only.
 - Choosing English on a computer set to another language did not stick: English counted as "no choice", so the computer's language came back at the next start. The choice is now stored as such (persisted state v1; an older non-English choice is kept).
 - The parent of a Windows folder directly on a drive (`C:\Users`) was `C:` (that drive's current folder) instead of `C:\`, and the parent of OneDrive's root (`/drive/root:`) was `/drive`, which cannot be listed; both now stop at the root.
 

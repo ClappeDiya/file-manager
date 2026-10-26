@@ -44,6 +44,7 @@ import {
   ArrowRight,
   ArrowLeftRight,
   FolderUp,
+  AppWindow,
   Shield,
   Filter,
   FolderSync,
@@ -769,6 +770,8 @@ export function getDefaultCommands(actions: {
   /** Turn the active pane's breadcrumb into the editable address field. */
   onEditAddress?: () => void;
   onGoToParentFolder?: () => void;
+  /** Open another app window at the active pane's folder. */
+  onNewWindow?: () => void;
   /** Open the Connection Manager on its rclone remote manager. */
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
@@ -1522,6 +1525,16 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: actions.onEditAddress || (() => {}),
       keywords: ["address", "path", "go to", "location", "breadcrumb", "type path", "cloud", "connection"],
+    },
+    {
+      id: "new-window",
+      label: "New Window",
+      description: "Open another UFOP window at the active pane's folder (each window has its own panes and tabs)",
+      icon: <AppWindow className="h-4 w-4" />,
+      shortcut: `${cmd}N`,
+      category: "Navigation",
+      action: actions.onNewWindow || (() => {}),
+      keywords: ["window", "new window", "another window", "second window", "multiple windows", "open window"],
     },
     {
       id: "go-to-parent-folder",

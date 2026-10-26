@@ -283,10 +283,11 @@ macro; if you add a new one here, register it there too.
 - `list_custom_commands`
 - `save_custom_command`
 
-## `desktop_commands` (5 commands)
+## `desktop_commands` (6 commands)
 
 - `detect_cloud_folders`
 - `get_startup_settings`
+- `open_new_window`
 - `reset_settings`
 - `set_startup_settings`
 - `set_ui_language`
@@ -869,4 +870,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 677 commands across 59 modules.
+**Surface:** 678 commands across 59 modules.
