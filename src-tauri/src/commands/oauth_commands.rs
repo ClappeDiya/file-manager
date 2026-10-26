@@ -76,6 +76,17 @@ async fn oauth_profile(manager: &ConnectionManager, connection_id: &str) -> Resu
     Ok((profile, provider))
 }
 
+/// A sign-in with your own app: remember it, so the next sign-in uses it too.
+fn remember_own_app(profile: &mut ConnectionProfile, provider: OAuthProvider, grant: &OAuthGrant) {
+    if let OAuthGrant::Token { client_id: Some(id), .. } = grant {
+        let builtin = provider.builtin_client().map(|(b, _)| b);
+        if builtin.as_deref() != Some(id.as_str()) {
+            let o = profile.extras.oauth.get_or_insert_with(OAuthSettings::default);
+            o.client_id = Some(id.clone());
+        }
+    }
+}
+
 /// Check `grant` by connecting with it, then store it (with the tokens the
 /// connect may have renewed) as the connection's credential. Nothing is
 /// stored when the service refuses it.
@@ -90,23 +101,17 @@ pub async fn finish_sign_in(manager: &ConnectionManager, cloud: &CloudConnectors
         }
         // Anything else (no network, a server error) says nothing about the
         // tokens, and the code they came from cannot be used again: keep them.
+        remember_own_app(&mut profile, provider, &grant);
         manager.save_connection(profile, Some(grant.to_json()?)).await?;
         return Ok(OAuthSignedIn {
             connection_id: connection_id.to_string(),
             provider,
             account: None,
-            warning: Some(format!("Signed in, but the service could not be reached to check it ({}). It connects once the service answers.", e.user_message())),
+            warning: Some(format!("Signed in, but connecting to check it failed ({}). The sign-in is kept; it is used at the next connect.", e.user_message())),
         });
     }
     let stored = cloud.grant(provider).await.unwrap_or(grant);
-    // A sign-in with your own app: remember it, so the next sign-in uses it too.
-    if let OAuthGrant::Token { client_id: Some(id), .. } = &stored {
-        let builtin = provider.builtin_client().map(|(b, _)| b);
-        if builtin.as_deref() != Some(id.as_str()) {
-            let o = profile.extras.oauth.get_or_insert_with(OAuthSettings::default);
-            o.client_id = Some(id.clone());
-        }
-    }
+    remember_own_app(&mut profile, provider, &stored);
     // Saving stores the credential and clears any credentials-rejected flag.
     manager.save_connection(profile, Some(stored.to_json()?)).await?;
     Ok(OAuthSignedIn { connection_id: connection_id.to_string(), provider, account: cloud.account(provider), warning: None })

@@ -1584,6 +1584,12 @@ mod tests {
         assert!(!compare_engine::apply::is_staging("/b/.x.txt.ufop-compare-notahex!"));
         assert!(!compare_engine::apply::is_staging("/b/x.txt.ufop-compare-0a1b2c3d"), "not hidden");
         assert!(compare_engine::apply::is_staging("C:\\b\\.x.ufop-compare-0A1B2C3D"));
+        // Review: a long name's staging file stays within 255 bytes and is
+        // still recognised as staging.
+        let long = std::path::PathBuf::from("/b").join(format!("{}.txt", "y".repeat(248)));
+        let staging = compare_engine::apply::staging_for(&long);
+        assert!(staging.file_name().unwrap().len() <= 255, "{}", staging.display());
+        assert!(compare_engine::apply::is_staging(&staging.to_string_lossy()));
     }
 
     /// The stored rclone settings become the ones every rclone call uses.

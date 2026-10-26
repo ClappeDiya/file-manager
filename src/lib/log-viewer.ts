@@ -87,7 +87,8 @@ export async function fetchTail(
     const page = await query({ ...filtersQuery, limit, ...(since ? { since } : {}), ...(cursor ? { cursor } : {}) });
     records.push(...page.records);
     // Without a starting point (an empty view), one page is enough.
-    if (!since || !page.next_cursor || page.records.length < limit) return { records, complete: true };
+    // A short page is the end, unless the scan budget cut it short.
+    if (!since || !page.next_cursor || (page.records.length < limit && !page.scan_limited)) return { records, complete: true };
     cursor = page.next_cursor;
   }
   return { records, complete: false };

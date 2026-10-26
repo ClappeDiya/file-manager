@@ -777,13 +777,13 @@ impl Connector for SmbConnector {
             let (plan, mount_point, share_name) = self.mount_command_for(&profile, secret.as_deref()).await?;
             let host = profile.host.clone();
 
-            // Create mount point directory
-            tokio::fs::create_dir_all(&mount_point).await.map_err(|e| {
-                AppError::Connection {
+            // Create mount point directory (Windows reads through the UNC path).
+            if !matches!(plan, MountPlan::WNet { .. }) {
+                tokio::fs::create_dir_all(&mount_point).await.map_err(|e| AppError::Connection {
                     message: format!("Failed to create mount point: {e}"),
                     advice: "Check file permissions.".to_string(),
-                }
-            })?;
+                })?;
+            }
 
             let mp = mount_point.clone();
             let root = tokio::task::spawn_blocking(move || Self::execute(&plan, &mp))
@@ -965,14 +965,12 @@ impl MountPlan {
     }
 }
 
-/// URL-encode a string for SMB URLs.
+/// Percent-encode a string for an SMB URL: every byte outside RFC 3986's
+/// unreserved set (so `#`, `?` and non-ASCII names stay part of the share).
 fn urlencoded(s: &str) -> String {
-    s.replace('%', "%25")
-        .replace(' ', "%20")
-        .replace('@', "%40")
-        .replace(':', "%3A")
-        .replace('/', "%2F")
-        .replace('\\', "%5C")
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
 }
 
 /// Detect if a hostname appears to be a NAS device.
@@ -1228,6 +1226,12 @@ mod tests {
         assert_eq!(urlencoded("user@domain"), "user%40domain");
         assert_eq!(urlencoded("pass word"), "pass%20word");
         assert_eq!(urlencoded("admin"), "admin");
+        // Review: `#`/`?` cut the URL short (another share was mounted) and
+        // non-ASCII names made an invalid URL on macOS.
+        assert_eq!(urlencoded("Données #1?"), "Donn%C3%A9es%20%231%3F");
+        // Review: the native sign-in errors must still read as refused
+        // credentials (no retry, connection flagged).
+        assert!(smb_credentials_rejected(super::super::smb_native::CREDENTIALS_REFUSED));
     }
 
     #[test]

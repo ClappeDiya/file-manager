@@ -1024,12 +1024,20 @@ impl ListedNames {
 /// Folders, and entries the plan has no size for, are not compared.
 fn unchanged_since_plan(path: &Path, size: Option<u64>, modified: Option<DateTime<Utc>>, rel_path: &str) -> Result<(), AppError> {
     let Some(size) = size else { return Ok(()) };
-    let Ok(meta) = fs::symlink_metadata(path) else { return Ok(()) };
-    if meta.is_dir() {
-        return Ok(());
+    // The plan saw a link itself or (followed, the default) its target.
+    let seen = [fs::symlink_metadata(path), fs::metadata(path)];
+    let mut any = false;
+    for meta in seen.into_iter().flatten() {
+        any = true;
+        if meta.is_dir() {
+            return Ok(());
+        }
+        let now_modified = meta.modified().ok().map(DateTime::<Utc>::from);
+        if meta.len() == size && (modified.is_none() || now_modified == modified) {
+            return Ok(());
+        }
     }
-    let now_modified = meta.modified().ok().map(DateTime::<Utc>::from);
-    if meta.len() == size && (modified.is_none() || now_modified == modified) {
+    if !any {
         return Ok(());
     }
     Err(AppError::Sync {
@@ -1095,7 +1103,11 @@ fn execute_single_operation(
         "delete" => {
             if dest_file.exists() {
                 listed.check_delete(&dest_file, &entry.relative_path)?;
-                unchanged_since_plan(&dest_file, entry.dest_size, entry.dest_modified, &entry.relative_path)?;
+                // A one-way trusted inventory holds the source's times, not
+                // the destination's (which may not keep them exactly): size only.
+                let inventory_times = pair.dest_state == DestStateMode::TrustedInventory && pair.mode != SyncMode::TwoWay;
+                let planned = if inventory_times { None } else { entry.dest_modified };
+                unchanged_since_plan(&dest_file, entry.dest_size, planned, &entry.relative_path)?;
                 // Take pre-destructive snapshot
                 rollback.snapshot_file(&entry.relative_path, &dest_file)?;
 
@@ -2977,6 +2989,51 @@ mod tests {
         assert_eq!(out.report.files_deleted, 1);
         assert_eq!(out.report.errors, 1);
         assert!(out.report.error_messages.iter().any(|m| m.contains("x.txt") && m.contains("changed")), "{:?}", out.report.error_messages);
+    }
+
+    // Review of the change above: the planner records a followed link's
+    // target (the default symlink mode), so the check must not compare the
+    // link itself, or the link is never deleted and errs every run.
+    #[cfg(unix)]
+    #[test]
+    fn mirror_still_deletes_an_extra_linked_file() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        for k in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(src.path().join(k), "kept").unwrap();
+        }
+        fs::write(elsewhere.path().join("t.txt"), "a longer target file").unwrap();
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+        execute_sync(&cfg(pair.clone())).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("t.txt"), dst.path().join("extra.txt")).unwrap();
+        let r = execute_sync(&cfg(pair)).unwrap();
+        assert_eq!(r.errors, 0, "{:?}", r.error_messages);
+        assert!(fs::symlink_metadata(dst.path().join("extra.txt")).is_err(), "the extra link is removed");
+        assert!(elsewhere.path().join("t.txt").exists(), "its target is not");
+    }
+
+    // Review of the change above: a trusted inventory records the source's
+    // times as the destination's; a destination that does not keep times
+    // exactly (FAT, some NAS) then never matched, so a file removed from the
+    // source stayed at the destination and the run failed every time.
+    #[test]
+    fn trusted_inventory_mirror_deletes_despite_other_destination_times() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        for k in ["a.txt", "b.txt", "c.txt", "gone.txt"] {
+            fs::write(src.path().join(k), k).unwrap();
+        }
+        let mut pair = make_test_pair(src.path(), dst.path());
+        pair.mode = SyncMode::Mirror;
+        pair.dest_state = DestStateMode::TrustedInventory;
+        execute_sync(&cfg(pair.clone())).unwrap();
+        set_age_days(&dst.path().join("gone.txt"), 1);
+        fs::remove_file(src.path().join("gone.txt")).unwrap();
+        let r = execute_sync(&cfg(pair)).unwrap();
+        assert_eq!(r.errors, 0, "{:?}", r.error_messages);
+        assert!(!dst.path().join("gone.txt").exists());
     }
 
     /// Regression (review): the baseline was read from both sides after the

@@ -29,6 +29,9 @@ const TAIL_MS = 1500;
 const field = "text-xs px-2 py-1 rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900";
 const btn = "text-xs px-2 py-1 rounded border border-zinc-300 dark:border-zinc-600 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50";
 
+/** Shown once the live tail had to skip lines; a reload clears it. */
+const TAIL_GAP = "More lines arrived than the live tail reads at once; some were skipped. Reload to see them all.";
+
 export function LogViewer({ onClose, listHeight = 420, tailMs = TAIL_MS }: { onClose?: () => void; listHeight?: number; tailMs?: number }) {
   const [filters, setFilters] = useState<LogFilters>(NO_FILTERS);
   const [settledText, setSettledText] = useState("");
@@ -110,7 +113,8 @@ export function LogViewer({ onClose, listHeight = 420, tailMs = TAIL_MS }: { onC
         const tail = await fetchTail((q) => tauriInvoke<LogPage>("query_logs", { query: q }), logQuery(effective).query, newest?.ts ?? null, PAGE);
         if (mine !== generation.current) return;
         setRecords((prev) => mergeTail(prev, tail.records));
-        setError(tail.complete ? null : "More lines arrived than the live tail reads at once; some were skipped. Reload to see them all.");
+        // The gap note stays until a reload fills the gap.
+        setError((prev) => (tail.complete ? (prev === TAIL_GAP ? prev : null) : TAIL_GAP));
       } catch (e) {
         setError(errorText(e));
       }

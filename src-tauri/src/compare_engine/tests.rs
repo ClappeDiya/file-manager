@@ -936,7 +936,13 @@ async fn a_file_put_in_a_folder_while_it_is_deleted_is_kept() {
     let entries = compare(&left, &right, &CompareOptions::default()).await.entries;
     let (tm, ledger) = env_parts().await;
     let plan = plan_action(&entries, &["emptied".to_string()], CompareAction::DeleteLeft);
-    *apply::BEFORE_EMPTY_FOLDER_DELETE.lock().unwrap() = Some(Box::new(|dir: &std::path::Path| std::fs::write(dir.join("new.txt"), "saved just now").unwrap()));
+    // Only this test's folder: other tests delete empty folders meanwhile.
+    let mine = l.path().join("emptied");
+    *apply::BEFORE_EMPTY_FOLDER_DELETE.lock().unwrap() = Some(Box::new(move |dir: &std::path::Path| {
+        if dir == mine {
+            std::fs::write(dir.join("new.txt"), "saved just now").unwrap();
+        }
+    }));
     let cancel = CancellationToken::new();
     let progress = no_progress();
     let env = ApplyEnv { transfer: &tm, ledger: &ledger, permanent: true, cancel: &cancel, progress: &progress, task_id: "t" };

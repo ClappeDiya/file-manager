@@ -225,6 +225,18 @@ describe("live tail without gaps", () => {
     expect(asked.every((q) => q.since === rec(2).ts && q.level === "INFO")).toBe(true);
   });
 
+  // Review: a short page that ran out of scan budget still has more behind it.
+  it("keeps going after a page cut short by the scan budget", async () => {
+    const pages: LogPage[] = [
+      { records: [rec(9)], next_cursor: "scan@1", sources: [], scan_limited: true, directory: "" },
+      { records: [rec(5), rec(4)], next_cursor: null, sources: [], scan_limited: false, directory: "" },
+    ];
+    let n = 0;
+    const tail = await fetchTail(async () => pages[n++], { level: "ERROR" }, rec(3).ts, 3);
+    expect(tail.records.map((r) => r.message)).toEqual(["line 9", "line 5", "line 4"]);
+    expect(tail.complete).toBe(true);
+  });
+
   it("stops after a bound and says lines were skipped", async () => {
     const query = async (q: Record<string, unknown>): Promise<LogPage> => ({ records: [rec(Number(q.cursor ?? 100) - 1)], next_cursor: String(Number(q.cursor ?? 100) - 1), sources: [], scan_limited: false, directory: "" });
     const tail = await fetchTail(query, {}, rec(0).ts, 1, 4);

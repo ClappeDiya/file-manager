@@ -517,6 +517,9 @@ async fn a_network_error_after_sign_in_keeps_the_tokens() {
     let cloud = CloudConnectors { gdrive: &gd, dropbox: &db, onedrive: &od };
     let grant = OAuthGrant::parse(r#"{"access_token":"a1","refresh_token":"r1","client_id":"c","expires_at":"2999-01-01T00:00:00Z"}"#).unwrap();
     let signed = finish_sign_in(&e.mgr, &cloud, p.id, grant).await.expect("signed in although the service was not reachable");
-    assert!(signed.warning.as_deref().is_some_and(|w| w.contains("could not be reached")), "{:?}", signed.warning);
+    assert!(signed.warning.as_deref().is_some_and(|w| w.contains("sign-in is kept")), "{:?}", signed.warning);
     assert!(matches!(e.stored_grant(&p).await, OAuthGrant::Token { token, .. } if token.refresh_token.as_deref() == Some("r1")));
+    // Review: the custom app the sign-in used is remembered here too.
+    let saved = e.mgr.get_connection(p.id).await.unwrap().unwrap();
+    assert_eq!(saved.extras.oauth.and_then(|o| o.client_id).as_deref(), Some("c"));
 }

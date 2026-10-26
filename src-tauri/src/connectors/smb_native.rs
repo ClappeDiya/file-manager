@@ -3,6 +3,10 @@
 //! line (`ps`, Task Manager, process auditing). Linux keeps `mount.cifs`
 //! with the password in its environment (`PASSWD`).
 
+/// The error for refused credentials (worded so `smb_credentials_rejected`
+/// recognises it: no retry, the connection is flagged).
+pub const CREDENTIALS_REFUSED: &str = "Logon failure: the server refused the user name or password";
+
 /// macOS: mount `url` (`smb://host/share`) at `mount_dir` with NetFS.
 #[cfg(target_os = "macos")]
 pub fn netfs_mount(url: &str, mount_dir: &std::path::Path, user: Option<&str>, password: Option<&str>, guest: bool) -> Result<(), String> {
@@ -72,7 +76,7 @@ pub fn netfs_mount(url: &str, mount_dir: &std::path::Path, user: Option<&str>, p
     }
     match rc {
         0 => Ok(()),
-        80 | 1 | 13 => Err("The server refused the user name or password".into()),
+        80 | 1 | 13 => Err(CREDENTIALS_REFUSED.into()),
         n => Err(format!("NetFS error {n} ({})", std::io::Error::from_raw_os_error(n))),
     }
 }
@@ -107,25 +111,10 @@ pub fn wnet_connect(remote: &str, user: Option<&str>, password: Option<&str>) ->
     };
     match rc {
         0 => Ok(()),
-        // Already connected with these credentials.
+        // ERROR_SESSION_CREDENTIAL_CONFLICT: connected as another user.
         1219 => Err("Windows is already connected to this server with another user name; disconnect it first (net use)".into()),
-        86 | 1326 => Err("The server refused the user name or password".into()),
+        86 | 1326 => Err(CREDENTIALS_REFUSED.into()),
         n => Err(format!("Windows error {n} ({})", std::io::Error::from_raw_os_error(n as i32))),
-    }
-}
-
-/// Windows: end the session's connection to `remote`.
-#[cfg(windows)]
-pub fn wnet_disconnect(remote: &str) -> Result<(), String> {
-    use windows_sys::Win32::NetworkManagement::WNet::WNetCancelConnection2W;
-    let remote_w = wide(remote);
-    // SAFETY: NUL-terminated string valid for the call.
-    let rc = unsafe { WNetCancelConnection2W(remote_w.as_ptr(), 0, 1) };
-    if rc == 0 || rc == 2250 {
-        // 2250: not connected (already gone).
-        Ok(())
-    } else {
-        Err(format!("Windows error {rc} ({})", std::io::Error::from_raw_os_error(rc as i32)))
     }
 }
 

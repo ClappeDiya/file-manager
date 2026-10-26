@@ -25,7 +25,8 @@
 //! - Local deletes go through the file manager's own delete (Trash unless
 //!   permanent, and not on Windows yet); connection deletes through the
 //!   connector's remove, which most protocols cannot undo. A folder is
-//!   removed only once nothing is left in it.
+//!   removed only once nothing is left in it (a local one atomically, so
+//!   never to the Trash: it is empty).
 //!
 //! Everything is recorded in the operation ledger. Local copies of new files
 //! and local folders created are recorded as `fs` copy / create-folder
@@ -369,10 +370,10 @@ async fn remote_exists(target: &ResolvedSide, rel: &str, cache: &mut HashMap<Str
 const STAGING_MARK: &str = ".ufop-compare-";
 
 /// Hidden sibling a local copy is written to before it is moved into place.
-fn staging_for(dest: &Path) -> PathBuf {
+pub(crate) fn staging_for(dest: &Path) -> PathBuf {
     let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
-    dest.with_file_name(format!(".{name}{STAGING_MARK}{tag}"))
+    dest.with_file_name(crate::connectors::staging_name(&name, &format!("{STAGING_MARK}{tag}")))
 }
 
 /// Whether `path` is a staging file of a local copy
@@ -623,10 +624,13 @@ async fn delete_dir(target: &ResolvedSide, rel: &str, env: &ApplyEnv<'_>) -> Res
             // `remove_dir` removes the folder only while it is empty, in one
             // step: a file saved into it meanwhile keeps the folder (a check
             // first and a recursive delete after could take that file along).
+            // So an empty folder is removed, not moved to the Trash, even
+            // without "permanent": it holds nothing to restore, and the Trash
+            // has no "only if empty" move.
             match std::fs::remove_dir(&path) {
                 Ok(()) => {
                     let id = uuid::Uuid::new_v4().to_string();
-                    record_fs_ok(env.ledger, "delete", &[path.to_string_lossy().to_string()], &[], &id).await;
+                    record_fs_ok(env.ledger, "delete_permanent", &[path.to_string_lossy().to_string()], &[], &id).await;
                     Ok(true)
                 }
                 Err(e) => {
