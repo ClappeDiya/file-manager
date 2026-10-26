@@ -206,8 +206,8 @@ pub struct TransferManager {
     /// locations; set once at start-up (both init paths).
     resolver: Arc<std::sync::RwLock<Option<Arc<dyn location::RemoteResolver>>>>,
 
-    /// Pane moves in flight (in memory: after a restart the restored jobs
-    /// are plain copies and the originals are kept).
+    /// Pane moves in flight (saved with the queue at exit, see
+    /// [`Self::snapshot_moves`], so a restored job still finishes its move).
     moves: Arc<Mutex<MoveBook>>,
 
     /// Transfer slots per saved connection for location jobs (see
@@ -295,6 +295,34 @@ impl TransferManager {
             book.by_job.insert(*job, group);
         }
         book.groups.insert(group, location::MoveGroup { pending: jobs.into_iter().collect(), source_dirs, incomplete: false });
+    }
+
+    /// The moves not finished yet (saved with the queue at exit).
+    pub async fn snapshot_moves(&self) -> Vec<location::MoveGroup> {
+        self.moves.lock().await.groups.values().cloned().collect()
+    }
+
+    /// Moves saved by the last session (after [`Self::restore_jobs`]): each
+    /// job still in the queue finishes its move. A job that is gone makes
+    /// its move incomplete, so the originals are kept.
+    pub async fn restore_moves(&self, groups: Vec<location::MoveGroup>) {
+        let jobs = self.jobs.read().await;
+        let mut book = self.moves.lock().await;
+        for mut group in groups {
+            let before = group.pending.len();
+            group.pending.retain(|id, _| jobs.contains_key(id));
+            if group.pending.len() < before {
+                group.incomplete = true;
+            }
+            if group.pending.is_empty() {
+                continue;
+            }
+            let gid = Uuid::new_v4();
+            for job in group.pending.keys() {
+                book.by_job.insert(*job, gid);
+            }
+            book.groups.insert(gid, group);
+        }
     }
 
     /// After a location job ended: finish its part of a move.
@@ -1945,6 +1973,45 @@ mod tests {
         let j = mgr.get_job(job.id).await.unwrap().unwrap();
         assert!(j.error_message.unwrap_or_default().contains("upload refused"));
         assert!(down.exists(), "the source of a failed move is kept");
+    }
+
+    /// Regression (WS-Z2): moves were kept in memory only, so a move
+    /// interrupted by quitting came back after the restart as a copy: the
+    /// restored job completed and the original stayed. The move groups now
+    /// go with the saved queue and come back with it.
+    #[tokio::test]
+    async fn an_interrupted_move_is_still_a_move_after_a_restart() {
+        use location::tests::{MemConnector, MemResolver};
+        let id = Uuid::new_v4();
+        let conn = Arc::new(MemConnector::with(&[("/src/a.txt", "aaa")], &["/src"]));
+        let local = tempfile::tempdir().unwrap();
+        let down = local.path().join("a.txt");
+
+        // First session: the move is queued, then the app quits.
+        let before = TransferManager::new();
+        let job = before.enqueue_location_job(&format!("conn://{id}/src/a.txt"), down.to_str().unwrap(), 3).await.unwrap();
+        before.register_move(vec![(job.id, format!("conn://{id}/src/a.txt"))], vec![format!("conn://{id}/src")]).await;
+        let saved_jobs = before.snapshot_jobs().await;
+        let saved_moves = serde_json::to_string(&before.snapshot_moves().await).unwrap();
+
+        // Next session: the queue and its moves come back.
+        let after = TransferManager::new();
+        after.set_remote_resolver(Arc::new(MemResolver(HashMap::from([(id, conn.clone())]))));
+        after.restore_jobs(saved_jobs).await;
+        after.restore_moves(serde_json::from_str(&saved_moves).unwrap()).await;
+        after.spawn_runner(job.id).await;
+        wait_until(|| conn.file("/src/a.txt").is_none(), "the original removed").await;
+        assert_eq!(std::fs::read_to_string(&down).unwrap(), "aaa");
+        assert!(after.snapshot_moves().await.is_empty(), "the finished move is forgotten");
+    }
+
+    /// A restored move whose job is no longer in the queue keeps its originals.
+    #[tokio::test]
+    async fn a_restored_move_without_its_jobs_keeps_the_originals() {
+        let mgr = TransferManager::new();
+        let gone = Uuid::new_v4();
+        mgr.restore_moves(vec![location::MoveGroup { pending: HashMap::from([(gone, "/x/a.txt".to_string())]), source_dirs: vec!["/x".into()], incomplete: false }]).await;
+        assert!(mgr.snapshot_moves().await.is_empty());
     }
 
     /// Regression: a failed job of a move stayed pending in its move group

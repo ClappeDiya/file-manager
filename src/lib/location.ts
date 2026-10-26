@@ -230,7 +230,9 @@ export function parseAddressInput(text: string, connections: ReadonlyArray<Addre
     if (!connections.some((c) => c.id === loc.connectionId)) return { ok: false, error: "No saved connection has that id" };
     return { ok: true, path: remoteLocation(loc.connectionId, loc.path) };
   }
-  const colon = t.indexOf(":");
+  // A full local path stays local even with ":" in a name (`/notes:2024`).
+  const absoluteLocal = t.startsWith("/") || t.startsWith("\\\\");
+  const colon = absoluteLocal ? -1 : t.indexOf(":");
   if (colon > 0) {
     const name = t.slice(0, colon);
     const rest = t.slice(colon + 1);
@@ -241,7 +243,7 @@ export function parseAddressInput(text: string, connections: ReadonlyArray<Addre
     if (windowsDrive) return { ok: true, path: rest === "" ? `${name}:\\` : t };
     return { ok: false, error: `No saved connection is named "${name}"` };
   }
-  if (t.startsWith("/") || t.startsWith("\\\\")) return { ok: true, path: t.length > 1 ? t.replace(/[\\/]+$/, "") || "/" : t };
+  if (absoluteLocal) return { ok: true, path: t.length > 1 ? t.replace(/[\\/]+$/, "") || "/" : t };
   return { ok: false, error: "Type a full path (starting with /), or <connection name>:path" };
 }
 

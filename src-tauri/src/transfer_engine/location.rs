@@ -711,7 +711,7 @@ pub async fn remove_empty_dir(dir: &Location, resolver: &dyn RemoteResolver) -> 
 
 /// The jobs of one move: sources are deleted as their copies complete; the
 /// source folders once every job completed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MoveGroup {
     /// Jobs not finished yet, with the source each one moves.
     pub pending: HashMap<Uuid, String>,

@@ -154,4 +154,14 @@ describe("pane locations", () => {
     expect(isTopFolder(`conn://${ID}/drive/root:`)).toBe(true);
     expect(isTopFolder(`conn://${ID}/a`)).toBe(false);
   });
+
+  // Regression (WS-Z2): a local path with ":" in a name was read as
+  // "<connection name>:path" and refused.
+  it("takes full local paths with a colon in a name as local", () => {
+    const conns = [{ id: ID, name: "Work Drive" }];
+    expect(parseAddressInput("/home/me/notes:2024", conns)).toEqual({ ok: true, path: "/home/me/notes:2024" });
+    expect(parseAddressInput("/Volumes/Backup 10:30/", conns)).toEqual({ ok: true, path: "/Volumes/Backup 10:30" });
+    expect(parseAddressInput("\\\\nas\\share\\a:b", conns)).toEqual({ ok: true, path: "\\\\nas\\share\\a:b" });
+    expect(parseAddressInput("Work Drive:/Docs", conns)).toEqual({ ok: true, path: `conn://${ID}/Docs` });
+  });
 });

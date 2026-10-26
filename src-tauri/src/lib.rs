@@ -158,6 +158,13 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         );
         transfer_mgr.restore_jobs(queued_jobs).await;
     }
+    if let Ok(Some(json)) = repo.get_config(PENDING_MOVES_KEY).await {
+        match serde_json::from_str::<Vec<transfer_engine::location::MoveGroup>>(&json) {
+            Ok(moves) => transfer_mgr.restore_moves(moves).await,
+            Err(e) => tracing::warn!("Pending moves not restored: {e}"),
+        }
+        let _ = repo.delete_config(PENDING_MOVES_KEY).await;
+    }
 
     // Initialize credential store and connection manager
     let credential_store = std::sync::Arc::new(CredentialStore::new());
@@ -441,7 +448,19 @@ async fn persist_on_shutdown(repo: &Repository, transfer_mgr: &TransferManager) 
     } else {
         tracing::info!("Transfer queue persisted ({} job(s))", jobs.len());
     }
+    // The moves among them, so a restored job still removes its original.
+    let moves = transfer_mgr.snapshot_moves().await;
+    let saved = match serde_json::to_string(&moves) {
+        Ok(json) if !moves.is_empty() => repo.set_config(PENDING_MOVES_KEY, &json).await,
+        _ => repo.delete_config(PENDING_MOVES_KEY).await.map(|_| ()),
+    };
+    if let Err(e) = saved {
+        tracing::error!("Failed to persist pending moves on shutdown: {e}");
+    }
 }
+
+/// Moves not finished when the app quit (`TransferManager::snapshot_moves`).
+const PENDING_MOVES_KEY: &str = "transfer.pending_moves";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

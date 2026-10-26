@@ -16,7 +16,7 @@ import {
   clockTime,
   isFiltered,
   logQuery,
-  mergeTail,
+  fetchTail, mergeTail,
   oldestFirst,
   recordText,
   type LogFilters,
@@ -107,10 +107,10 @@ export function LogViewer({ onClose, listHeight = 420, tailMs = TAIL_MS }: { onC
       const newest = recordsRef.current.at(-1);
       const mine = generation.current;
       try {
-        const page = await tauriInvoke<LogPage>("query_logs", logQuery(effective, { limit: PAGE, ...(newest ? { since: newest.ts } : {}) }));
+        const tail = await fetchTail((q) => tauriInvoke<LogPage>("query_logs", { query: q }), logQuery(effective).query, newest?.ts ?? null, PAGE);
         if (mine !== generation.current) return;
-        setRecords((prev) => mergeTail(prev, page.records));
-        setError(null);
+        setRecords((prev) => mergeTail(prev, tail.records));
+        setError(tail.complete ? null : "More lines arrived than the live tail reads at once; some were skipped. Reload to see them all.");
       } catch (e) {
         setError(errorText(e));
       }
