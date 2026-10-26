@@ -25,7 +25,7 @@ export const RESET_SCOPES: readonly { id: ResetScope; label: string; covers: str
 
 /** Kept whatever is chosen. */
 export const RESET_KEEPS =
-  "Connections, sync pairs, backup jobs, mounts, favorites, history, saved passwords and keys, and the local web server, chat control, metrics, rclone, proxy and console settings.";
+  "Connections, sync pairs, backup jobs, mounts, favorites, history, saved passwords and keys, the app lock, and the local web server, chat control, metrics, rclone, proxy and console settings.";
 
 /** Interface preferences back to the defaults a new install has. */
 export function resetInterfacePreferences() {

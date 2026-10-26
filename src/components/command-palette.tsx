@@ -45,6 +45,7 @@ import {
   ArrowLeftRight,
   FolderUp,
   AppWindow,
+  Lock,
   Shield,
   Filter,
   FolderSync,
@@ -772,6 +773,8 @@ export function getDefaultCommands(actions: {
   onGoToParentFolder?: () => void;
   /** Open another app window at the active pane's folder. */
   onNewWindow?: () => void;
+  /** Show the lock screen in every window (when the app lock is on). */
+  onLockApp?: () => void;
   /** Open the Connection Manager on its rclone remote manager. */
   onOpenRcloneRemotes?: () => void;
   /** Open Settings expanded and scrolled to its rclone section. */
@@ -1563,6 +1566,15 @@ export function getDefaultCommands(actions: {
       category: "Navigation",
       action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("startup") : actions.onOpenSettings?.()),
       keywords: ["startup", "login", "autostart", "tray", "minimise", "minimize", "close", "background", "menu bar"],
+    },
+    {
+      id: "lock-app",
+      label: "Lock UFOP",
+      description: "Show the lock screen in every window until the master password is entered (turn it on in Settings \u2192 App Lock)",
+      icon: <Lock className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onLockApp || (() => actions.onOpenSettingsSection?.("app-lock")),
+      keywords: ["lock", "app lock", "password", "privacy", "away", "screen lock"],
     },
     {
       id: "reset-settings",

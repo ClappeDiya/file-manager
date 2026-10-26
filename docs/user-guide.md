@@ -897,6 +897,16 @@ Theme switching is instant with no restart required. The theme applies immediate
 - **Size units** - *Decimal* (default; 1 KB = 1,000 bytes, as macOS and disk makers count) or *Binary* (1 KiB = 1,024 bytes, labelled KiB, MiB, GiB). Every size in the app follows it: file lists, transfers, sync, backups, mounts and drives. Sizes already on screen in a panel update the next time it redraws.
 - **Backup times** - show the times of backup versions, runs and files in this computer's time zone (default) or in UTC (marked "UTC"). Schedules keep their own time zone; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
 
+### App lock
+
+**Settings → App Lock** locks UFOP's windows with the master password:
+
+- **Lock UFOP with the master password** - the first time, choose a master password (at least 8 characters; it also protects saved credentials and cannot be recovered). Afterwards every change here asks for it.
+- **Lock when UFOP starts** and **Lock when not used** - never, or after 1, 5, 10, 15, 30 or 60 minutes without using any UFOP window.
+- **Lock now** - also *Lock UFOP* in the command palette and the tray menu.
+
+While locked, every window shows the lock screen and nothing can be read or changed through the app: the desktop app refuses every request except unlocking. Scheduled backups, syncs, automations and transfers keep running. After too many wrong passwords the lock screen waits a few minutes before accepting another one. Locking, unlocking and wrong passwords are recorded in the security audit log.
+
 ### Reset settings
 
 **Settings → Reset** (or *Reset Settings…* in the command palette) puts preferences back to the defaults. Choose what to reset:
@@ -906,7 +916,7 @@ Theme switching is instant with no restart required. The theme applies immediate
 - **Sync and transfer defaults** (desktop app) - global sync defaults, the bandwidth timetable and how long failed transfers are kept.
 - **Welcome tour and tips** - shows the welcome wizard and the feature tips again (not chosen unless you tick it).
 
-Connections, sync pairs, backup jobs, mounts, favorites, history, saved passwords and keys are never reset, nor are the local web server, chat control, metrics, rclone, proxy and console settings. You are asked to confirm first, and the reset is recorded in the security audit log.
+Connections, sync pairs, backup jobs, mounts, favorites, history, saved passwords and keys are never reset, nor are the app lock, the local web server, chat control, metrics, rclone, proxy and console settings. You are asked to confirm first, and the reset is recorded in the security audit log.
 
 ### Startup and tray
 

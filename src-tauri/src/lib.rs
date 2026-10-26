@@ -36,6 +36,7 @@ pub mod schedule_library;
 pub mod sync_engine;
 pub mod spaces_engine;
 pub mod transfer_engine;
+pub mod app_lock;
 pub mod cloud_folders;
 pub mod reset;
 pub mod startup;
@@ -47,7 +48,7 @@ use automation_engine::suggester::LedgerSuggester;
 use automation_engine::AutomationManager;
 use backup_engine::BackupManager;
 use spaces_engine::SpacesManager;
-use commands::{ai_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, desktop_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
+use commands::{ai_commands, app_lock_commands, archive_commands, audit_commands, automation_commands, backup_commands, aws_commands, chat_control_commands, batch_rename_commands, confirmation_commands, connection_commands, connector_commands, custom_commands, desktop_commands, oauth_commands, drive_commands, editor_commands, embedded_server_commands, encryption_commands, file_ops_commands, feedback_commands, fleet_agent_commands, fs_commands, integrity_commands, ledger_commands, lineage_commands, log_commands, master_password_commands, mount_commands, narrator_commands, network_wizard_commands, notification_commands, peer_commands, preview_commands, s3_commands, safety_commands, schedule_commands, settings_commands, space_commands, ssh_key_commands, state_commands, sync_commands, system_commands, terminal_commands, transfer_commands, undo_commands, url_handler_commands, version_commands, filter_commands};
 use ledger::OperationLedger;
 use narrator::OperationNarrator;
 use safety::SafetyInterlock;
@@ -104,6 +105,7 @@ struct AppState {
     desktop_metrics: backup_engine::metrics_exporter::DesktopMetrics,
     background_mode: tray::BackgroundMode,
     startup: startup::StartupState,
+    app_lock: app_lock::AppLock,
     audit_trail: security::audit::AuditTrail,
     metadata_store: metadata_engine::MetadataStore,
     search_manager: search_engine::SearchManager,
@@ -329,6 +331,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
     // throwaway runtime whose spawned tasks die when it is dropped.
     let background_mode = tray::load_background_mode(&repo).await;
     let startup = startup::load(&repo).await;
+    let app_lock = app_lock::AppLock::load(&repo, master_pw_mgr.is_master_password_set(&repo).await.unwrap_or(false)).await;
 
     Ok(AppState {
         repo,
@@ -365,6 +368,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
         embedded_server,
         background_mode,
         startup,
+        app_lock,
         audit_trail,
         metadata_store: metadata_engine::MetadataStore::new(repo_for_metadata),
         search_manager: search_engine::SearchManager::open_default(),
@@ -559,6 +563,7 @@ pub fn run() {
                     embedded_server,
                     background_mode: tray::BackgroundMode::default(),
                     startup: startup::StartupState::default(),
+                    app_lock: app_lock::AppLock::default(),
                     audit_trail,
                 }
             }
@@ -579,6 +584,8 @@ pub fn run() {
     let close_mode = app_state.background_mode.clone();
     let window_startup = app_state.startup.clone();
     let setup_startup = app_state.startup.clone();
+    let ipc_lock = app_state.app_lock.clone();
+    let setup_lock = app_state.app_lock.clone();
     let shutdown_transfer = app_state.transfer_mgr.clone();
     let shutdown_backup = app_state.backup_mgr.clone();
     let setup_audit = app_state.audit_trail.clone();
@@ -658,6 +665,7 @@ pub fn run() {
             // Signed audit checkpoints: once at start-up, then hourly.
             tauri::async_runtime::spawn(setup_audit.clone().run_anchor_loop(security::audit::ANCHOR_INTERVAL));
             commands::mount_commands::forward_mount_changes(app.handle().clone(), &app.state::<MountManager>());
+            app_lock::spawn_idle_watch(app.handle().clone(), setup_lock.clone());
             match tray::setup(app, mgr) {
                 Ok(()) => setup_startup.set_tray_created(true),
                 Err(e) => tracing::warn!("System tray unavailable (non-fatal): {e}"),
@@ -716,13 +724,15 @@ pub fn run() {
         .manage(app_state.desktop_metrics)
         .manage(app_state.background_mode)
         .manage(app_state.startup)
+        .manage(app_state.app_lock)
         .manage(app_state.audit_trail)
         .manage(app_state.metadata_store)
         .manage(app_state.search_manager)
         .manage(app_state.thumbnails)
         .manage(app_state.office_renderer)
         .manage(app_state.credential_store)
-        .invoke_handler(tauri::generate_handler![
+        // While the app lock is on, only the lock screen's commands run.
+        .invoke_handler(app_lock::gate(ipc_lock, tauri::generate_handler![
             // Security audit log (tamper-evident, append-only)
             audit_commands::verify_audit_log,
             audit_commands::export_audit_log,
@@ -738,6 +748,11 @@ pub fn run() {
             desktop_commands::reset_settings,
             desktop_commands::detect_cloud_folders,
             desktop_commands::open_new_window,
+            app_lock_commands::app_lock_status,
+            app_lock_commands::app_lock_set_settings,
+            app_lock_commands::app_lock_now,
+            app_lock_commands::app_lock_unlock,
+            app_lock_commands::app_lock_activity,
             system_commands::get_platform_info,
             // Filesystem
             fs_commands::list_directory,
@@ -1470,7 +1485,7 @@ pub fn run() {
             safety_commands::safety_confirm_intent,
             // Operation Narrator (plain-language cross-engine story per correlation trace)
             narrator_commands::narrator_narrate_operation,
-        ])
+        ]))
         .on_window_event(move |window, event| {
             // "Keep running in the tray": closing hides the window so
             // scheduled backups continue.

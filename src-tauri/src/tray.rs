@@ -222,6 +222,7 @@ pub struct TrayMenuItems {
     run_all: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
     resume: MenuItem<tauri::Wry>,
+    lock: MenuItem<tauri::Wry>,
     quit: MenuItem<tauri::Wry>,
     mounts: Submenu<tauri::Wry>,
 }
@@ -237,7 +238,15 @@ impl TrayMenuItems {
         let _ = self.pause.set_text(t.pause);
         let _ = self.resume.set_text(t.resume);
         let _ = self.quit.set_text(t.quit);
+        let _ = self.lock.set_text(t.lock);
         let _ = self.mounts.set_text(t.mounts);
+    }
+}
+
+/// "Lock UFOP" is offered while the app lock is on and the app is unlocked.
+pub fn set_lock_enabled(app: &AppHandle) {
+    if let (Some(items), Some(lock)) = (app.try_state::<TrayMenuItems>(), app.try_state::<crate::app_lock::AppLock>()) {
+        let _ = items.lock.set_enabled(lock.settings().enabled && !lock.is_locked());
     }
 }
 
@@ -260,12 +269,13 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
     let run_all = MenuItem::with_id(app, "run_all", text.run_all, true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", text.pause, true, None::<&str>)?;
     let resume = MenuItem::with_id(app, "resume", text.resume, true, None::<&str>)?;
+    let lock = MenuItem::with_id(app, "lock", text.lock, false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", text.quit, true, None::<&str>)?;
     let mounts_menu = Submenu::with_id(app, "mounts", text.mounts, true)?;
     rebuild_mounts_submenu(app.handle(), &mounts_menu, &MountsMenu::default())?;
     let menu = Menu::with_items(
         app,
-        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &new_window, &backups, &mounts_menu, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &quit],
+        &[&status_item, &PredefinedMenuItem::separator(app)?, &open, &new_window, &backups, &mounts_menu, &PredefinedMenuItem::separator(app)?, &run_all, &pause, &resume, &PredefinedMenuItem::separator(app)?, &lock, &quit],
     )?;
     let m2 = mgr.clone();
     let mut builder = TrayIconBuilder::with_id("ufop").tooltip("UFOP").menu(&menu).show_menu_on_left_click(true).on_menu_event(move |app, ev| match ev.id().as_ref() {
@@ -293,6 +303,12 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
         }
         "pause" => m2.pause(Some(60)),
         "resume" => m2.resume(),
+        "lock" => {
+            let lock = app.state::<crate::app_lock::AppLock>();
+            if lock.lock() {
+                crate::app_lock::announce(app, true);
+            }
+        }
         "quit" => app.exit(0),
         other => {
             if let Some(action) = parse_mount_action(other) {
@@ -304,7 +320,8 @@ pub fn setup(app: &tauri::App, mgr: BackupManager) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     let tray = builder.build(app)?;
-    app.manage(TrayMenuItems { open, new_window, backups, run_all, pause: pause.clone(), resume: resume.clone(), quit, mounts: mounts_menu.clone() });
+    app.manage(TrayMenuItems { open, new_window, backups, run_all, pause: pause.clone(), resume: resume.clone(), lock, quit, mounts: mounts_menu.clone() });
+    set_lock_enabled(app.handle());
     spawn_mounts_menu(app.handle().clone(), mounts_menu);
 
     // Refresh the status lines and tooltip.

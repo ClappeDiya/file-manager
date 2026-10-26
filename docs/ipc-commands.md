@@ -36,6 +36,14 @@ macro; if you add a new one here, register it there too.
 - `ai_set_feature_toggles`
 - `ai_set_ollama_model`
 
+## `app_lock_commands` (5 commands)
+
+- `app_lock_activity`
+- `app_lock_now`
+- `app_lock_set_settings`
+- `app_lock_status`
+- `app_lock_unlock`
+
 ## `archive_commands` (4 commands)
 
 - `archive_browse`
@@ -870,4 +878,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 678 commands across 59 modules.
+**Surface:** 683 commands across 60 modules.

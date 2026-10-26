@@ -40,6 +40,7 @@ import { FolderField } from "@/components/remote-folder-picker";
 import { useT } from "@/lib/i18n";
 import { StartupTraySection } from "@/components/startup-tray-section";
 import { ResetSettingsSection } from "@/components/reset-settings-section";
+import { AppLockSection } from "@/components/app-lock-section";
 
 // ── Types ──
 
@@ -1397,6 +1398,10 @@ export default function SettingsPanel({
 
         <Section title={t("settings.startupTray")} id="startup" focus={focusSection === "startup"}>
           <StartupTraySection />
+        </Section>
+
+        <Section title={t("settings.appLock")} id="app-lock" focus={focusSection === "app-lock"}>
+          <AppLockSection />
         </Section>
 
         {/* Export */}

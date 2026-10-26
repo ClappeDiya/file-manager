@@ -55,6 +55,7 @@ import { pickFolder } from "@/lib/folder-picker";
 import { planPaneCopy, awaitPaneCopyJobs } from "@/lib/pane-copy";
 import { isTextEntry, resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveNewWindowKey, resolveParentFolderKey } from "@/lib/file-action-keys";
 import { isSecondaryWindow, openNewWindow } from "@/lib/app-window";
+import { useAppLockStore } from "@/stores/app-lock-store";
 import {
   useDriveSpace,
   useAllDrives,
@@ -2268,6 +2269,14 @@ export function FileManager() {
         },
         onEditAddress: () => {
           window.dispatchEvent(new CustomEvent(EDIT_ADDRESS_EVENT, { detail: { paneIndex: useFileManagerStore.getState().activePaneIndex } }));
+        },
+        onLockApp: () => {
+          const lock = useAppLockStore.getState();
+          if (lock.status?.enabled) void lock.lockNow().catch((e) => console.error("Lock failed:", e));
+          else {
+            setSettingsFocus("app-lock");
+            setSettingsOpen(true);
+          }
         },
         onNewWindow: () => {
           const fm = useFileManagerStore.getState();
