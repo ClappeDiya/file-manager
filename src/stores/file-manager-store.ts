@@ -534,7 +534,7 @@ export const useFileManagerStore = create<FileManagerState>()(
       // Initial state
       panes: [createDefaultPane(), createDefaultPane()],
       activePaneIndex: 0,
-      singlePaneMode: true, // Simple mode default
+      singlePaneMode: false, // New workspaces show source and destination together
       paneSplitPercent: 50,
       paneOrientation: "horizontal",
 

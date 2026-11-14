@@ -20,6 +20,7 @@ import {
   Star,
   Activity,
   Settings,
+  DatabaseBackup,
   ChevronRight,
   Sparkles,
 } from "lucide-react";
@@ -31,6 +32,7 @@ import {
 export type SimpleNavSection =
   | "files"
   | "transfers"
+  | "backups"
   | "sync"
   | "cloud"
   | "search"
@@ -66,6 +68,12 @@ const NAV_ITEMS: {
     label: "Transfers",
     icon: <ArrowUpDown className="h-5 w-5" aria-hidden="true" />,
     description: "Send and receive files",
+  },
+  {
+    id: "backups",
+    label: "Backups & Restore",
+    icon: <DatabaseBackup className="h-5 w-5" aria-hidden="true" />,
+    description: "Protect files and restore a version",
   },
   {
     id: "sync",
@@ -135,30 +143,57 @@ export function SimpleSidebar({
       <nav className="py-3 flex flex-col h-full" aria-label="Main navigation">
         {/* Navigation items with larger touch targets */}
         <div className="flex-1 space-y-1 px-2">
-          {NAV_ITEMS.map((item) => (
-            <button
-              key={item.id}
-              className={cn(
-                "flex items-center gap-3 w-full py-3 rounded-lg text-left",
-                compact ? "px-2 justify-center" : "px-4",
-                "transition-all duration-150",
-                "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
-                activeSection === item.id
-                  ? "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] shadow-sm"
-                  : "text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)] hover:text-[color:var(--color-text)]",
-              )}
-              onClick={() => onSectionChange(item.id)}
-              aria-current={activeSection === item.id ? "page" : undefined}
-              title={item.description}
+          {[
+            { label: "Workspace", ids: ["files", "search", "favorites"] },
+            {
+              label: "File operations",
+              ids: ["transfers", "sync", "backups", "cloud"],
+            },
+            { label: "Manage", ids: ["activity", "settings"] },
+          ].map((group) => (
+            <section
+              key={group.label}
+              aria-label={group.label}
+              className="mb-3"
             >
-              {item.icon}
-              <div className={compact ? "sr-only" : "flex-1 min-w-0"}>
-                <span className="text-sm font-medium">{item.label}</span>
-              </div>
-              {activeSection === item.id && (
-                <ChevronRight className="h-4 w-4 opacity-60" aria-hidden="true" />
+              {!compact && (
+                <h2 className="px-3 pb-1 text-xs font-medium text-[color:var(--color-text-secondary)]">
+                  {group.label}
+                </h2>
               )}
-            </button>
+              {NAV_ITEMS.filter((item) => group.ids.includes(item.id)).map(
+                (item) => (
+                  <button
+                    key={item.id}
+                    className={cn(
+                      "flex items-center gap-3 w-full py-2.5 rounded-lg text-left",
+                      compact ? "px-2 justify-center" : "px-4",
+                      "transition-all duration-150",
+                      "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
+                      activeSection === item.id
+                        ? "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] shadow-sm"
+                        : "text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)] hover:text-[color:var(--color-text)]",
+                    )}
+                    onClick={() => onSectionChange(item.id)}
+                    aria-current={
+                      activeSection === item.id ? "page" : undefined
+                    }
+                    title={item.description}
+                  >
+                    {item.icon}
+                    <div className={compact ? "sr-only" : "flex-1 min-w-0"}>
+                      <span className="text-sm font-medium">{item.label}</span>
+                    </div>
+                    {activeSection === item.id && (
+                      <ChevronRight
+                        className="h-4 w-4 opacity-60"
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+                ),
+              )}
+            </section>
           ))}
         </div>
 
@@ -166,13 +201,15 @@ export function SimpleSidebar({
         <div className="px-2 pt-3 mt-auto border-t border-[var(--color-border)]">
           <button
             className={cn(
-              "flex items-center gap-3 w-full py-3 rounded-lg text-left",
-                compact ? "px-2 justify-center" : "px-4",
+              "flex items-center gap-3 w-full py-2.5 rounded-lg text-left",
+              compact ? "px-2 justify-center" : "px-4",
               "text-[color:var(--color-text-tertiary)] hover:bg-[var(--color-hover-bg)] hover:text-[color:var(--color-text)]",
               "transition-all duration-150",
               "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
             )}
             onClick={handleModeSwitch}
+            onFocus={() => setShowModeHint(true)}
+            onBlur={() => setShowModeHint(false)}
             onMouseEnter={() => setShowModeHint(true)}
             onMouseLeave={() => setShowModeHint(false)}
             aria-label={

@@ -15,6 +15,7 @@ import { isRemotePath, locationConnectionId, locationRoot, locationSegments } fr
  */
 interface BreadcrumbBarProps {
   path: string;
+  ariaLabel?: string;
   onNavigate: (path: string) => void;
   onBack?: () => void;
   onForward?: () => void;
@@ -37,6 +38,7 @@ const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform
 
 export function BreadcrumbBar({
   path,
+  ariaLabel,
   onNavigate,
   onBack,
   onForward,
@@ -64,7 +66,7 @@ export function BreadcrumbBar({
         "overflow-x-auto scrollbar-none",
         className,
       )}
-      aria-label={t("accessibility.breadcrumb")}
+      aria-label={ariaLabel ?? t("accessibility.breadcrumb")}
       data-testid="breadcrumb-bar"
     >
       {/* Back / Forward buttons */}

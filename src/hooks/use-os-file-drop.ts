@@ -8,11 +8,12 @@
  * a copy on drop — copy, not move, as the OS does across locations.
  */
 import { useEffect } from "react";
-import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
+import { isTauriAvailable } from "@/hooks/use-tauri";
 import { dispatchRefresh } from "@/lib/refresh-affected";
 import { reportOperationFailure } from "@/lib/op-error-toast";
 import { isRemotePath, parentLocation, sameFolder } from "@/lib/location";
 import { resolveItems, statLocation, transferItems } from "@/lib/location-provider";
+import { queueWorkspaceItems } from "@/stores/transfer-workspace-store";
 
 export const OS_DROP_ATTR = "data-os-drop-dir";
 export const OS_DROP_HOVER_ATTR = "data-os-drop-hover";
@@ -60,11 +61,12 @@ export async function handleOsDrop(event: OsDropEvent, scale: number): Promise<{
       const items = await Promise.all(paths.map(async (p) => (await statLocation(p)) ?? (await resolveItems([p]))[0]));
       await transferItems(items, dest, "copy");
     } else {
-      await tauriInvoke("copy_files", { sourcePaths: paths, destDir: dest });
+      await queueWorkspaceItems(paths, dest, "copy");
     }
     dispatchRefresh([dest]);
   } catch (err) {
     reportOperationFailure("Copy dropped files", err);
+    return null;
   }
   return { dest, paths };
 }

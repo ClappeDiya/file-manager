@@ -290,7 +290,7 @@ mod tests {
 
     /// The gate sees app commands only: plugin commands (`plugin:fs|…`) go
     /// straight to the plugin. So the windows are granted no plugin command
-    /// that reads or changes anything (review finding: fs read/write/remove
+    /// that accesses user files or changes state (review finding: fs read/write/remove
     /// over $HOME were granted and bypassed the lock).
     #[test]
     fn the_windows_are_granted_no_plugin_commands_the_lock_cannot_see() {
@@ -298,7 +298,10 @@ mod tests {
         let ids: Vec<String> = caps["permissions"].as_array().unwrap().iter().map(|p| p.as_str().map(str::to_string).unwrap_or_else(|| p["identifier"].as_str().unwrap().to_string())).collect();
         for id in &ids {
             let family = id.split(':').next().unwrap();
-            assert!(matches!(family, "core" | "updater"), "{id} would bypass the app lock gate");
+            // The notification plugin queries OS permission status during
+            // startup. This read-only query cannot send notifications,
+            // request permission, or access the user's files.
+            assert!(matches!(family, "core" | "updater") || id == "notification:allow-is-permission-granted", "{id} would bypass the app lock gate");
         }
     }
 

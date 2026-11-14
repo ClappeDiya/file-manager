@@ -797,6 +797,7 @@ pub fn run() {
             // Transfer management (T-015)
             transfer_commands::enqueue_transfer,
             transfer_commands::enqueue_location_transfer,
+            commands::local_transfer_commands::enqueue_local_transfer,
             transfer_commands::pause_transfer,
             transfer_commands::resume_transfer,
             transfer_commands::cancel_transfer,

@@ -1,4 +1,6 @@
 import { useState, useCallback } from "react";
+import { useTransferPolling } from "@/hooks/use-transfer-polling";
+import { TransferWorkspace } from "@/components/transfer-workspace";
 import { TransferPanel } from "@/components/transfer-panel";
 import { SyncPanel } from "@/components/sync-panel";
 import { ConnectionPanel } from "@/components/connection-panel";
@@ -22,6 +24,7 @@ import { useUIStore } from "@/stores/ui-store";
  * In Advanced mode, shows all features.
  */
 export function HomePage() {
+  const transfers = useTransferPolling();
   const onboardingComplete = useUIStore((s) => s.onboardingComplete);
   const setActiveGuidedFlow = useUIStore((s) => s.setActiveGuidedFlow);
 
@@ -49,8 +52,9 @@ export function HomePage() {
     <>
       {/* Main app content */}
       <SimpleModeWrapper
-        fileManager={<FileManager />}
-        transferPanel={<div className="h-full flex flex-col min-w-0"><button className="self-start m-3 rounded-md bg-[var(--color-primary)] text-[var(--color-primary-foreground)] px-4 py-2" onClick={() => handleOpenGuidedFlow("start-transfer")}>Start a Transfer</button><TransferPanel /></div>}
+        fileManager={<FileManager embedded />}
+        transferWorkspace={<TransferWorkspace jobs={transfers.jobs} error={transfers.error} onNewTransfer={() => handleOpenGuidedFlow("start-transfer")} />}
+        transferPanel={<div className="h-full flex flex-col min-w-0"><button className="self-start m-3 rounded-md bg-[var(--color-primary)] text-[var(--color-primary-foreground)] px-4 py-2" onClick={() => handleOpenGuidedFlow("start-transfer")}>Start a Transfer</button><TransferPanel initialMode="full" /></div>}
         syncPanel={<SyncPanel />}
         connectionPanel={<ConnectionPanel />}
         onOpenOnboarding={handleOpenOnboarding}

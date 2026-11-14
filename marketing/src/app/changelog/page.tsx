@@ -1,3 +1,4 @@
+import { DocMarkdown } from '@/components/doc-markdown';
 import type { Metadata } from 'next';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -30,14 +31,12 @@ export default async function ChangelogPage() {
       <header className="mb-10">
         <h1 className="marketing-heading">Changelog</h1>
         <p className="marketing-subheading mt-3">
-          Every release, in the order it shipped. Subscribe via the RSS feed at <code className="text-sm">/changelog.xml</code> (coming soon).
+          Release notes, fixes and known changes.
         </p>
       </header>
 
       <article className="prose prose-sm dark:prose-invert max-w-none">
-        <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-foreground-secondary">
-          {markdown}
-        </pre>
+        <DocMarkdown content={markdown} />
       </article>
     </div>
   );

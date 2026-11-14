@@ -11,12 +11,15 @@
  * and contextual help.
  */
 import { useEffect, useState } from "react";
+import { queueWorkspaceTransfer } from "@/stores/transfer-workspace-store";
+import { useFileManagerStore } from "@/stores/file-manager-store";
+import { isRemotePath } from "@/lib/location";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
 import { cn } from "@ufop/ui-components";
 import { pickFolder } from "@/lib/folder-picker";
 import { errorText } from "@/lib/error-text";
-import { createSyncPair, fixNames, listInterrupted, resolveInterrupted, scanNames, startTransfer, compatProfiles, type CompatIssue, type CompatScan, type Resolution, type TransferJobLite } from "@/lib/guided-actions";
+import { createSyncPair, fixNames, listInterrupted, resolveInterrupted, scanNames, compatProfiles, type CompatIssue, type CompatScan, type Resolution, type TransferJobLite } from "@/lib/guided-actions";
 import {
   ArrowUpDown,
   FolderOpen,
@@ -35,10 +38,10 @@ export function StartTransferWizard() {
   const addActivity = useUIStore((s) => s.addActivity);
   const setActiveGuidedFlow = useUIStore((s) => s.setActiveGuidedFlow);
   const [step, setStep] = useState(0);
-  const [sourcePath, setSourcePath] = useState("");
-  const [destPath, setDestPath] = useState("");
+  const [sourcePath, setSourcePath] = useState(() => { const p = useFileManagerStore.getState().getActiveTab(0)?.path; return p && p !== "/" ? p : ""; });
+  const [destPath, setDestPath] = useState(() => { const p = useFileManagerStore.getState().getActiveTab(1)?.path; return p && p !== "/" ? p : ""; });
   const [transferMode, setTransferMode] = useState<"copy" | "move">("copy");
-  const [verifyAfter, setVerifyAfter] = useState(false);
+  const localTransfer = !isRemotePath(sourcePath) && !isRemotePath(destPath);
 
   const steps: WizardStepDef[] = [
     {
@@ -73,12 +76,12 @@ export function StartTransferWizard() {
       currentStep={step}
       onStepChange={setStep}
       onComplete={async () => {
-        const outcome = await startTransfer(sourcePath, destPath, transferMode, verifyAfter);
+        const outcome = await queueWorkspaceTransfer(sourcePath.trim(), destPath.trim(), transferMode);
         addActivity({
           type: "transfer",
-          summary: `${transferMode === "copy" ? "Copy" : "Move"} of "${sourcePath}" to "${destPath}": ${outcome}`,
+          summary: `${transferMode === "copy" ? "Copy" : "Move"} of "${sourcePath}" to "${destPath}": ${outcome.jobs.length} files queued. Follow progress in the workspace.`,
           paths: [sourcePath, destPath],
-          undoable: transferMode === "move",
+          undoable: false,
         });
         setActiveGuidedFlow(null);
       }}
@@ -98,6 +101,7 @@ export function StartTransferWizard() {
             <div className="flex gap-2 mt-1">
               <input
                 type="text"
+                aria-label="Source"
                 value={sourcePath}
                 onChange={(e) => setSourcePath(e.target.value)}
                 placeholder="/Users/you/Documents/project"
@@ -105,6 +109,7 @@ export function StartTransferWizard() {
               />
               <button
                 type="button"
+                aria-label="Choose source folder"
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
                 onClick={async (e) => {
                   e.preventDefault();
@@ -133,6 +138,7 @@ export function StartTransferWizard() {
             <div className="flex gap-2 mt-1">
               <input
                 type="text"
+                aria-label="Destination"
                 value={destPath}
                 onChange={(e) => setDestPath(e.target.value)}
                 placeholder="/Volumes/External/backup"
@@ -140,6 +146,7 @@ export function StartTransferWizard() {
               />
               <button
                 type="button"
+                aria-label="Choose destination folder"
                 className="px-3 py-2.5 rounded-lg border border-[var(--color-border)] text-sm text-[color:var(--color-text-secondary)] hover:bg-[var(--color-hover-bg)]"
                 onClick={async (e) => {
                   e.preventDefault();
@@ -190,29 +197,16 @@ export function StartTransferWizard() {
               <div className="flex items-start gap-2">
                 <AlertTriangle className="h-4 w-4 text-[color:var(--color-warning)] shrink-0 mt-0.5" aria-hidden="true" />
                 <p className="text-xs text-[color:var(--color-text-secondary)]">
-                  Move will remove the original files after they're transferred.
-                  You can undo this from the Activity feed.
+                  Move removes each original file only after its transfer succeeds.
+                  Keep a backup if you may need the originals again.
                 </p>
               </div>
             </div>
           )}
 
-          {transferMode === "copy" && (
-          <label className="flex items-center gap-3 p-3 rounded-lg bg-[var(--color-bg-secondary)] cursor-pointer">
-            <input
-              type="checkbox"
-              checked={verifyAfter}
-              onChange={(e) => setVerifyAfter(e.target.checked)}
-              className="h-4 w-4 rounded border-[var(--color-border)]"
-            />
-            <div>
-              <span className="text-sm text-[color:var(--color-text)]">Verify files after transfer</span>
-              <p className="text-xs text-[color:var(--color-text-secondary)] mt-0.5">
-                Compares every copied file with its original by checksum. Takes longer but proves the copy is exact.
-              </p>
-            </div>
-          </label>
-          )}
+          <p className="text-sm text-[color:var(--color-text-secondary)] rounded-lg bg-[var(--color-bg-secondary)] p-3">
+            {localTransfer ? "Local transfers verify file checksums automatically. Copy keeps existing files and gives incoming items a copy name. Move stops if a destination name already exists." : "The report shows each file’s actual outcome. Checksum evidence depends on the connected service."}
+          </p>
         </div>
       )}
 
@@ -233,7 +227,7 @@ export function StartTransferWizard() {
             <div className="p-3 rounded-lg bg-[var(--color-bg-secondary)]">
               <span className="text-xs font-medium text-[color:var(--color-text-secondary)]">Action</span>
               <p className="text-sm text-[color:var(--color-text)] mt-0.5 capitalize">{transferMode}</p>
-              {verifyAfter && transferMode === "copy" && <p className="text-xs text-[color:var(--color-primary)] mt-0.5">With verification</p>}
+              {localTransfer && <p className="text-xs text-[color:var(--color-text-secondary)] mt-0.5">Automatic checksum verification · existing files stay safe</p>}
             </div>
           </div>
         </div>

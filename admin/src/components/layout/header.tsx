@@ -11,7 +11,7 @@ import { ROLE_LABELS } from '@/lib/types/auth';
 import { useTranslate } from '@/lib/i18n';
 
 export function Header() {
-  const { toggleMobileSidebar, theme, setTheme } = useAdminStore();
+  const { toggleMobileSidebar, sidebarMobileOpen, theme, setTheme } = useAdminStore();
   const { user, logout, organization, organizations, switchOrg } = useAuthStore();
   const router = useRouter();
   const notify = useToastStore((s) => s.notify);
@@ -39,6 +39,8 @@ export function Header() {
           onClick={toggleMobileSidebar}
           className="lg:hidden h-10 w-10 inline-flex items-center justify-center rounded-md hover:bg-background-secondary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           aria-label={t('shell.toggleSidebar')}
+          aria-expanded={sidebarMobileOpen}
+          aria-controls="admin-navigation"
         >
           <Menu size={20} aria-hidden="true" />
         </button>

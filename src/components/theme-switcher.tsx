@@ -16,10 +16,16 @@ const themes: { value: Theme; label: string; icon: React.ReactNode }[] = [
  * Theme switcher component with radio-group semantics.
  * Provides instant theme switching with keyboard accessibility.
  */
-export function ThemeSwitcher() {
+export function ThemeSwitcher({ compact = false }: { compact?: boolean }) {
   const theme = useUIStore((s) => s.theme);
   const setTheme = useUIStore((s) => s.setTheme);
 
+  if (compact) return <label className="inline-flex items-center gap-2 text-sm">
+    <span className="sr-only">Appearance</span>
+    <select aria-label="Appearance" value={theme} onChange={(e) => setTheme(e.target.value as Theme)} className="h-9 max-w-36 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 text-[color:var(--color-text)] focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]">
+      {themes.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
+    </select>
+  </label>;
   return (
     <div
       role="radiogroup"

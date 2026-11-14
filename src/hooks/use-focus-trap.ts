@@ -6,6 +6,7 @@ const FOCUSABLE_SELECTOR =
 interface UseFocusTrapOptions {
   /** When false the trap is inactive (e.g. dialog is closed). */
   active: boolean;
+  initialFocusSelector?: string;
   /** Optional callback invoked when the user presses Escape. */
   onEscape?: () => void;
   /** When provided, this element receives initial focus instead of the first focusable. */
@@ -21,10 +22,16 @@ interface UseFocusTrapOptions {
  */
 export function useFocusTrap<T extends HTMLElement>({
   active,
+  initialFocusSelector,
   onEscape,
   initialFocusRef,
 }: UseFocusTrapOptions) {
   const containerRef = useRef<T | null>(null);
+
+  const escapeRef = useRef(onEscape);
+  useEffect(() => {
+    escapeRef.current = onEscape;
+  }, [onEscape]);
 
   useEffect(() => {
     if (!active) return;
@@ -32,8 +39,12 @@ export function useFocusTrap<T extends HTMLElement>({
     const previouslyFocused = document.activeElement as HTMLElement | null;
 
     const focusFirst = () => {
-      const target = initialFocusRef?.current
-        ?? container?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+      const target =
+        initialFocusRef?.current ??
+        (initialFocusSelector
+          ? container?.querySelector<HTMLElement>(initialFocusSelector)
+          : null) ??
+        container?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
       target?.focus();
     };
 
@@ -41,9 +52,9 @@ export function useFocusTrap<T extends HTMLElement>({
     const id = requestAnimationFrame(focusFirst);
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && onEscape) {
+      if (event.key === "Escape" && escapeRef.current) {
         event.preventDefault();
-        onEscape();
+        escapeRef.current();
         return;
       }
       if (event.key !== "Tab" || !container) return;
@@ -55,7 +66,10 @@ export function useFocusTrap<T extends HTMLElement>({
       const first = items[0];
       const last = items[items.length - 1];
       const active = document.activeElement as HTMLElement | null;
-      if (event.shiftKey && active === first) {
+      if (!active || !container.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && active === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && active === last) {
@@ -70,7 +84,7 @@ export function useFocusTrap<T extends HTMLElement>({
       document.removeEventListener("keydown", onKeyDown);
       previouslyFocused?.focus?.();
     };
-  }, [active, onEscape, initialFocusRef]);
+  }, [active, initialFocusRef, initialFocusSelector]);
 
   return containerRef;
 }

@@ -8,10 +8,10 @@
   </head>
   <body>
     <div id="root"></div>
-    <script>
+    <script type="module">
       // Diagnostic: Catch any errors during module loading
       window.__APP_ERRORS = [];
-      var __IS_DEV = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.protocol === 'file:' || window.location.port === '1420';
+      var __IS_DEV = import.meta.env.DEV;
       window.addEventListener('error', function(e) {
         var msg = 'ERROR: ' + e.message + ' | File: ' + e.filename + ' | Line: ' + e.lineno;
         window.__APP_ERRORS.push(msg);
@@ -55,9 +55,18 @@
               el.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#b45309;color:white;padding:10px;z-index:99999;font-size:12px;max-height:50vh;overflow:auto;';
               document.body.appendChild(el);
             }
-            el.textContent += 'WARNING: #root is empty after 3s. React did not render.\n';
+            el.textContent += 'FileManager is still starting…\n';
             el.textContent += 'Errors captured: ' + window.__APP_ERRORS.length + '\n';
             window.__APP_ERRORS.forEach(function(e) { el.textContent += '  - ' + e + '\n'; });
+            // Development imports can take longer than three seconds. Remove
+            // the startup notice once the app mounts, without hiding errors.
+            var observer = new MutationObserver(function() {
+              if (root && root.childElementCount) {
+                if (!window.__APP_ERRORS.length) el.remove();
+                observer.disconnect();
+              }
+            });
+            if (root) observer.observe(root, { childList: true });
           }
         }, 3000);
       }

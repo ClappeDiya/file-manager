@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { paneLabel, useFileManagerStore, type PaneTab } from "@/stores/file-manager-store";
+import {
+  paneLabel,
+  useFileManagerStore,
+  type PaneTab,
+} from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
 import { Tooltip } from "@ufop/ui-components";
 import { X, Plus, Pin, PinOff } from "lucide-react";
@@ -76,9 +80,12 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
       // Ctrl+Tab / Ctrl+Shift+Tab - Switch tabs
       if (e.ctrlKey && e.key === "Tab") {
         e.preventDefault();
-        const currentIdx = pane.tabs.findIndex((t) => t.id === pane.activeTabId);
+        const currentIdx = pane.tabs.findIndex(
+          (t) => t.id === pane.activeTabId,
+        );
         if (e.shiftKey) {
-          const prevIdx = (currentIdx - 1 + pane.tabs.length) % pane.tabs.length;
+          const prevIdx =
+            (currentIdx - 1 + pane.tabs.length) % pane.tabs.length;
           setActiveTab(paneIndex, pane.tabs[prevIdx].id);
         } else {
           const nextIdx = (currentIdx + 1) % pane.tabs.length;
@@ -165,8 +172,7 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
           ? unpinTab(paneIndex, tabMenu.tabId)
           : pinTab(paneIndex, tabMenu.tabId),
       onDuplicate: () => duplicateTab(paneIndex, tabMenu.tabId),
-      onMoveToOtherPane: () =>
-        moveTabToOtherPane(paneIndex, tabMenu.tabId),
+      onMoveToOtherPane: () => moveTabToOtherPane(paneIndex, tabMenu.tabId),
     });
   }, [
     tabMenu,
@@ -183,71 +189,84 @@ export function TabBar({ paneIndex, className }: TabBarProps) {
 
   return (
     <>
-    <div
-      className={cn(
-        "flex items-center gap-0.5 bg-[var(--color-bg-secondary)] border-b border-[var(--color-border)] px-1",
-        "overflow-x-auto scrollbar-none",
-        className,
-      )}
-      role="tablist"
-      aria-label={`Pane ${paneIndex + 1} tabs`}
-      ref={tabsRef}
-      data-testid={`tab-bar-${paneIndex}`}
-    >
-      {/* Pinned tabs come first */}
-      {pane.tabs
-        .map((tab, index) => ({ tab, index }))
-        .sort((a, b) => {
-          if (a.tab.pinned && !b.tab.pinned) return -1;
-          if (!a.tab.pinned && b.tab.pinned) return 1;
-          return 0;
-        })
-        .map(({ tab, index }) => (
-          <TabItem
-            key={tab.id}
-            tab={tab}
-            index={index}
-            isActive={tab.id === pane.activeTabId}
-            paneIndex={paneIndex}
-            onActivate={() => setActiveTab(paneIndex, tab.id)}
-            onClose={() => closeTab(paneIndex, tab.id)}
-            onPin={() => (tab.pinned ? unpinTab(paneIndex, tab.id) : pinTab(paneIndex, tab.id))}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setTabMenu({ tabId: tab.id, x: e.clientX, y: e.clientY });
-            }}
-            canClose={pane.tabs.length > 1}
-            isDragging={dragIndex === index}
-            isDropTarget={dropIndex === index}
-            onDragStart={(e) => handleDragStart(e, index)}
-            onDragOver={(e) => handleDragOver(e, index)}
-            onDrop={(e) => handleDrop(e, index)}
-            onDragEnd={handleDragEnd}
+      <div className="flex min-w-0 shrink-0 bg-[var(--color-bg-secondary)] border-b border-[var(--color-border)]">
+        <div
+          className={cn(
+            "flex items-center gap-0.5 bg-[var(--color-bg-secondary)] border-b border-[var(--color-border)] px-1",
+            "overflow-x-auto scrollbar-none",
+            className,
+          )}
+          role="group"
+          aria-label={`Pane ${paneIndex + 1} tab controls`}
+          ref={tabsRef}
+          data-testid={`tab-bar-${paneIndex}`}
+        >
+          <div
+            role="tablist"
+            aria-label={`Pane ${paneIndex + 1} tabs`}
+            aria-owns={pane.tabs
+              .map((t) => `pane-${paneIndex}-tab-${t.id}`)
+              .join(" ")}
+            className="sr-only"
           />
-        ))}
+          {/* Pinned tabs come first */}
+          {pane.tabs
+            .map((tab, index) => ({ tab, index }))
+            .sort((a, b) => {
+              if (a.tab.pinned && !b.tab.pinned) return -1;
+              if (!a.tab.pinned && b.tab.pinned) return 1;
+              return 0;
+            })
+            .map(({ tab, index }) => (
+              <TabItem
+                key={tab.id}
+                tab={tab}
+                index={index}
+                isActive={tab.id === pane.activeTabId}
+                paneIndex={paneIndex}
+                onActivate={() => setActiveTab(paneIndex, tab.id)}
+                onClose={() => closeTab(paneIndex, tab.id)}
+                onPin={() =>
+                  tab.pinned
+                    ? unpinTab(paneIndex, tab.id)
+                    : pinTab(paneIndex, tab.id)
+                }
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setTabMenu({ tabId: tab.id, x: e.clientX, y: e.clientY });
+                }}
+                canClose={pane.tabs.length > 1}
+                isDragging={dragIndex === index}
+                isDropTarget={dropIndex === index}
+                onDragStart={(e) => handleDragStart(e, index)}
+                onDragOver={(e) => handleDragOver(e, index)}
+                onDrop={(e) => handleDrop(e, index)}
+                onDragEnd={handleDragEnd}
+              />
+            ))}
+        </div>
+        {/* New tab button */}
+        <button
+          className={cn(
+            "flex items-center justify-center h-7 w-7 rounded-[var(--radius-sm)]",
+            "text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]",
+            "hover:bg-[var(--color-hover-bg)] transition-theme",
+            "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
+          )}
+          onClick={handleNewTab}
+          aria-label="New tab"
+          title="New tab (Cmd+T)"
+          data-testid="new-tab-button"
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      </div>
 
-      {/* New tab button */}
-      <button
-        className={cn(
-          "flex items-center justify-center h-7 w-7 rounded-[var(--radius-sm)]",
-          "text-[color:var(--color-text-tertiary)] hover:text-[color:var(--color-text)]",
-          "hover:bg-[var(--color-hover-bg)] transition-theme",
-          "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
-        )}
-        onClick={handleNewTab}
-        aria-label="New tab"
-        title="New tab (Cmd+T)"
-        data-testid="new-tab-button"
-      >
-        <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-      </button>
-    </div>
-
-    <ContextMenu
-      items={tabMenuItems}
-      position={tabMenu ? { x: tabMenu.x, y: tabMenu.y } : null}
-      onClose={() => setTabMenu(null)}
-    />
+      <ContextMenu
+        items={tabMenuItems}
+        position={tabMenu ? { x: tabMenu.x, y: tabMenu.y } : null}
+        onClose={() => setTabMenu(null)}
+      />
     </>
   );
 }
@@ -280,6 +299,7 @@ interface TabItemProps {
 function TabItem({
   tab,
   isActive,
+  paneIndex,
   onActivate,
   onClose,
   onPin,
@@ -293,10 +313,13 @@ function TabItem({
   onDragEnd,
 }: TabItemProps) {
   return (
-    <Tooltip content={formatAddress(tab.path, (id) => useConnectionsStore.getState().nameOf(id))}>
+    <Tooltip
+      content={formatAddress(tab.path, (id) =>
+        useConnectionsStore.getState().nameOf(id),
+      )}
+    >
       <div
-        role="tab"
-        aria-selected={isActive}
+        role="presentation"
         className={cn(
           "group flex items-center gap-1 h-8 px-2 rounded-t-[var(--radius-sm)]",
           "text-[length:var(--font-size-xs)] cursor-pointer select-none",
@@ -315,26 +338,53 @@ function TabItem({
         onDrop={onDrop}
         onDragEnd={onDragEnd}
         data-testid={`tab-${tab.id}`}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onActivate();
-          }
-        }}
-        tabIndex={0}
       >
         {/* Pin indicator */}
         {tab.pinned && (
-          <Pin className="h-3 w-3 text-[color:var(--color-primary)] shrink-0" aria-label="Pinned" />
+          <Pin
+            className="h-3 w-3 text-[color:var(--color-primary)] shrink-0"
+            aria-label="Pinned"
+          />
         )}
 
         {/* Tab label */}
-        <span className="truncate" title={formatAddress(tab.path, (id) => useConnectionsStore.getState().nameOf(id))}>
+        <button
+          type="button"
+          role="tab"
+          id={`pane-${paneIndex}-tab-${tab.id}`}
+          aria-controls={`pane-tabpanel-${paneIndex}`}
+          aria-selected={isActive}
+          tabIndex={isActive ? 0 : -1}
+          className="truncate min-w-0 h-full text-left focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]"
+          title={formatAddress(tab.path, (id) =>
+            useConnectionsStore.getState().nameOf(id),
+          )}
+          onKeyDown={(e) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key))
+              return;
+            e.preventDefault();
+            const tabs = [
+              ...(e.currentTarget
+                .closest('[data-testid^="tab-bar-"]')
+                ?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? []),
+            ];
+            const index = tabs.indexOf(e.currentTarget);
+            const next =
+              e.key === "Home"
+                ? 0
+                : e.key === "End"
+                  ? tabs.length - 1
+                  : (index + (e.key === "ArrowLeft" ? -1 : 1) + tabs.length) %
+                    tabs.length;
+            tabs[next]?.click();
+            tabs[next]?.focus();
+          }}
+        >
           {tab.label}
-        </span>
+        </button>
 
         {/* Close / pin button on hover */}
-        <div className="flex items-center shrink-0 opacity-0 group-hover:opacity-100 transition-theme">
+        <div className="flex items-center shrink-0 opacity-100 transition-theme">
           {/* Pin/unpin button */}
           <button
             className={cn(

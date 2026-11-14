@@ -204,6 +204,7 @@ export default function ApprovalsPage() {
               className="sm:w-72"
             />
             <Select
+              aria-label="Filter approvals by trigger"
               options={[
                 { value: '', label: 'All Triggers' },
                 ...Object.entries(APPROVAL_TRIGGER_LABELS).map(([v, l]) => ({ value: v, label: l })),

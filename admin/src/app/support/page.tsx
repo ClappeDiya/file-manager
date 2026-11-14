@@ -25,12 +25,12 @@ export default function SupportPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Statement Descriptor */}
             <div className="space-y-2">
-              <h4 className="text-sm font-semibold text-foreground flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
                 <CreditCard size={16} className="text-primary" />
                 Statement Descriptor
-              </h4>
+              </h3>
               <p className="text-sm text-foreground-secondary">
-                Charges from Clapwork will appear as{' '}
+                Charges from FileManager will appear as{' '}
                 <span className="font-semibold text-foreground bg-background-tertiary px-2 py-0.5 rounded text-xs tracking-wide">
                   CLAPPE.COM
                 </span>{' '}
@@ -41,14 +41,14 @@ export default function SupportPage() {
 
             {/* Payment Gateway */}
             <div className="space-y-2">
-              <h4 className="text-sm font-semibold text-foreground flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
                 <ExternalLink size={16} className="text-primary" />
                 Payment Gateway
-              </h4>
+              </h3>
               <p className="text-sm text-foreground-secondary">
                 All payments are securely processed through{' '}
                 <span className="font-semibold text-foreground">Stripe</span>, an
-                industry-leading payment processor. Clapwork never stores your full
+                industry-leading payment processor. FileManager never stores your full
                 card details — all sensitive payment data is handled entirely by
                 Stripe&apos;s PCI-compliant infrastructure.
               </p>
@@ -56,10 +56,10 @@ export default function SupportPage() {
 
             {/* Affiliated Company */}
             <div className="space-y-2">
-              <h4 className="text-sm font-semibold text-foreground flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
                 <HelpCircle size={16} className="text-primary" />
                 Affiliated Company
-              </h4>
+              </h3>
               <p className="text-sm text-foreground-secondary">
                 Billing and subscription management is handled by{' '}
                 <span className="font-semibold text-foreground">Clappe.com</span>,
@@ -75,8 +75,8 @@ export default function SupportPage() {
               <div className="flex items-center gap-2 bg-background-tertiary rounded-lg px-4 py-2.5 border border-border">
                 <Lock size={16} className="text-success" />
                 <div className="flex flex-col">
-                  <span className="text-xs font-semibold text-foreground">256-bit SSL</span>
-                  <span className="text-[10px] text-foreground-tertiary">Encrypted Connection</span>
+                  <span className="text-xs font-semibold text-foreground">Payment data handling</span>
+                  <span className="text-[10px] text-foreground-tertiary">Handled by your payment provider</span>
                 </div>
               </div>
 
@@ -91,8 +91,8 @@ export default function SupportPage() {
               <div className="flex items-center gap-2 bg-background-tertiary rounded-lg px-4 py-2.5 border border-border">
                 <Shield size={16} className="text-warning" />
                 <div className="flex flex-col">
-                  <span className="text-xs font-semibold text-foreground">PCI DSS Compliant</span>
-                  <span className="text-[10px] text-foreground-tertiary">Level 1 Certified</span>
+                  <span className="text-xs font-semibold text-foreground">Card processing</span>
+                  <span className="text-[10px] text-foreground-tertiary">Provider-managed payments</span>
                 </div>
               </div>
             </div>

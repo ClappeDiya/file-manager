@@ -59,3 +59,5 @@ pub mod transfer_commands;
 pub mod undo_commands;
 pub mod url_handler_commands;
 pub mod version_commands;
+
+pub mod local_transfer_commands;

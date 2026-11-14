@@ -14,7 +14,10 @@ let inner: HTMLElement;
 const at = vi.fn<(x: number, y: number) => Element | null>();
 
 beforeEach(() => {
-  mockInvoke.mockReset().mockResolvedValue(undefined);
+  mockInvoke.mockReset().mockImplementation(async (cmd: string, args: Record<string, unknown>) => {
+    if (cmd === "get_file_metadata") return { is_dir: false };
+    if (cmd === "enqueue_local_transfer") return { jobs: [], dest_paths: (args.sourcePaths as string[]).map((s) => `${args.destDir}/${s.split("/").pop()}`), folders_created: 0 };
+  });
   (window as unknown as Record<string, unknown>).__TAURI__ = {};
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
   document.body.innerHTML = `<div id="pane" ${OS_DROP_ATTR}="/home/me/Docs"><span id="row">x</span></div><div id="other"></div>`;
@@ -44,7 +47,7 @@ describe("OS file drop", () => {
   it("copies dropped files into the pane's folder", async () => {
     const r = await handleOsDrop({ type: "drop", paths: ["/tmp/a.txt", "/home/me/Docs/self.txt"], position: { x: 10, y: 10 } }, 1);
     expect(r).toEqual({ dest: "/home/me/Docs", paths: ["/tmp/a.txt"] });
-    expect(mockInvoke).toHaveBeenCalledWith("copy_files", { sourcePaths: ["/tmp/a.txt"], destDir: "/home/me/Docs" });
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_local_transfer", { mode: "copy", sourcePaths: ["/tmp/a.txt"], destDir: "/home/me/Docs" });
     expect(pane.hasAttribute(OS_DROP_HOVER_ATTR)).toBe(false);
   });
 

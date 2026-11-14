@@ -8,7 +8,7 @@ export default function TermsPage() {
   return (
     <div className="container-prose py-16 text-sm text-foreground-secondary leading-relaxed space-y-5">
       <h1 className="marketing-heading">Terms of Service</h1>
-      <p className="text-foreground-tertiary text-xs">Last updated: {new Date().toISOString().slice(0, 10)}</p>
+      <p className="text-foreground-tertiary text-xs">Last updated: 2026-05-17</p>
 
       <p>
         These terms govern your use of the FileManager desktop application and any paid subscription

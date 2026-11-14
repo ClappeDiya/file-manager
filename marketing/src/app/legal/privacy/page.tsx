@@ -8,7 +8,7 @@ export default function PrivacyPage() {
   return (
     <div className="container-prose py-16 text-sm text-foreground-secondary leading-relaxed space-y-5">
       <h1 className="marketing-heading">Privacy Policy</h1>
-      <p className="text-foreground-tertiary text-xs">Last updated: {new Date().toISOString().slice(0, 10)}</p>
+      <p className="text-foreground-tertiary text-xs">Last updated: 2026-11-14</p>
 
       <p>
         This page describes how Clappe ("we") handles personal information when you use FileManager. It is written
@@ -25,10 +25,16 @@ export default function PrivacyPage() {
 
       <h2 className="text-xl font-bold text-foreground mt-8">What our website collects</h2>
       <p>
-        Standard web server logs (IP, user agent, requested path, response code) retained for 30 days for abuse
-        prevention. We do not deploy third-party analytics, advertising trackers, or social-network embeds. If you
-        submit the waitlist form on the pricing page, we keep your email until you ask us to delete it or until
-        Business launches and you decline to convert.
+        Our website uses server logs for operation and abuse prevention. These can include your IP address,
+        browser information, requested page and response status. The production website also uses first-party
+        Matomo analytics, served from /mtm/, to measure page visits and link clicks. Where enabled, Matomo
+        cookies can recognize returning browsers and group visits into sessions. Website measurement is
+        separate from the desktop application's settings.
+      </p>
+      <p>
+        If you submit the waitlist form, we use the details you provide to contact you about Business availability.
+        Contact privacy@clappe.com to request access or deletion, or to ask about the current retention settings
+        for website logs, analytics and waitlist records.
       </p>
 
       <h2 className="text-xl font-bold text-foreground mt-8">Your credentials</h2>

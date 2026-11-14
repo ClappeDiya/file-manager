@@ -140,7 +140,7 @@ export default function FleetDashboardPage() {
                 {data.largestBackups.length === 0 && (
                   <TableRow>
                     <TableCell colSpan={5} className="text-center text-foreground-secondary">
-                      No backups reported yet. <Link href="/fleet/enroll" className="text-primary">Enroll a machine</Link>.
+                      No backups reported yet. <Link href="/fleet/enroll" className="text-primary underline underline-offset-2">Enroll a machine</Link>.
                     </TableCell>
                   </TableRow>
                 )}

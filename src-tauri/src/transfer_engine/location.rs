@@ -195,6 +195,14 @@ pub trait RemoteResolver: Send + Sync {
     fn connector(&self, connection_id: Uuid) -> BoxFuture<'_, Result<Arc<dyn Connector>, AppError>>;
 }
 
+/// Local plans and move cleanup do not need a connection manager.
+pub struct LocalOnlyResolver;
+impl RemoteResolver for LocalOnlyResolver {
+    fn connector(&self, _id: Uuid) -> BoxFuture<'_, Result<Arc<dyn Connector>, AppError>> {
+        Box::pin(async { Err(AppError::validation("Choose a saved connection for a remote location.")) })
+    }
+}
+
 /// One item the user picked (as the pane listed it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationItem {
@@ -249,11 +257,9 @@ pub async fn list(loc: &Location, resolver: &dyn RemoteResolver) -> Result<Vec<F
             tokio::task::spawn_blocking(move || -> Result<Vec<FileEntry>, AppError> {
                 let mut out = Vec::new();
                 let rd = std::fs::read_dir(&dir).map_err(|e| AppError::file_op(format!("Cannot read {dir}: {e}"), "Check the folder exists and you may open it."))?;
-                for entry in rd.flatten() {
-                    let meta = match entry.metadata() {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+                for entry in rd {
+                    let entry = entry.map_err(|e| AppError::file_op(format!("Cannot read an entry in {dir}: {e}"), "Check folder permissions and try again."))?;
+                    let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| AppError::file_op(format!("Cannot inspect {}: {e}", entry.path().display()), "Check permissions and try again."))?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     out.push(FileEntry {
                         path: entry.path().to_string_lossy().to_string(),
@@ -375,6 +381,9 @@ async fn expand_dir(source: &Location, dest: &Location, resolver: &dyn RemoteRes
         plan.dirs.push(dst.to_location_string());
         plan.source_dirs.push(src.to_location_string());
         for entry in list(&src, resolver).await? {
+            if entry.is_symlink {
+                return Err(AppError::validation(format!("{} is a symbolic link. Transfer its target explicitly; folder transfers do not follow links.", entry.path)));
+            }
             let child_src = match &src {
                 Location::Local(_) => Location::Local(entry.path.clone()),
                 Location::Remote { connection_id, .. } => Location::Remote { connection_id: *connection_id, path: entry.path.clone() },

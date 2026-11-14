@@ -23,6 +23,7 @@ export function AdminShell({ children }: AdminShellProps) {
   const [checkedOnce, setCheckedOnce] = React.useState(false);
   const applyTheme = useAdminStore((s) => s.applyTheme);
   const theme = useAdminStore((s) => s.theme);
+  const mobileNavigationOpen = useAdminStore((s) => s.sidebarMobileOpen);
   const t = useTranslate();
 
   useEffect(() => {
@@ -75,7 +76,7 @@ export function AdminShell({ children }: AdminShellProps) {
         {t('shell.skipToContent')}
       </a>
       <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div inert={mobileNavigationOpen || undefined} className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ViewAsBanner />
         <Header />
         <main id="admin-main" tabIndex={-1} className="flex-1 overflow-y-auto p-4 lg:p-6">

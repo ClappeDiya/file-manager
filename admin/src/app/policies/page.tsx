@@ -237,6 +237,7 @@ export default function PoliciesPage() {
           className="sm:w-72"
         />
         <Select
+              aria-label="Filter policies by domain"
           options={[{ value: '', label: 'All Domains' }, ...domainOptions]}
           value={domainFilter}
           onChange={(e) => setDomainFilter(e.target.value)}

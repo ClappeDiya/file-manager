@@ -7,7 +7,7 @@
  * `reportOperationFailure` call invisible to Advanced-mode users — a failed
  * Delete produced a store entry and nothing on screen. The
  * "SimpleModeWrapper integration" block below is the guard that matters: it
- * asserts the surface survives the Advanced-mode early return.
+ * asserts the shared surface remains available in Advanced mode.
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
@@ -105,28 +105,11 @@ describe("NotificationBell - SimpleModeWrapper integration", () => {
     expect(screen.getByTestId("notification-bell")).toBeInTheDocument();
   });
 
-  it("renders the bell in Advanced mode, where the wrapper early-returns", () => {
+  it("keeps one shared notification surface in Advanced mode", () => {
     useUIStore.getState().setAppMode("advanced");
     addError("Delete failed");
-
-    // SimpleModeWrapper returns `fileManager` verbatim in Advanced mode, so the
-    // Advanced shell must mount its own bell. Standing in for FileManager here
-    // keeps the test off that 4k-line component while pinning the contract:
-    // an Advanced-mode shell is responsible for its own NotificationBell.
-    render(
-      <SimpleModeWrapper
-        fileManager={
-          <div>
-            files
-            <NotificationBell />
-          </div>
-        }
-      />,
-    );
-
-    expect(screen.getByTestId("notification-bell")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "1 notification" }),
-    ).toBeInTheDocument();
+    render(<SimpleModeWrapper fileManager={<div>files</div>} />);
+    expect(screen.getAllByTestId("notification-bell")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "1 notification" })).toBeInTheDocument();
   });
 });

@@ -1,64 +1,8 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { listSharedConnections, listSyncTemplates, listWorkspaces } from '@/lib/db/repos/workspaces';
-import { requireRole, isAuthorized } from '@/lib/utils/require-role';
+import type { NextRequest } from 'next/server';
+import { notAvailable } from '@/lib/features';
 
-/** GET /api/workspaces - List workspaces and shared resources */
-export async function GET(request: NextRequest) {
-  const authResult = await requireRole(request, 'viewer');
-  if (!isAuthorized(authResult)) return authResult;
-
-  const { searchParams } = new URL(request.url);
-  const type = searchParams.get('type'); // connections, templates, workspaces
-
-  switch (type) {
-    case 'connections':
-      return NextResponse.json({ connections: listSharedConnections() });
-    case 'sync_templates':
-      return NextResponse.json({ templates: listSyncTemplates() });
-    default:
-      return NextResponse.json({
-        workspaces: listWorkspaces(),
-        connections: listSharedConnections(),
-        syncTemplates: listSyncTemplates(),
-      });
-  }
-}
-
-/** POST /api/workspaces - Share a resource or create a workspace */
-export async function POST(request: NextRequest) {
-  const authResult = await requireRole(request, 'manager');
-  if (!isAuthorized(authResult)) return authResult;
-
-  try {
-    const body = await request.json();
-    const { action } = body;
-
-    switch (action) {
-      case 'share_connection':
-        return NextResponse.json({
-          success: true,
-          message: 'Connection shared. Propagation will complete within 5 minutes.',
-        });
-      case 'share_template':
-        return NextResponse.json({
-          success: true,
-          message: 'Template shared. Propagation will complete within 5 minutes.',
-        });
-      case 'activate_template':
-        return NextResponse.json({
-          success: true,
-          message: 'Template activated for your desktop client.',
-        });
-      case 'propagate':
-        return NextResponse.json({
-          success: true,
-          message: 'Propagation initiated. Target clients will sync within 5 minutes.',
-          estimatedCompletionSeconds: 180,
-        });
-      default:
-        return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
-    }
-  } catch {
-    return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
-  }
-}
+// The former route returned every organization's records and acknowledged
+// grants/propagation without writing them. Refuse until authorized, scoped
+// persistence and actual desktop delivery exist together.
+export async function GET(_request: NextRequest) { return notAvailable('sharedWorkspaces'); }
+export async function POST(_request: NextRequest) { return notAvailable('sharedWorkspaces'); }

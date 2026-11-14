@@ -280,6 +280,7 @@ export default function UsersPage() {
               className="sm:w-72"
             />
             <Select
+              aria-label="Filter users by role"
               options={[{ value: '', label: 'All Roles' }, ...roleOptions]}
               value={roleFilter}
               onChange={(e) => setRoleFilter(e.target.value)}

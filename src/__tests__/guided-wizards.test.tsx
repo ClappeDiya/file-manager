@@ -33,6 +33,8 @@ import {
 } from "@/components/guided-flows/utility-flows";
 import { getDefaultCommands } from "@/components/command-palette";
 import { syncTrigger } from "@/lib/guided-actions";
+import { useTransferWorkspace } from "@/stores/transfer-workspace-store";
+import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
 
 type Handler = (a: Record<string, unknown>) => unknown;
@@ -56,6 +58,8 @@ function backend() {
         return [];
       case "save_connection":
         return { id: "c1", name: args.name, protocol: args.protocol };
+      case "enqueue_local_transfer":
+        return { jobs: [{ id: "local-1", source_path: (args.sourcePaths as string[])[0], dest_path: `${args.destDir}/file.txt`, status: "queued", total_bytes: 1, transferred_bytes: 0, error_message: null }], folders_created: 0, dest_paths: [`${args.destDir}/file.txt`] };
       case "copy_files":
       case "move_files":
         return { success: true, operation: cmd, source_paths: args.sourcePaths, dest_paths: (args.sourcePaths as string[]).map((s) => `${args.destDir}/${s.split("/").pop()}`), undo_id: "u" };
@@ -124,6 +128,9 @@ beforeAll(() => {
 
 beforeEach(() => {
   over = {};
+  useTransferWorkspace.setState({ sessions: [], selectedId: null });
+  const files = useFileManagerStore.getState();
+  for (const index of [0, 1] as const) { const tab = files.getActiveTab(index); if (tab) files.navigateTab(index, tab.id, "/", "Root"); }
   useUIStore.setState({ activeGuidedFlow: "x", activityFeed: [] });
   mockInvoke.mockReset();
   pickFolderMock.mockClear();
@@ -263,8 +270,20 @@ describe("server wizards", () => {
 });
 
 describe("transfer wizards", () => {
+  it("moves focus into each transfer step and keeps Tab inside the dialog", async () => {
+    render(<StartTransferWizard />);
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Source" })).toHaveFocus());
+    type("/Users/you/Documents/project", "/src");
+    next();
+    expect(screen.getByRole("textbox", { name: "Destination" })).toHaveFocus();
+    type("/Volumes/External/backup", "/dst");
+    next();
+    expect(screen.getByRole("dialog")).toContainElement(document.activeElement as HTMLElement);
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(screen.getByRole("dialog")).toContainElement(document.activeElement as HTMLElement);
+  });
   it("keeps a rejected copy open without recording a completed transfer", async () => {
-    over.copy_files = () => ({ success: false, dest_paths: [] });
+    over.enqueue_local_transfer = () => ({ jobs: [], dest_paths: [] });
     render(<StartTransferWizard />);
     type("/Users/you/Documents/project", "/src/file.txt");
     next();
@@ -272,24 +291,37 @@ describe("transfer wizards", () => {
     next();
     next();
     next(/Start Transfer/);
-    expect(await screen.findByText(/The transfer did not finish/)).toBeInTheDocument();
+    expect(await screen.findByText(/The transfer was not accepted/)).toBeInTheDocument();
     expect(useUIStore.getState().activeGuidedFlow).toBe("x");
   });
 
-  it("Transfer Files copies and verifies by checksum; a mismatch keeps the wizard open", async () => {
-    over.integrity_checksum = (a) => ({ hash: String(a.path).startsWith("/dst") ? "other" : "orig" });
+  it("hands a real queued copy to two visible folder panes without claiming completion", async () => {
     render(<StartTransferWizard />);
     type("/Users/you/Documents/project", "/src/file.txt");
     next();
     type("/Volumes/External/backup", "/dst");
     next();
-    fireEvent.click(screen.getByText("Verify files after transfer"));
+    expect(screen.getByText(/Local transfers verify file checksums automatically/)).toBeInTheDocument();
     next();
     next(/Start Transfer/);
-    expect(await screen.findByText(/the check found a problem: The copy's content differs/)).toBeInTheDocument();
-    expect(calls("copy_files")[0]).toEqual({ sourcePaths: ["/src/file.txt"], destDir: "/dst" });
-    expect(calls("integrity_checksum").map((a) => a.path)).toEqual(["/src/file.txt", "/dst/file.txt"]);
-    expect(useUIStore.getState().activeGuidedFlow).toBe("x");
+    await closed();
+    expect(calls("enqueue_local_transfer")[0]).toEqual({ sourcePaths: ["/src/file.txt"], destDir: "/dst", mode: "copy" });
+    expect(useFileManagerStore.getState().singlePaneMode).toBe(false);
+    expect(useFileManagerStore.getState().getActiveTab(0)?.path).toBe("/src");
+    expect(useFileManagerStore.getState().getActiveTab(1)?.path).toBe("/dst");
+    expect(useTransferWorkspace.getState().sessions[0].jobs[0].id).toBe("local-1");
+    expect(lastActivity()).toContain("1 files queued");
+    expect(lastActivity()).not.toContain("verified");
+  });
+
+  it("does not close or record success when the native queue rejects a source", async () => {
+    over.enqueue_local_transfer = () => { throw new Error("Cannot open source: permission denied"); };
+    render(<StartTransferWizard />);
+    type("/Users/you/Documents/project", "/src/file.txt"); next();
+    type("/Volumes/External/backup", "/dst"); next(); next(); next(/Start Transfer/);
+    expect(await screen.findByRole("alert")).toHaveTextContent("permission denied");
+    expect(useTransferWorkspace.getState().sessions).toEqual([]);
+    expect(useUIStore.getState().activityFeed).toEqual([]);
   });
 
   it("Interrupted Operation lists paused and failed transfers and resumes them", async () => {

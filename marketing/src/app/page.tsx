@@ -14,13 +14,13 @@ export default function HomePage() {
         <div className="container-wide">
           <div className="max-w-3xl">
             <span className="pill mb-6">
-              <ShieldCheck size={12} /> Source-available · Local-first · No telemetry
+              <ShieldCheck size={12} /> Source-available · Local-first desktop app
             </span>
             <h1 className="text-5xl md:text-6xl font-bold tracking-tight text-foreground leading-[1.05]">
               The file manager built for people who move data for a living.
             </h1>
             <p className="mt-6 text-xl text-foreground-secondary leading-relaxed">
-              Local + remote browsing, 17 protocols, crash-safe transfers, real-time sync, and a local AI assistant
+              Local and remote browsing, verified local transfers, folder sync, and an optional local AI assistant
               — all in one cross-platform desktop app. Free for individuals. Always.
             </p>
             <div className="mt-8">
@@ -46,15 +46,15 @@ export default function HomePage() {
           <div className="flex items-start gap-3">
             <Gauge className="text-primary mt-1 shrink-0" size={20} />
             <div>
-              <p className="font-semibold text-foreground">17 protocols, one engine</p>
-              <p className="text-sm text-foreground-secondary">Resume, checksum, throttle, and recover the same way across every backend.</p>
+              <p className="font-semibold text-foreground">Connect your storage</p>
+              <p className="text-sm text-foreground-secondary">Browse local drives, cloud services and servers. Transfer capabilities depend on the connection.</p>
             </div>
           </div>
           <div className="flex items-start gap-3">
             <ShieldCheck className="text-primary mt-1 shrink-0" size={20} />
             <div>
               <p className="font-semibold text-foreground">Your files stay yours</p>
-              <p className="text-sm text-foreground-secondary">No cloud relay. No telemetry by default. Credentials live in your OS keychain.</p>
+              <p className="text-sm text-foreground-secondary">Choose which services to connect. Local file operations run on your computer.</p>
             </div>
           </div>
         </div>

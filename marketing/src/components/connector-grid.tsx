@@ -33,23 +33,26 @@ export function ConnectorGrid() {
     <section id="connectors" className="marketing-section bg-background-secondary">
       <div className="container-wide">
         <div className="text-center max-w-3xl mx-auto mb-12">
-          <h2 className="marketing-heading">17 protocols. One app. Zero adapters.</h2>
+          <h2 className="marketing-heading">Your storage, in one workspace.</h2>
           <p className="marketing-subheading mt-4">
-            Every connector implements the same crash-safe transfer engine. Resume, checksum, throttle, and recover the same way no matter what's at the other end.
+            Connect local drives, cloud storage and servers. Available operations, verification and resume support depend on the service.
           </p>
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+        <details className="group">
+        <summary className="cursor-pointer text-primary font-medium py-3">View supported connections and transfer methods</summary>
+        <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
           {connectors.map((c) => (
             <div
               key={c.name}
-              className="bg-background-elevated rounded-lg border border-border p-4 flex items-center justify-between"
+              className="bg-background-elevated rounded-lg border border-border p-4 flex flex-wrap gap-2 items-center justify-between"
             >
               <span className="font-medium text-sm text-foreground">{c.name}</span>
               <span className={`text-xs px-2 py-0.5 rounded-full border ${kindColors[c.kind] ?? ''}`}>{c.kind}</span>
             </div>
           ))}
         </div>
+        </details>
       </div>
     </section>
   );

@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Menu, X, Download } from 'lucide-react';
 
 const navLinks = [
@@ -14,6 +14,13 @@ const navLinks = [
 
 export function SiteNav() {
   const [open, setOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const escape = (e: KeyboardEvent) => { if (e.key === 'Escape') { setOpen(false); menuButton.current?.focus(); } };
+    document.addEventListener('keydown', escape);
+    return () => document.removeEventListener('keydown', escape);
+  }, [open]);
 
   return (
     <header className="sticky top-0 z-40 w-full border-b border-border bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70">
@@ -24,7 +31,7 @@ export function SiteNav() {
           <span className="pill ml-2">by Clappe</span>
         </Link>
 
-        <nav className="hidden md:flex items-center gap-7 text-sm">
+        <nav aria-label="Main navigation" className="hidden md:flex items-center gap-7 text-sm">
           {navLinks.map((link) => (
             <Link key={link.href} href={link.href} className="text-foreground-secondary hover:text-foreground transition-colors">
               {link.label}
@@ -46,7 +53,10 @@ export function SiteNav() {
           type="button"
           className="md:hidden p-2 rounded-md text-foreground-secondary hover:bg-background-secondary"
           onClick={() => setOpen(!open)}
-          aria-label="Toggle menu"
+          ref={menuButton}
+          aria-label={open ? "Close navigation menu" : "Open navigation menu"}
+          aria-expanded={open}
+          aria-controls="public-mobile-navigation"
         >
           {open ? <X size={20} /> : <Menu size={20} />}
         </button>
@@ -54,7 +64,7 @@ export function SiteNav() {
 
       {open && (
         <div className="md:hidden border-t border-border bg-background">
-          <nav className="container-wide py-4 flex flex-col gap-3 text-sm">
+          <nav id="public-mobile-navigation" aria-label="Mobile navigation" className="container-wide py-4 flex flex-col gap-3 text-sm">
             {navLinks.map((link) => (
               <Link
                 key={link.href}

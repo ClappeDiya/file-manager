@@ -1,7 +1,16 @@
 import { useCallback, useRef, useState, useEffect } from "react";
+import { useTransferWorkspace } from "@/stores/transfer-workspace-store";
+import { sameFolder } from "@/lib/location";
+import { useMediaQuery } from "@/hooks/use-media-query";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
-import { PanelLeftClose, PanelRightClose, Columns2, Rows2, GitCompareArrows } from "lucide-react";
+import {
+  PanelLeftClose,
+  PanelRightClose,
+  Columns2,
+  Rows2,
+  GitCompareArrows,
+} from "lucide-react";
 import { useCompareStore } from "@/stores/compare-store";
 import { Button } from "@ufop/ui-components";
 
@@ -29,9 +38,12 @@ export function DualPaneLayout({
   const paneSplitPercent = useFileManagerStore((s) => s.paneSplitPercent);
   const paneOrientation = useFileManagerStore((s) => s.paneOrientation);
   const setActivePaneIndex = useFileManagerStore((s) => s.setActivePaneIndex);
-  const toggleSinglePaneMode = useFileManagerStore((s) => s.toggleSinglePaneMode);
+  const toggleSinglePaneMode = useFileManagerStore(
+    (s) => s.toggleSinglePaneMode,
+  );
   const setPaneSplitPercent = useFileManagerStore((s) => s.setPaneSplitPercent);
-  const isVertical = paneOrientation === "vertical";
+  const narrow = useMediaQuery("(max-width: 639px)");
+  const isVertical = narrow || paneOrientation === "vertical";
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -47,14 +59,23 @@ export function DualPaneLayout({
         }
       }
       // Cmd+Shift+D to toggle dual pane
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "d") {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        e.shiftKey &&
+        e.key.toLowerCase() === "d"
+      ) {
         e.preventDefault();
         toggleSinglePaneMode();
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activePaneIndex, singlePaneMode, setActivePaneIndex, toggleSinglePaneMode]);
+  }, [
+    activePaneIndex,
+    singlePaneMode,
+    setActivePaneIndex,
+    toggleSinglePaneMode,
+  ]);
 
   // Drag to resize
   const handleDividerMouseDown = useCallback(
@@ -111,7 +132,13 @@ export function DualPaneLayout({
 
   if (singlePaneMode) {
     return (
-      <div className="flex h-full flex-col" data-testid="dual-pane-layout">
+      <div
+        className={cn(
+          "flex h-full min-h-0 flex-col",
+          narrow && "min-h-[580px]",
+        )}
+        data-testid="dual-pane-layout"
+      >
         <PaneToolbar />
         <div
           className={cn(
@@ -123,19 +150,23 @@ export function DualPaneLayout({
           role="region"
           aria-label="File pane"
         >
-          {renderPane(0)}
+          <PaneHeading index={0} />
+          <div className="flex-1 min-h-0 overflow-hidden">{renderPane(0)}</div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex h-full flex-col" data-testid="dual-pane-layout">
+    <div
+      className={cn("flex h-full min-h-0 flex-col", narrow && "min-h-[580px]")}
+      data-testid="dual-pane-layout"
+    >
       <PaneToolbar />
       <div
         ref={containerRef}
         className={cn(
-          "flex flex-1 overflow-hidden",
+          "flex flex-1 min-h-0 overflow-hidden",
           isVertical ? "flex-col" : "flex-row",
           isDragging && "select-none",
         )}
@@ -143,14 +174,16 @@ export function DualPaneLayout({
         {/* First Pane (Left or Top) */}
         <div
           className={cn(
-            "overflow-hidden border-2 transition-theme",
+            "flex flex-col min-w-0 min-h-0 overflow-hidden border-2 transition-theme",
             activePaneIndex === 0
               ? "border-[var(--color-primary)]"
               : "border-transparent",
           )}
           style={
             isVertical
-              ? { height: `calc(${paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)` }
+              ? {
+                  height: `calc(${paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)`,
+                }
               : { width: `calc(${paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)` }
           }
           onClick={() => setActivePaneIndex(0)}
@@ -158,7 +191,8 @@ export function DualPaneLayout({
           role="region"
           aria-label={isVertical ? "Top file pane" : "Left file pane"}
         >
-          {renderPane(0)}
+          <PaneHeading index={0} />
+          <div className="flex-1 min-h-0 overflow-hidden">{renderPane(0)}</div>
         </div>
 
         {/* Divider */}
@@ -186,31 +220,38 @@ export function DualPaneLayout({
           tabIndex={0}
           data-testid="pane-divider"
         >
-          <div className={cn(
-            "rounded-full bg-[var(--color-text-tertiary)] opacity-50",
-            isVertical ? "w-8 h-1" : "h-8 w-1",
-          )} />
+          <div
+            className={cn(
+              "rounded-full bg-[var(--color-text-tertiary)] opacity-50",
+              isVertical ? "w-8 h-1" : "h-8 w-1",
+            )}
+          />
         </div>
 
         {/* Second Pane (Right or Bottom) */}
         <div
           className={cn(
-            "overflow-hidden border-2 transition-theme",
+            "flex flex-col min-w-0 min-h-0 overflow-hidden border-2 transition-theme",
             activePaneIndex === 1
               ? "border-[var(--color-primary)]"
               : "border-transparent",
           )}
           style={
             isVertical
-              ? { height: `calc(${100 - paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)` }
-              : { width: `calc(${100 - paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)` }
+              ? {
+                  height: `calc(${100 - paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)`,
+                }
+              : {
+                  width: `calc(${100 - paneSplitPercent}% - ${DIVIDER_WIDTH / 2}px)`,
+                }
           }
           onClick={() => setActivePaneIndex(1)}
           data-testid="pane-1"
           role="region"
           aria-label={isVertical ? "Bottom file pane" : "Right file pane"}
         >
-          {renderPane(1)}
+          <PaneHeading index={1} />
+          <div className="flex-1 min-h-0 overflow-hidden">{renderPane(1)}</div>
         </div>
       </div>
     </div>
@@ -222,11 +263,15 @@ export function DualPaneLayout({
  */
 function PaneToolbar() {
   const singlePaneMode = useFileManagerStore((s) => s.singlePaneMode);
-  const toggleSinglePaneMode = useFileManagerStore((s) => s.toggleSinglePaneMode);
+  const toggleSinglePaneMode = useFileManagerStore(
+    (s) => s.toggleSinglePaneMode,
+  );
   const activePaneIndex = useFileManagerStore((s) => s.activePaneIndex);
   const setActivePaneIndex = useFileManagerStore((s) => s.setActivePaneIndex);
   const paneOrientation = useFileManagerStore((s) => s.paneOrientation);
-  const togglePaneOrientation = useFileManagerStore((s) => s.togglePaneOrientation);
+  const togglePaneOrientation = useFileManagerStore(
+    (s) => s.togglePaneOrientation,
+  );
   const isVertical = paneOrientation === "vertical";
 
   return (
@@ -240,8 +285,14 @@ function PaneToolbar() {
         variant="ghost"
         size="icon"
         onClick={toggleSinglePaneMode}
-        aria-label={singlePaneMode ? "Enable dual-pane mode" : "Enable single-pane mode"}
-        title={singlePaneMode ? "Dual Pane (Cmd+Shift+D)" : "Single Pane (Cmd+Shift+D)"}
+        aria-label={
+          singlePaneMode ? "Enable dual-pane mode" : "Enable single-pane mode"
+        }
+        title={
+          singlePaneMode
+            ? "Dual Pane (Cmd+Shift+D)"
+            : "Single Pane (Cmd+Shift+D)"
+        }
         data-testid="toggle-pane-mode"
       >
         {singlePaneMode ? (
@@ -257,7 +308,11 @@ function PaneToolbar() {
             variant="ghost"
             size="icon"
             onClick={togglePaneOrientation}
-            aria-label={isVertical ? "Switch to side-by-side layout" : "Switch to top-bottom layout"}
+            aria-label={
+              isVertical
+                ? "Switch to side-by-side layout"
+                : "Switch to top-bottom layout"
+            }
             title={isVertical ? "Side by Side" : "Top / Bottom"}
             data-testid="toggle-pane-orientation"
           >
@@ -302,6 +357,36 @@ function PaneToolbar() {
           </Button>
         </>
       )}
+    </div>
+  );
+}
+
+function PaneHeading({ index }: { index: 0 | 1 }) {
+  const pane = useFileManagerStore((s) => s.panes[index]);
+  const path = pane.tabs.find((t) => t.id === pane.activeTabId)?.path ?? "/";
+  const session = useTransferWorkspace((s) =>
+    s.sessions.find((x) => x.id === s.selectedId),
+  );
+  const label = !session
+    ? index === 0
+      ? "Source folder"
+      : "Destination folder"
+    : sameFolder(path, session.sourceFolder || session.source)
+      ? "Source folder"
+      : sameFolder(path, session.destination)
+        ? "Destination folder"
+        : index === 0
+          ? "Left folder"
+          : "Right folder";
+  return (
+    <div className="px-3 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+      <h2 className="text-sm font-semibold">{label}</h2>
+      <p
+        className="text-xs text-[color:var(--color-text-secondary)] truncate"
+        title={path}
+      >
+        {path}
+      </p>
     </div>
   );
 }

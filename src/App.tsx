@@ -89,8 +89,6 @@ function App() {
         <BrowserRouter>
           <div
             className="h-full"
-            role="application"
-            aria-label="Unified File Operations Platform"
           >
             <a
               href="#main-content"

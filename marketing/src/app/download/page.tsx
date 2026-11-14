@@ -3,7 +3,7 @@ import { Apple, Monitor, Server, Terminal, ShieldCheck, AlertCircle } from 'luci
 
 export const metadata: Metadata = {
   title: 'Download',
-  description: 'Get FileManager for macOS, Windows, or Linux. Signed installers with auto-updates.',
+  description: 'Check installer availability and platform requirements for FileManager on macOS, Windows, and Linux.',
 };
 
 export const revalidate = 300;
