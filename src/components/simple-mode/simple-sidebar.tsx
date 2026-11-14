@@ -39,6 +39,7 @@ export type SimpleNavSection =
   | "settings";
 
 interface SimpleSidebarProps {
+  compact?: boolean;
   activeSection: SimpleNavSection;
   onSectionChange: (section: SimpleNavSection) => void;
   className?: string;
@@ -109,6 +110,7 @@ const NAV_ITEMS: {
 // ──────────────────────────────────────────────
 
 export function SimpleSidebar({
+  compact = false,
   activeSection,
   onSectionChange,
   className,
@@ -137,7 +139,8 @@ export function SimpleSidebar({
             <button
               key={item.id}
               className={cn(
-                "flex items-center gap-3 w-full px-4 py-3 rounded-lg text-left",
+                "flex items-center gap-3 w-full py-3 rounded-lg text-left",
+                compact ? "px-2 justify-center" : "px-4",
                 "transition-all duration-150",
                 "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
                 activeSection === item.id
@@ -149,7 +152,7 @@ export function SimpleSidebar({
               title={item.description}
             >
               {item.icon}
-              <div className="flex-1 min-w-0">
+              <div className={compact ? "sr-only" : "flex-1 min-w-0"}>
                 <span className="text-sm font-medium">{item.label}</span>
               </div>
               {activeSection === item.id && (
@@ -163,7 +166,8 @@ export function SimpleSidebar({
         <div className="px-2 pt-3 mt-auto border-t border-[var(--color-border)]">
           <button
             className={cn(
-              "flex items-center gap-3 w-full px-4 py-3 rounded-lg text-left",
+              "flex items-center gap-3 w-full py-3 rounded-lg text-left",
+                compact ? "px-2 justify-center" : "px-4",
               "text-[color:var(--color-text-tertiary)] hover:bg-[var(--color-hover-bg)] hover:text-[color:var(--color-text)]",
               "transition-all duration-150",
               "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
@@ -178,7 +182,7 @@ export function SimpleSidebar({
             }
           >
             <Sparkles className="h-5 w-5" aria-hidden="true" />
-            <div className="flex-1 min-w-0">
+            <div className={compact ? "sr-only" : "flex-1 min-w-0"}>
               <span className="text-sm font-medium">
                 {appMode === "simple" ? "More Options" : "Simple Mode"}
               </span>

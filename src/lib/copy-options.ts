@@ -213,7 +213,9 @@ export function countChangedOptions(options: CopyOptions): number {
 
 /** True on Windows, where NTFS attribute and permission options apply. */
 export function isWindowsPlatform(): boolean {
-  return typeof navigator !== "undefined" && /win/i.test(navigator.platform || navigator.userAgent);
+  if (typeof navigator === "undefined") return false;
+  if (navigator.platform) return /^win/i.test(navigator.platform);
+  return /Windows (?:NT|Phone)|Win(?:32|64|CE)\b/i.test(navigator.userAgent);
 }
 
 /** Attribute letters Robocopy understands (RASHCNETO). */

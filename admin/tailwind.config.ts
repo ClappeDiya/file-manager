@@ -3,6 +3,7 @@ import type { Config } from 'tailwindcss';
 const config: Config = {
   content: [
     './src/**/*.{js,ts,jsx,tsx,mdx}',
+    '../packages/ui-components/src/**/*.{ts,tsx}',
   ],
   darkMode: ['class', '[data-theme="dark"]'],
   theme: {

@@ -1,4 +1,7 @@
 import { useState, useCallback } from "react";
+import { TransferPanel } from "@/components/transfer-panel";
+import { SyncPanel } from "@/components/sync-panel";
+import { ConnectionPanel } from "@/components/connection-panel";
 import { FileManager } from "@/components/file-manager";
 import { SimpleModeWrapper } from "@/components/simple-mode";
 import { OnboardingWizard } from "@/components/onboarding-wizard";
@@ -47,12 +50,15 @@ export function HomePage() {
       {/* Main app content */}
       <SimpleModeWrapper
         fileManager={<FileManager />}
+        transferPanel={<div className="h-full flex flex-col min-w-0"><button className="self-start m-3 rounded-md bg-[var(--color-primary)] text-[var(--color-primary-foreground)] px-4 py-2" onClick={() => handleOpenGuidedFlow("start-transfer")}>Start a Transfer</button><TransferPanel /></div>}
+        syncPanel={<SyncPanel />}
+        connectionPanel={<ConnectionPanel />}
         onOpenOnboarding={handleOpenOnboarding}
         onOpenGuidedFlow={handleOpenGuidedFlow}
       />
 
       {/* Onboarding wizard (T-055) */}
-      {showOnboarding && (
+      {showOnboarding && !onboardingComplete && (
         <OnboardingWizard
           onComplete={handleOnboardingComplete}
           onOpenGuidedFlow={handleOpenGuidedFlow}

@@ -102,19 +102,19 @@ export default async function DownloadPage() {
       <header className="max-w-3xl mb-12">
         <h1 className="marketing-heading">Download FileManager</h1>
         <p className="marketing-subheading mt-4">
-          Free. Signed. Auto-updating. Pick your OS below — every installer is code-signed and verified before release.
+          Choose your desktop platform below. Available installers link to the published release.
         </p>
         {!release && (
           <div className="mt-6 flex items-start gap-3 rounded-md border border-warning bg-warning-bg p-4">
             <AlertCircle size={18} className="mt-0.5 shrink-0 text-warning" />
             <div className="text-sm">
-              <p className="font-medium text-warning-foreground">Pre-release — installers coming soon.</p>
+              <p className="font-medium text-warning-foreground">Installers currently unavailable.</p>
               <p className="mt-1 text-warning-foreground">
-                Signed binaries are being prepared for the first public release. Star{' '}
+                No public release could be loaded. Check availability on{' '}
                 <a href={`https://github.com/${REPO}`} className="underline" rel="noopener">
                   the repo
                 </a>{' '}
-                or check back here to be notified.
+                or try again later.
               </p>
             </div>
           </div>
@@ -160,7 +160,7 @@ export default async function DownloadPage() {
               })}
             </ul>
 
-            {platform.code && (
+            {platform.code && platform.downloads.some((download) => resolveHref(download, release)) && (
               <div>
                 <p className="text-xs text-foreground-tertiary mb-2 flex items-center gap-1">
                   <Terminal size={12} /> Package manager

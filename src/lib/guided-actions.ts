@@ -135,6 +135,9 @@ export async function startTransfer(source: string, destDir: string, mode: Trans
   }
   const meta = verify && mode === "copy" ? await tauriInvoke<FileEntryLite>("get_file_metadata", { path: source }) : null;
   const r = await tauriInvoke<{ success: boolean; dest_paths: string[] }>(mode === "copy" ? "copy_files" : "move_files", { sourcePaths: [source], destDir });
+  if (!r.success || r.dest_paths.length !== 1) {
+    throw new Error("The transfer did not finish. Check the destination before retrying.");
+  }
   if (meta && r.dest_paths[0]) {
     const problem = await verifyCopy(source, r.dest_paths[0], meta.is_dir);
     if (problem) throw new Error(`Copied, but the check found a problem: ${problem}`);

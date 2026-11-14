@@ -3802,8 +3802,8 @@ function FilePane({
         return;
       }
       console.error("Failed to list directory:", err);
-      setError(String(err));
-      setFiles(generateDemoFiles(path));
+      setError(errorText(err));
+      setFiles([]);
       // Path Recall — ask the ledger whether it has any history for
       // this path so we can show the user where it went. Fail-soft:
       // any error during the lineage fetch is silently swallowed,
@@ -5562,9 +5562,10 @@ function FilePane({
         <div className="h-0.5 bg-[var(--color-primary)] animate-pulse" />
       )}
 
-      {error && !isTauriAvailable() && (
+      {error && (
         <div className="px-3 py-1.5 text-[length:var(--font-size-xs)] text-[color:var(--color-error)] bg-[var(--color-error)]/10 border-b border-[var(--color-border)]">
-          {error}
+          <span role="alert">{error}</span>
+          <button type="button" className="ml-3 underline" onClick={() => void loadDirectory(currentPath)}>Retry</button>
         </div>
       )}
 

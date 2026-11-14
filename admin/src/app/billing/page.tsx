@@ -50,6 +50,10 @@ interface Data {
 const money = (cents: number, currency: string) => new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(cents / 100);
 
 export default function BillingPage() {
+  return <React.Suspense fallback={<Loading />}><BillingContent /></React.Suspense>;
+}
+
+function BillingContent() {
   const params = useSearchParams();
   const { data, error, loading } = useApi<Data>('/api/billing');
   const canWrite = useAuthStore((s) => s.checkPermission)('billing.write');

@@ -22,6 +22,7 @@ import { useAuthStore } from '@/lib/stores/auth-store';
 export default function ApprovalsPage() {
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [loading, setLoading] = useState(true);
+  const [decisionError, setDecisionError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState('pending');
   const [searchQuery, setSearchQuery] = useState('');
@@ -78,6 +79,7 @@ export default function ApprovalsPage() {
 
   const handleApprove = async () => {
     if (!selectedApproval || !currentUser) return;
+    setDecisionError(null);
     try {
       const res = await fetch('/api/approvals', {
         method: 'PATCH',
@@ -94,12 +96,8 @@ export default function ApprovalsPage() {
       const data = await res.json();
       setApprovals(approvals.map(a => a.id === selectedApproval.id ? data.approval : a));
     } catch {
-      // Optimistic update fallback
-      setApprovals(approvals.map(a =>
-        a.id === selectedApproval.id
-          ? { ...a, state: 'approved' as ApprovalState, reviewedBy: currentUser.id, reviewedByName: currentUser.name, reviewedAt: new Date().toISOString(), reviewComment }
-          : a
-      ));
+      setDecisionError('The decision could not be confirmed. Refresh the request status before retrying.');
+      return;
     }
     setShowReviewDialog(false);
     setSelectedApproval(null);
@@ -108,6 +106,7 @@ export default function ApprovalsPage() {
 
   const handleDeny = async () => {
     if (!selectedApproval || !currentUser) return;
+    setDecisionError(null);
     try {
       const res = await fetch('/api/approvals', {
         method: 'PATCH',
@@ -124,11 +123,8 @@ export default function ApprovalsPage() {
       const data = await res.json();
       setApprovals(approvals.map(a => a.id === selectedApproval.id ? data.approval : a));
     } catch {
-      setApprovals(approvals.map(a =>
-        a.id === selectedApproval.id
-          ? { ...a, state: 'denied' as ApprovalState, reviewedBy: currentUser.id, reviewedByName: currentUser.name, reviewedAt: new Date().toISOString(), reviewComment }
-          : a
-      ));
+      setDecisionError('The decision could not be confirmed. Refresh the request status before retrying.');
+      return;
     }
     setShowReviewDialog(false);
     setSelectedApproval(null);
@@ -371,6 +367,7 @@ export default function ApprovalsPage() {
             )}
           </div>
         )}
+        {decisionError && <p role="alert" className="text-sm text-error">{decisionError}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={() => { setShowReviewDialog(false); setSelectedApproval(null); setReviewComment(''); }}>
             {selectedApproval?.state === 'pending' ? 'Cancel' : 'Close'}

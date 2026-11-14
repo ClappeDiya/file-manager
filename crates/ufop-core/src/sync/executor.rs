@@ -1670,6 +1670,7 @@ mod tests {
         // The same extra file in both places, so one is left alone.
         fs::write(src.path().join("same.txt"), "same").unwrap();
         fs::write(dst.path().join("same.txt"), "same").unwrap();
+        copier::set_mtime(&dst.path().join("same.txt"), fs::metadata(src.path().join("same.txt")).unwrap().modified().unwrap());
         let events: Arc<Mutex<Vec<FileEvent>>> = Arc::default();
         let sink = events.clone();
         let hooks = RunHooks { on_file: Some(Arc::new(move |e: &FileEvent| sink.lock().unwrap().push(e.clone()))), ..Default::default() };
@@ -2637,7 +2638,11 @@ mod tests {
         run_two_way(&pair, &mut base);
         assert_eq!(fs::read_to_string(src.path().join("Notes.md")).unwrap(), "from source");
         assert_eq!(fs::read_to_string(dst.path().join("notes.md")).unwrap(), "from destination");
-        assert!(!src.path().join("notes.md").exists() && !dst.path().join("Notes.md").exists());
+        // exists() follows case aliases on APFS/NTFS; inspect the actual names.
+        assert_eq!(fs::read_dir(src.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(dst.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(src.path()).unwrap().next().unwrap().unwrap().file_name(), "Notes.md");
+        assert_eq!(fs::read_dir(dst.path()).unwrap().next().unwrap().unwrap().file_name(), "notes.md");
     }
 
     /// Names present on both sides in every case (case-sensitive drives at
@@ -2648,15 +2653,19 @@ mod tests {
         let dst = TempDir::new().unwrap();
         fs::write(src.path().join("A.txt"), "upper").unwrap();
         fs::write(src.path().join("a.txt"), "lower").unwrap();
+        // On case-insensitive filesystems the second write updates the same
+        // file. Exercise that case too, without expecting two distinct files.
+        let distinct = fs::read_dir(src.path()).unwrap().count() == 2;
         let pair = two_way(src.path(), dst.path());
         let mut base = None;
         run_two_way(&pair, &mut base);
-        assert!(dst.path().join("A.txt").exists() && dst.path().join("a.txt").exists());
+        assert_eq!(fs::read_dir(dst.path()).unwrap().count(), if distinct { 2 } else { 1 });
+        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "lower");
         fs::write(src.path().join("A.txt"), "upper, edited").unwrap();
         let out = run_two_way(&pair, &mut base);
         assert_eq!(out.report.files_modified, 1);
         assert_eq!(fs::read_to_string(dst.path().join("A.txt")).unwrap(), "upper, edited");
-        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), "lower");
+        assert_eq!(fs::read_to_string(dst.path().join("a.txt")).unwrap(), if distinct { "lower" } else { "upper, edited" });
     }
 
     /// Second safeguard: a delete goes through only when the folder lists
@@ -2671,9 +2680,12 @@ mod tests {
         let mut names = ListedNames::default();
         assert!(names.lists_exactly(&dir.path().join("Exact.txt")));
         assert!(names.lists_exactly(&dir.path().join("123")));
-        // Both cases exist: the folder listing decides.
-        assert!(names.lists_exactly(&dir.path().join("ab")));
-        assert!(names.lists_exactly(&dir.path().join("AB")));
+        // Only case-sensitive filesystems can store both. The exact directory
+        // listing, rather than exists() opening an alias, decides in either case.
+        let listed: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        for name in ["ab", "AB"] {
+            assert_eq!(names.lists_exactly(&dir.path().join(name)), listed.iter().any(|n| n == name));
+        }
         // What a case-insensitive drive would open as Exact.txt.
         assert!(!names.lists_exactly(&dir.path().join("exact.txt")));
         assert!(!names.lists_exactly(&dir.path().join("EXACT.TXT")));
@@ -3242,7 +3254,7 @@ mod tests {
         set_age_days(&src.path().join("a.txt"), 1);
         set_age_days(&src.path().join("b.txt"), 1);
         let mut pair = make_test_pair(src.path(), dst.path());
-        // Without kept timestamps every rerun would copy everything again.
+        // Exercise checkpoint matching independently of platform copy timestamp behavior.
         pair.copy_options.copy_timestamps = false;
         let steps = Arc::new(Mutex::new(SyncCheckpoint::for_pair(&pair, Uuid::new_v4())));
         let rec = steps.clone();
@@ -3254,6 +3266,11 @@ mod tests {
         };
         let first = execute_sync_with(&cfg(pair.clone()), &hooks).unwrap();
         assert_eq!(first.report.files_added, 2);
+        // Emulate a copier that leaves fresh destination timestamps, ensuring
+        // the resumed plan must actually consult both recorded steps.
+        for name in ["a.txt", "b.txt"] {
+            copier::set_mtime(&dst.path().join(name), std::time::SystemTime::now());
+        }
         let mut checkpoint = steps.lock().unwrap().clone();
         assert_eq!(checkpoint.completed.len(), 2);
 
@@ -3265,12 +3282,16 @@ mod tests {
         assert_eq!(resumed.files_modified, 1, "only the changed file is copied again");
         assert_eq!(fs::read_to_string(dst.path().join("b.txt")).unwrap(), "bravo, edited after the crash");
 
-        // Without the checkpoint both files would be copied again.
+        // Force both files into the ordinary plan: macOS copyfile may retain
+        // timestamps even when timestamp copying is not requested.
+        set_age_days(&dst.path().join("a.txt"), 2);
+        set_age_days(&dst.path().join("b.txt"), 2);
         let plain = run_with(pair.clone());
         assert_eq!(plain.files_modified, 2);
         assert!(!plain.resumed);
         // Steps of another kind (a delete recorded for a file now to be copied) never match.
         checkpoint.completed.get_mut("a.txt").unwrap().action = SyncAction::Delete;
+        set_age_days(&dst.path().join("a.txt"), 2);
         let p = planner::compute_preview(&pair).unwrap();
         let a = p.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
         assert!(!checkpoint.covers(a));

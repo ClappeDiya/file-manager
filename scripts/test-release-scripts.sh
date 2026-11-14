@@ -44,6 +44,29 @@ expect_contains() {
   ok "$name"
 }
 
+echo "==> desktop bundle selection"
+mkdir -p "$T/desktop/scripts" "$T/desktop/src-tauri"
+cp scripts/check-tauri-config.sh "$T/desktop/scripts/"
+cp src-tauri/tauri.conf.json "$T/desktop/src-tauri/"
+cp .env.example "$T/desktop/"
+# Exercise missing/wrong defaults as well as the desktop choice. The package
+# has a companion server binary, which Tauri otherwise selected for the app.
+for selected in missing ufop-server unified-file-ops; do
+  printf '[package]\nname = "unified-file-ops"\n' > "$T/desktop/src-tauri/Cargo.toml"
+  if [[ "$selected" != missing ]]; then
+    printf 'default-run = "%s"\n' "$selected" >> "$T/desktop/src-tauri/Cargo.toml"
+  fi
+  out="$(bash "$T/desktop/scripts/check-tauri-config.sh" 2>&1)"
+  code=$?
+  if [[ "$selected" == unified-file-ops && $code -eq 0 ]]; then
+    ok "desktop executable accepted"
+  elif [[ "$selected" != unified-file-ops && $code -ne 0 && "$out" == *'must set default-run'* ]]; then
+    ok "desktop rejects $selected executable selection"
+  else
+    bad "desktop executable selection: $selected (exit $code)"
+  fi
+done
+
 echo "==> release-local.sh --print-plan"
 out="$(UFOP_RELEASE_HOST_OS=linux UFOP_RELEASE_HOST_ARCH=x86_64 env -u UFOP_WINDOWS_CROSS scripts/release-local.sh --print-plan 2>&1)"
 expect_contains "linux host plan" "$out" "x86_64-unknown-linux-gnu     yes" "universal-apple-darwin       skip" "x86_64-pc-windows-msvc       skip" "needs a Windows host" "ufop_0" ".deb" "SHA256SUMS.minisig"

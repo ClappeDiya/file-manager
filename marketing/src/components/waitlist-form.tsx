@@ -33,13 +33,13 @@ export function WaitlistForm() {
       setSeats('');
     } catch (err) {
       setStatus('error');
-      setError(err instanceof Error ? err.message : 'Unexpected error.');
+      setError('Could not save your signup. Check your connection and try again, or contact sales@clappe.com.');
     }
   }
 
   if (status === 'success') {
     return (
-      <div id="waitlist" className="marketing-card text-center">
+      <div id="waitlist" className="marketing-card text-center" role="status">
         <CheckCircle2 size={32} className="text-success mx-auto mb-3" />
         <h3 className="font-semibold text-foreground mb-1">You're on the list.</h3>
         <p className="text-sm text-foreground-secondary">
@@ -59,32 +59,41 @@ export function WaitlistForm() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <label className="flex flex-col gap-1 text-sm"><span>Work email</span>
         <input
           type="email"
           required
+          aria-label="Work email"
           placeholder="Work email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           className="px-3 py-2 rounded-md border border-border bg-background text-foreground text-sm focus:outline-none focus:border-border-focus"
         />
+        </label>
+        <label className="flex flex-col gap-1 text-sm"><span>Company (optional)</span>
         <input
           type="text"
+          aria-label="Company (optional)"
           placeholder="Company (optional)"
           value={company}
           onChange={(e) => setCompany(e.target.value)}
           className="px-3 py-2 rounded-md border border-border bg-background text-foreground text-sm focus:outline-none focus:border-border-focus"
         />
+        </label>
+        <label className="flex flex-col gap-1 text-sm"><span>Team size</span>
         <input
           type="text"
+          aria-label="Team size"
           placeholder="Team size"
           value={seats}
           onChange={(e) => setSeats(e.target.value)}
           className="px-3 py-2 rounded-md border border-border bg-background text-foreground text-sm focus:outline-none focus:border-border-focus"
         />
+        </label>
       </div>
 
       {status === 'error' && error && (
-        <div className="flex items-start gap-2 text-sm text-error">
+        <div role="alert" className="flex items-start gap-2 text-sm text-error">
           <AlertCircle size={16} className="shrink-0 mt-0.5" />
           <span>{error}</span>
         </div>

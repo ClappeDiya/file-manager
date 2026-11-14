@@ -184,11 +184,11 @@ export function SimpleModeWrapper({
         {sidebarOpen && (
           <aside
             className="border-r border-[var(--color-border)] shrink-0 overflow-hidden"
-            style={{ width: sidebarWidth }}
-            role="navigation"
-            aria-label="Main navigation"
+            style={{ width: activeSection === "files" ? 64 : sidebarWidth }}
+            aria-label="Application sections"
           >
             <SimpleSidebar
+              compact={activeSection === "files"}
               activeSection={activeSection}
               onSectionChange={setActiveSection}
             />
@@ -196,7 +196,7 @@ export function SimpleModeWrapper({
         )}
 
         {/* Content area */}
-        <main className="flex-1 overflow-hidden">
+        <main id="simple-main-content" tabIndex={-1} className="flex-1 min-w-0 overflow-auto">
           {renderSection()}
         </main>
       </div>

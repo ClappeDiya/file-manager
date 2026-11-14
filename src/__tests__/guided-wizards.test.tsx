@@ -263,6 +263,19 @@ describe("server wizards", () => {
 });
 
 describe("transfer wizards", () => {
+  it("keeps a rejected copy open without recording a completed transfer", async () => {
+    over.copy_files = () => ({ success: false, dest_paths: [] });
+    render(<StartTransferWizard />);
+    type("/Users/you/Documents/project", "/src/file.txt");
+    next();
+    type("/Volumes/External/backup", "/dst");
+    next();
+    next();
+    next(/Start Transfer/);
+    expect(await screen.findByText(/The transfer did not finish/)).toBeInTheDocument();
+    expect(useUIStore.getState().activeGuidedFlow).toBe("x");
+  });
+
   it("Transfer Files copies and verifies by checksum; a mismatch keeps the wizard open", async () => {
     over.integrity_checksum = (a) => ({ hash: String(a.path).startsWith("/dst") ? "other" : "orig" });
     render(<StartTransferWizard />);

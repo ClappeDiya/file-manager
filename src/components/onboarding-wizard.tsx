@@ -167,10 +167,10 @@ export function OnboardingWizard({ onComplete, onOpenGuidedFlow }: OnboardingWiz
             <ChooseStyleStep userStyle={userStyle} onSelect={setUserStyle} />
           )}
           {onboardingStep === "connect-locations" && (
-            <ConnectLocationsStep onOpenGuidedFlow={onOpenGuidedFlow} />
+            <ConnectLocationsStep onOpenGuidedFlow={(flowId) => { setOnboardingComplete(true); onComplete(); onOpenGuidedFlow?.(flowId); }} />
           )}
           {onboardingStep === "first-action" && (
-            <FirstActionStep onOpenGuidedFlow={onOpenGuidedFlow} />
+            <FirstActionStep onOpenGuidedFlow={(flowId) => { setOnboardingComplete(true); onComplete(); onOpenGuidedFlow?.(flowId); }} />
           )}
           {onboardingStep === "explain-compat" && <ExplainCompatStep />}
           {onboardingStep === "enter-workspace" && <EnterWorkspaceStep />}
@@ -524,6 +524,8 @@ function FirstActionStep({
             onClick={() => {
               if (action.flowId && onOpenGuidedFlow) {
                 onOpenGuidedFlow(action.flowId);
+              } else {
+                useUIStore.getState().setOnboardingComplete(true);
               }
             }}
           >

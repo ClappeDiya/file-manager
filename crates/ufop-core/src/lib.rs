@@ -36,3 +36,5 @@ pub mod webdav;
 pub mod sync;
 pub mod throttle;
 pub mod sync_types;
+
+pub mod local_transfer;
