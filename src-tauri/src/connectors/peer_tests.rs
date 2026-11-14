@@ -39,8 +39,21 @@ async fn status_of(m: &PeerManager, id: Uuid) -> Option<PeerTransferStatus> {
 }
 
 async fn wait_status(m: &PeerManager, id: Uuid, want: PeerTransferStatus) -> PeerTransferProgress {
-    wait_for(&format!("{want:?}"), || async { status_of(m, id).await == Some(want) }).await;
-    m.get_transfer_progress(id).await.unwrap()
+    let first = m.get_transfer_progress(id).await.unwrap();
+    let addresses = m.get_peer(first.peer_id).await.unwrap().addresses;
+    // Discovery can return several interfaces. Allow the production dialer's
+    // per-address timeout plus transfer time, instead of timing out at exactly
+    // the first address's deadline before fallback can succeed.
+    let deadline = std::time::Instant::now() + CONNECT_TIMEOUT * (addresses.len().max(1) as u32 + 1);
+    loop {
+        let p = m.get_transfer_progress(id).await.unwrap();
+        if p.status == want {
+            return p;
+        }
+        assert!(!p.status.is_finished(), "expected {want:?}, transfer ended: {p:?}; addresses: {addresses:?}");
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {want:?}: {p:?}; addresses: {addresses:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// `a` connects to `b` by address; returns `b` as `a` sees it.
@@ -356,12 +369,24 @@ fn unique_names_and_os_detection() {
     assert_eq!(TrustLevel::from_str_lossy("bogus"), TrustLevel::Unknown);
 }
 
+#[test]
+fn mdns_exposes_only_addresses_the_listener_accepts() {
+    let id = Uuid::new_v4().to_string();
+    let props = [("id", id), ("name", "beta".to_string())];
+    let info = |ips: &str| mdns_sd::ServiceInfo::new(MDNS_SERVICE_TYPE, "beta", "beta.local.", ips, 4321, &props[..]).unwrap();
+    assert!(sighting_from_mdns(&info("fe80::1")).is_none(), "IPv6-only resolution is not a reachable IPv4 peer");
+    let s = sighting_from_mdns(&info("fe80::1,127.0.0.1")).unwrap();
+    assert_eq!(s.addresses, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+    assert_eq!(s.port, 4321);
+}
+
 /// Two devices find each other over mDNS (needs a multicast-capable
 /// interface; skipped with a note when the network has none).
 #[tokio::test(flavor = "multi_thread")]
 async fn mdns_discovery_finds_the_other_device() {
     let (a, b) = (side("alpha"), side("beta"));
     if let Err(e) = a.mgr.start_discovery().await {
+        assert!(std::env::var("UFOP_TEST_MDNS").is_err(), "mDNS is required for this run: {e}");
         eprintln!("mDNS unavailable here, skipping: {e}");
         return;
     }

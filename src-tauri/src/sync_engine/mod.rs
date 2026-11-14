@@ -2616,6 +2616,10 @@ mod tests {
         let dst = tempfile::TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), "alpha").unwrap();
         std::fs::write(src.path().join("b.txt"), "bravo").unwrap();
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        for name in ["a.txt", "b.txt"] {
+            copier::set_mtime(&src.path().join(name), older);
+        }
         let mut pair = temp_pair(src.path(), dst.path(), SyncMode::OneWay);
         pair.copy_options.copy_timestamps = false;
         let (mgr, _state) = mgr_with(&pair).await;
@@ -2624,6 +2628,11 @@ mod tests {
         assert!(!first.resumed);
         assert!(!mgr.checkpoint_path(pair.id).exists(), "a finished run leaves no checkpoint");
 
+        // Force a normal re-copy plan independently of macOS copyfile keeping
+        // timestamps even when copy_timestamps is false.
+        for name in ["a.txt", "b.txt"] {
+            copier::set_mtime(&dst.path().join(name), std::time::SystemTime::now());
+        }
         // A run that died after copying a.txt left this behind.
         let preview = mgr.dry_run(pair.id).await.unwrap();
         let a = preview.modifications.iter().find(|e| e.relative_path == "a.txt").unwrap();
@@ -2683,6 +2692,8 @@ mod tests {
         let (mgr, _state) = mgr_with(&pair).await;
         mgr.execute_sync(pair.id).await.unwrap();
         let record = |mgr: &SyncManager, pair: &SyncPair| {
+            // Keep the planned re-copy deterministic across platform copiers.
+            copier::set_mtime(&std::path::Path::new(&pair.dest_path).join("a.txt"), std::time::SystemTime::now() - std::time::Duration::from_secs(86_400));
             let preview = planner::compute_preview(pair).unwrap();
             let a = preview.modifications.iter().chain(&preview.additions).find(|e| e.relative_path == "a.txt").unwrap().clone();
             let journal = checkpoint::Journal::open(&mgr.checkpoint_path(pair.id), pair, Uuid::new_v4(), false).unwrap();
@@ -2700,6 +2711,7 @@ mod tests {
 
         // A checkpoint written for other folders is ignored and removed.
         record(&mgr, &pair);
+        copier::set_mtime(&d2.path().join("a.txt"), std::time::SystemTime::now() - std::time::Duration::from_secs(86_400));
         let r = mgr.execute_sync(pair.id).await.unwrap();
         assert!(!r.resumed);
         assert_eq!(r.files_modified, 1);

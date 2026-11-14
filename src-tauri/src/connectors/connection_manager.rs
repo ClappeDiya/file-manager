@@ -209,25 +209,29 @@ impl ConnectionManager {
                     use std::net::ToSocketAddrs;
                     let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
                     let resolved = match addr.to_socket_addrs() {
-                        Ok(mut addrs) => addrs.next(),
+                        Ok(addrs) => addrs.collect::<Vec<_>>(),
                         Err(e) => {
                             tracing::warn!("Connection test could not resolve {addr}: {e}");
                             return Ok(false);
                         }
                     };
-                    let Some(sock) = resolved else {
+                    if resolved.is_empty() {
                         return Err(AppError::Connection {
                             message: format!("Invalid address {addr}"),
                             advice: "Check the host and port.".to_string(),
                         });
-                    };
-                    match std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_secs(5)) {
-                        Ok(_) => Ok(true),
-                        Err(e) => {
-                            tracing::warn!("Connection test failed for {addr}: {e}");
-                            Ok(false)
+                    }
+                    // A hostname can resolve to IPv6 first while the service
+                    // only listens on IPv4. Try every address within one budget.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    for sock in resolved {
+                        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else { break };
+                        match std::net::TcpStream::connect_timeout(&sock, remaining) {
+                            Ok(_) => return Ok(true),
+                            Err(e) => tracing::warn!("Connection test failed for {sock}: {e}"),
                         }
                     }
+                    Ok(false)
                 })
                 .await
                 .map_err(|e| AppError::internal(format!("Connection test task panicked: {e}")))?

@@ -1345,7 +1345,8 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         let mut data = b"head".to_vec();
-        data.extend(vec![0u8; 8 << 20]);
+        // APFS may allocate small holes eagerly; 32 MiB exceeds that threshold.
+        data.extend(vec![0u8; 32 << 20]);
         data.extend(b"tail");
         write(src.path(), "disk.img", &data);
         let be = LocalBackend::new(dst.path());

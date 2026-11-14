@@ -127,7 +127,7 @@ async fn backup_and_restore_over_rest_and_rpc() {
     let v = s.get(&format!("/api/v1/jobs/{id}/versions"), &tok).await.json::<Value>().await.unwrap();
     assert_eq!(v.as_array().unwrap().len(), 1);
     let out = s.dir.join("out");
-    let r = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out}})).await.json::<Value>().await.unwrap();
+    let r = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out,"restore_owner":"never"}})).await.json::<Value>().await.unwrap();
     assert_eq!(r["report"]["files_restored"], 1);
     assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"server backup");
     // RPC endpoint speaks the desktop command names and argument shapes.
@@ -203,9 +203,9 @@ async fn backup_and_restore_over_rest_and_rpc() {
     let rpc = s.post("/api/v1/rpc/backup_read_file", &tok, json!({"id": id, "path": src.join("a.txt"), "offset": 0, "length": 6})).await.json::<Value>().await.unwrap();
     assert_eq!(rpc["data"], "c2VydmVy", "{rpc}");
     // A mirror restore over the API needs confirm_delete.
-    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true}})).await;
+    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true,"restore_owner":"never"}})).await;
     assert_eq!(mirror.status(), 409);
-    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true},"overrides":{"confirm_delete": true}})).await.json::<Value>().await.unwrap();
+    let mirror = s.post(&format!("/api/v1/jobs/{id}/operations"), &tok, json!({"type":"restore","options":{"target": out, "delete_extraneous": true,"restore_owner":"never"},"overrides":{"confirm_delete": true}})).await.json::<Value>().await.unwrap();
     assert_eq!(mirror["status"], "success", "{mirror}");
     // Estimate and run-all.
     std::fs::write(src.join("b.txt"), b"new since the backup").unwrap();

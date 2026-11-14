@@ -99,19 +99,19 @@ pub async fn probe(host: &str, port: u16, tls: bool, cert: &CertPolicy, timeout:
     };
     n.dns_ms = Some(ms(t.elapsed()));
     n.addresses = addrs.iter().map(|a| a.ip().to_string()).collect();
-    let Some(addr) = addrs.first().copied() else {
+    if addrs.is_empty() {
         n.error = Some("The name resolved to no addresses".into());
         return n;
-    };
+    }
     let t = Instant::now();
-    let sock = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+    let sock = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addrs.as_slice())).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            n.error = Some(format!("TCP connect to {addr} failed: {e}"));
+            n.error = Some(format!("TCP connect to {host}:{port} failed: {e}"));
             return n;
         }
         Err(_) => {
-            n.error = Some(format!("TCP connect to {addr} timed out"));
+            n.error = Some(format!("TCP connect to {host}:{port} timed out"));
             return n;
         }
     };

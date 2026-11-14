@@ -169,6 +169,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Desktop executable selection: without default-run, Tauri can pick the
+# companion ufop-server binary and produce an app bundle with no desktop UI.
+# ---------------------------------------------------------------------------
+if grep -Eq '^[[:space:]]*default-run[[:space:]]*=[[:space:]]*"unified-file-ops"' src-tauri/Cargo.toml; then
+  note "desktop default-run = unified-file-ops"
+else
+  fail "src-tauri/Cargo.toml must set default-run = \"unified-file-ops\" so Tauri bundles the desktop, not ufop-server"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

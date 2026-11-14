@@ -55,6 +55,13 @@ cargo test --lib      # ~733 library tests
 cargo clippy          # Lint
 ```
 
+The shared backup suite exercises real PAR2 repair and requires `par2` on `PATH`
+(on macOS: `brew install par2`; on Debian/Ubuntu: `apt install par2`):
+
+```bash
+cargo test --manifest-path crates/ufop-core/Cargo.toml --features backup
+```
+
 ### Admin console
 ```bash
 pnpm admin:dev        # Port 3001

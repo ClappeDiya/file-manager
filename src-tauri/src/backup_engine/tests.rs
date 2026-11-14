@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::Repository;
+use ufop_core::backup::owner::OwnerPolicy;
 
 async fn manager(dir: &Path) -> BackupManager {
     let repo = Repository::open_in_memory().await.unwrap();
@@ -411,11 +412,14 @@ async fn database_tools_recovery_and_restore_overrides() {
     let j = m.save_job(job(&src, &dst), Some("pw".into())).await.unwrap();
     assert_eq!(m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap().status, "success");
 
-    // Restore with one-off overrides (job settings untouched).
+    // Restore with one-off overrides (job settings untouched). These content
+    // tests opt out of privileged owner restoration; owner-policy coverage lives
+    // in the shared-core restore tests.
     let out = t.path().join("out");
     let ov = RestoreOverrides { download_bps: Some(10_000_000), retries: Some(0), network_timeout_secs: Some(30), ..Default::default() };
-    let r = m.execute(&j.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: ov }).await.unwrap();
+    let r = m.execute(&j.id, BackupOperation::Restore { options: RestoreOptions { restore_owner: OwnerPolicy::Never, target: Some(out.clone()), ..Default::default() }, overrides: ov }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
+    assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"recover me");
     assert_eq!(m.get_job(&j.id).await.unwrap().throttle.download_bps, 0);
     let ser: BackupOperation = serde_json::from_str(r#"{"type":"restore","options":{}}"#).unwrap();
     assert!(matches!(ser, BackupOperation::Restore { overrides, .. } if overrides == RestoreOverrides::default()), "overrides optional");
@@ -989,23 +993,33 @@ async fn concurrency_cap_runs_jobs_in_parallel_but_never_one_job_twice() {
     let both = |x: &str, y: &str| {
         let (m1, m2, x, y) = (m.clone(), m.clone(), x.to_string(), y.to_string());
         async move {
-            let t0 = std::time::Instant::now();
             let (r1, r2) = tokio::join!(m1.execute(&x, BackupOperation::Backup { dry_run: false }), m2.execute(&y, BackupOperation::Backup { dry_run: false }));
-            r1.unwrap();
-            r2.unwrap();
-            t0.elapsed().as_secs_f64()
+            let (r1, r2) = (r1.unwrap(), r2.unwrap());
+            assert_eq!((&*r1.status, &*r2.status), ("success", "success"));
+            let history = m1.run_history(None, 10).await.unwrap();
+            let interval = |id: &str| {
+                let run = history.iter().find(|r| r.id == id).unwrap();
+                (
+                    chrono::DateTime::parse_from_rfc3339(&run.started_at).unwrap(),
+                    chrono::DateTime::parse_from_rfc3339(run.finished_at.as_deref().unwrap()).unwrap(),
+                )
+            };
+            let (a, b) = (interval(&r1.run_id), interval(&r2.run_id));
+            // Observe actual overlap, not a wall-clock deadline that also
+            // measures unrelated CPU, disk and process-start contention.
+            a.0 < b.1 && b.0 < a.1
         }
     };
 
     // Default: one operation at a time.
     assert_eq!(m.effective_caps().await.concurrency(), 1);
-    assert!(both(&a.id, &b.id).await >= 1.15);
+    assert!(!both(&a.id, &b.id).await, "one-at-a-time runs must not overlap");
 
     let mut d = m.global_defaults().await.unwrap();
     d.caps = defaults::TransferCaps { upload_bps: 0, download_bps: 0, max_concurrent_runs: 2 };
     m.set_global_defaults(d.clone()).await.unwrap();
-    assert!(both(&a.id, &b.id).await < 1.15, "two jobs run side by side");
-    assert!(both(&a.id, &a.id).await >= 1.15, "the same job never runs twice at once");
+    assert!(both(&a.id, &b.id).await, "two jobs run side by side");
+    assert!(!both(&a.id, &a.id).await, "the same job never runs twice at once");
 
     // The console's cap wins over the machine's; clearing it restores the machine's.
     m.set_managed_caps(Some(ufop_core::agent::ManagedTransfers { max_concurrent_runs: Some(1), max_upload_kbps: Some(64), max_download_kbps: None })).await;
@@ -1192,7 +1206,7 @@ async fn format_upgrade_rollback_reshard_and_passphrase_change() {
     let r = m.change_passphrase(&j.id, None, "new-pw".into(), None).await.unwrap();
     assert_eq!(r.to_version, 2);
     assert_eq!(m.passphrase(&j.id).await.unwrap().as_deref(), Some("new-pw"));
-    let restore = RestoreOptions { target: Some(out.clone()), ..Default::default() };
+    let restore = RestoreOptions { restore_owner: OwnerPolicy::Never, target: Some(out.clone()), ..Default::default() };
     let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert_eq!(std::fs::read(out.join("src/b.txt")).unwrap(), b"beta");
@@ -1225,7 +1239,7 @@ async fn repository_lock_blocks_other_writers_and_can_be_broken() {
     let e = m.execute(&j.id, BackupOperation::Backup { dry_run: false }).await.unwrap_err();
     assert!(e.user_message().contains("Repository in use by vm (compact)") || e.user_message().contains("Repository in use by"), "{e}");
     // Readers wait for writers too.
-    let restore = RestoreOptions { target: Some(t.path().join("out")), ..Default::default() };
+    let restore = RestoreOptions { restore_owner: OwnerPolicy::Never, target: Some(t.path().join("out")), ..Default::default() };
     assert!(m.execute(&j.id, BackupOperation::Restore { options: restore.clone(), overrides: RestoreOverrides::default() }).await.is_err());
     // Format information needs no lock.
     assert_eq!(m.execute(&j.id, BackupOperation::FormatInfo).await.unwrap().status, "success");
@@ -1237,6 +1251,7 @@ async fn repository_lock_blocks_other_writers_and_can_be_broken() {
     assert_eq!(b.removed, ["ufop-lock.json"]);
     drop(held);
     assert_eq!(m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap().status, "success");
+    assert_eq!(std::fs::read(t.path().join("out/src/a.txt")).unwrap(), b"alpha");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1279,7 +1294,7 @@ async fn read_only_jobs_restore_and_browse_but_never_write() {
     assert!(m2.delete_job(&ro.id, false, true).await.is_err());
     // Reading works, and leaves no trace at the destination.
     let out = t.path().join("out");
-    let r = m2.execute(&ro.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+    let r = m2.execute(&ro.id, BackupOperation::Restore { options: RestoreOptions { restore_owner: OwnerPolicy::Never, target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.summary);
     assert_eq!(std::fs::read(out.join("src/a.txt")).unwrap(), b"alpha");
     assert_eq!(m2.execute(&ro.id, BackupOperation::Verify { full: true, options: None }).await.unwrap().status, "success");
@@ -1588,7 +1603,7 @@ async fn restore_access_by_time_files_cache_and_mirror() {
     let asof = VersionSelector::AsOf { time: between, allow_partial: false };
     let r = m.resolve_version(&j.id, asof.clone(), None).await.unwrap();
     assert_eq!(r.index, 1);
-    let restore = RestoreOptions { selector: Some(asof.clone()), target: Some(out.clone()), ..Default::default() };
+    let restore = RestoreOptions { restore_owner: OwnerPolicy::Never, selector: Some(asof.clone()), target: Some(out.clone()), ..Default::default() };
     let r = m.execute(&j.id, BackupOperation::Restore { options: restore, overrides: RestoreOverrides::default() }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert_eq!(r.report["version_index"], 1);
@@ -1625,7 +1640,7 @@ async fn restore_access_by_time_files_cache_and_mirror() {
 
     // K45: a mirror restore is refused without confirmation, dry run lists the deletions.
     std::fs::write(out.join("src/junk.tmp"), b"j").unwrap();
-    let mirror = RestoreOptions { version: 1, target: Some(out.clone()), delete_extraneous: true, ..Default::default() };
+    let mirror = RestoreOptions { restore_owner: OwnerPolicy::Never, version: 1, target: Some(out.clone()), delete_extraneous: true, ..Default::default() };
     let e = m.execute(&j.id, BackupOperation::Restore { options: mirror.clone(), overrides: RestoreOverrides::default() }).await.unwrap_err();
     assert!(e.user_message().contains("needs confirmation"));
     assert!(out.join("src/junk.tmp").exists());
@@ -1721,7 +1736,7 @@ async fn s3_point_in_time_recovery_through_manager() {
     assert_eq!(pit.destination.point_in_time(), Some(good));
     assert_eq!(pit.stats.version_count, 1);
     let writes = st.lock().unwrap().log.iter().filter(|(m, _, _)| m == "PUT" || m == "DELETE").count();
-    let r = m.execute(&pit.id, BackupOperation::Restore { options: RestoreOptions { target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
+    let r = m.execute(&pit.id, BackupOperation::Restore { options: RestoreOptions { restore_owner: OwnerPolicy::Never, target: Some(out.clone()), ..Default::default() }, overrides: RestoreOverrides::default() }).await.unwrap();
     assert_eq!(r.status, "success", "{:?}", r.log);
     assert_eq!(std::fs::read(out.join("src/report.txt")).unwrap(), b"quarterly numbers");
     assert_eq!(st.lock().unwrap().log.iter().filter(|(m, _, _)| m == "PUT" || m == "DELETE").count(), writes, "the view never wrote");

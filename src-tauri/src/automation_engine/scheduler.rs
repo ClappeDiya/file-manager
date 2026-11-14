@@ -89,7 +89,9 @@ pub(crate) fn start_folder_watcher(
         advice: "Check that the path exists and is accessible.".to_string(),
     })?;
 
-    let root = path.clone();
+    // FSEvents reports canonical paths (e.g. /private/var instead of /var).
+    // Compare the same spelling or non-recursive rules silently miss children.
+    let root = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             for file in &event.paths {

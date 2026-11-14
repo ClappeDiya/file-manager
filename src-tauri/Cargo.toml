@@ -1,5 +1,6 @@
 [package]
 name = "unified-file-ops"
+default-run = "unified-file-ops"
 version = "0.1.0"
 description = "Unified File Operations Platform - Rust Core"
 authors = ["UFOP Team"]

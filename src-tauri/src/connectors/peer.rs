@@ -537,6 +537,9 @@ impl PeerManager {
         let port = self.start_listener().await?;
         let mdns_err = |e: mdns_sd::Error| AppError::connection(format!("Network discovery is unavailable: {e}"), "Connect to the other computer by its address instead.");
         let daemon = mdns_sd::ServiceDaemon::new().map_err(mdns_err)?;
+        // The listener binds IPv4. Do not advertise IPv6-only interfaces
+        // (especially unscoped link-local addresses) as usable endpoints.
+        daemon.disable_interface(mdns_sd::IfKind::IPv6).map_err(mdns_err)?;
         let host: String = self.local_hostname.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
         let instance = self.identity.id.simple().to_string();
         let props = [
@@ -1336,7 +1339,12 @@ impl PeerManager {
 fn sighting_from_mdns(info: &mdns_sd::ServiceInfo) -> Option<PeerSighting> {
     let prop = |k: &str| info.get_property_val_str(k).map(str::to_string);
     let id = Uuid::parse_str(&prop("id")?).ok()?;
-    let mut addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+    let mut addresses: Vec<IpAddr> = info.get_addresses().iter().copied().filter(IpAddr::is_ipv4).collect();
+    if addresses.is_empty() {
+        // Resolution can arrive in parts; wait for an address our listener
+        // accepts instead of replacing usable IPv4 addresses with IPv6-only data.
+        return None;
+    }
     addresses.sort();
     Some(PeerSighting {
         id,
