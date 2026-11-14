@@ -62,7 +62,7 @@ export function SiteFooter() {
       <div className="border-t border-border">
         <div className="container-wide py-6 flex flex-col md:flex-row items-center justify-between gap-3 text-xs text-foreground-tertiary">
           <p>© {new Date().getFullYear()} Clappe. Source-available under PolyForm Shield 1.0.0.</p>
-          <p>Built locally. No telemetry by default.</p>
+          <p>Local-first desktop file operations.</p>
         </div>
       </div>
     </footer>

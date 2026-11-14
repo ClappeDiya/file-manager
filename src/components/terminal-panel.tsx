@@ -37,9 +37,10 @@ import {
 
 interface TerminalPanelProps {
   className?: string;
+  compactWhenClosed?: boolean;
 }
 
-export function TerminalPanel({ className }: TerminalPanelProps) {
+export function TerminalPanel({ className, compactWhenClosed = false }: TerminalPanelProps) {
   const panelOpen = useTerminalStore((s) => s.panelOpen);
   const panelHeight = useTerminalStore((s) => s.panelHeight);
   const setPanelHeight = useTerminalStore((s) => s.setPanelHeight);
@@ -132,7 +133,7 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
 
   if (!panelOpen) {
     return (
-      <TerminalToggleBar onToggle={togglePanel} sessionCount={sessions.length} />
+      <TerminalToggleBar onToggle={togglePanel} sessionCount={sessions.length} className={compactWhenClosed ? "[@media(max-height:700px)]:hidden" : undefined} />
     );
   }
 
@@ -303,9 +304,11 @@ export function TerminalPanel({ className }: TerminalPanelProps) {
 function TerminalToggleBar({
   onToggle,
   sessionCount,
+  className,
 }: {
   onToggle: () => void;
   sessionCount: number;
+  className?: string;
 }) {
   return (
     <button
@@ -315,6 +318,7 @@ function TerminalToggleBar({
         "bg-[var(--color-bg-secondary)]",
         "text-[length:var(--font-size-xs)] text-[color:var(--color-text-secondary)]",
         "hover:bg-[var(--color-hover-bg)] transition-theme",
+        className,
       )}
       onClick={onToggle}
       aria-label="Open terminal"

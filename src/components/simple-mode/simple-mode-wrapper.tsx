@@ -12,28 +12,25 @@
  * When appMode === "advanced", renders children as-is.
  * Mode switch is instant -- no restart required.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useMediaQuery } from "@/hooks/use-media-query";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
+import { BackupPanel } from "@/components/backup/backup-panel";
 import { SimpleSearchView } from "./simple-search-view";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
-import {
-  SimpleSidebar,
-  type SimpleNavSection,
-} from "./simple-sidebar";
+import { SimpleSidebar, type SimpleNavSection } from "./simple-sidebar";
 import { ThemeSwitcher } from "@/components/theme-switcher";
 import { ActivityFeed } from "@/components/activity-feed";
 import { NotificationBell } from "@/components/notification-bell";
-import {
-  FolderOpen,
-  PanelLeft,
-  HelpCircle,
-} from "lucide-react";
+import { FolderOpen, PanelLeft, HelpCircle, X } from "lucide-react";
 
 interface SimpleModeWrapperProps {
   /** The full file manager component (rendered when section = "files" or in advanced mode) */
   fileManager: React.ReactNode;
+  transferWorkspace?: React.ReactNode;
   /** Transfer panel component */
   transferPanel?: React.ReactNode;
   /** Sync panel component */
@@ -54,6 +51,7 @@ interface SimpleModeWrapperProps {
 
 export function SimpleModeWrapper({
   fileManager,
+  transferWorkspace,
   transferPanel,
   syncPanel,
   connectionPanel,
@@ -63,72 +61,110 @@ export function SimpleModeWrapper({
   onOpenOnboarding,
   onOpenGuidedFlow,
 }: SimpleModeWrapperProps) {
-  const appMode = useUIStore((s) => s.appMode);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
-  const sidebarWidth = useUIStore((s) => s.sidebarWidth);
+  const narrow = useMediaQuery("(max-width: 639px)");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const showSidebar = narrow ? mobileNavOpen : sidebarOpen;
+  const closeNavigation = () => setMobileNavOpen(false);
+  const mobileNavRef = useFocusTrap<HTMLElement>({
+    active: narrow && mobileNavOpen,
+    onEscape: closeNavigation,
+  });
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
   const [activeSection, setActiveSection] = useState<SimpleNavSection>("files");
 
-  // In advanced mode, just render the file manager directly. FileManager
-  // mounts its own NotificationBell, so structured errors stay visible.
-  if (appMode === "advanced") {
-    return <>{fileManager}</>;
-  }
+  useEffect(() => {
+    const show = () => setActiveSection("files");
+    window.addEventListener("ufop:show-workspace", show);
+    return () => window.removeEventListener("ufop:show-workspace", show);
+  }, []);
+
+  useEffect(() => {
+    const openCommands = (event: KeyboardEvent) => {
+      if (
+        activeSection === "files" ||
+        document.querySelector('[role="dialog"], [role="alertdialog"]')
+      )
+        return;
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setActiveSection("files");
+        useFileManagerStore.getState().setCommandPaletteOpen(true);
+      }
+    };
+    window.addEventListener("keydown", openCommands);
+    return () => window.removeEventListener("keydown", openCommands);
+  }, [activeSection]);
 
   const renderSection = () => {
     switch (activeSection) {
       case "files":
         return fileManager;
       case "transfers":
-        return transferPanel || (
-          <SimplePlaceholder
-            title="Transfers"
-            description="Send files between locations. Drag files here or use the guided wizard to start a transfer."
-            actionLabel="Start a Transfer"
-            onAction={() => onOpenGuidedFlow?.("start-transfer")}
-          />
+        return (
+          transferPanel || (
+            <SimplePlaceholder
+              title="Transfers"
+              description="Send files between locations. Drag files here or use the guided wizard to start a transfer."
+              actionLabel="Start a Transfer"
+              onAction={() => onOpenGuidedFlow?.("start-transfer")}
+            />
+          )
         );
+      case "backups":
+        return <BackupPanel />;
       case "sync":
-        return syncPanel || (
-          <SimplePlaceholder
-            title="Sync"
-            description="Keep two folders in sync automatically. Changes in one folder appear in the other."
-            actionLabel="Set Up Sync"
-            onAction={() => onOpenGuidedFlow?.("create-sync")}
-          />
+        return (
+          syncPanel || (
+            <SimplePlaceholder
+              title="Sync"
+              description="Keep two folders in sync automatically. Changes in one folder appear in the other."
+              actionLabel="Set Up Sync"
+              onAction={() => onOpenGuidedFlow?.("create-sync")}
+            />
+          )
         );
       case "cloud":
-        return connectionPanel || (
-          <SimplePlaceholder
-            title="Cloud & Servers"
-            description="Connect to OneDrive, Google Drive, Dropbox, or remote servers to manage your files in one place."
-            actionLabel="Connect a Service"
-            onAction={() => onOpenGuidedFlow?.("connect-onedrive")}
-          />
+        return (
+          connectionPanel || (
+            <SimplePlaceholder
+              title="Cloud & Servers"
+              description="Connect to OneDrive, Google Drive, Dropbox, or remote servers to manage your files in one place."
+              actionLabel="Connect a Service"
+              onAction={() => onOpenGuidedFlow?.("connect-onedrive")}
+            />
+          )
         );
       case "search":
-        return searchView || (
-          <SimpleSearchView
-            onOpen={(path, isDir) => {
-              useFileManagerStore.getState().revealPath(useFileManagerStore.getState().activePaneIndex, path, isDir);
-              setActiveSection("files");
-            }}
-          />
+        return (
+          searchView || (
+            <SimpleSearchView
+              onOpen={(path, isDir) => {
+                useFileManagerStore
+                  .getState()
+                  .revealPath(
+                    useFileManagerStore.getState().activePaneIndex,
+                    path,
+                    isDir,
+                  );
+                setActiveSection("files");
+              }}
+            />
+          )
         );
       case "favorites":
-        return favoritesView || (
-          <SimplePlaceholder
-            title="Favorites"
-            description="Your saved locations appear here. Drag any folder to add it to favorites."
-            actionLabel="Browse Files"
-            onAction={() => setActiveSection("files")}
-          />
+        return (
+          favoritesView || (
+            <SavedLocations onOpen={() => setActiveSection("files")} />
+          )
         );
       case "activity":
         return <ActivityFeed />;
       case "settings":
-        return settingsPanel || (
-          <SimpleSettingsView onOpenOnboarding={onOpenOnboarding} />
+        return (
+          settingsPanel || (
+            <SimpleSettingsView onOpenOnboarding={onOpenOnboarding} />
+          )
         );
       default:
         return fileManager;
@@ -136,26 +172,35 @@ export function SimpleModeWrapper({
   };
 
   return (
-    <div className="flex h-full flex-col" data-testid="simple-mode-wrapper">
+    <div
+      className="flex h-full min-h-0 flex-col"
+      data-testid="simple-mode-wrapper"
+    >
       {/* Simple mode toolbar */}
       <header
         className="flex items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-toolbar-bg)] px-4"
         style={{ height: "var(--toolbar-height)" }}
-        role="toolbar"
-        aria-label="Main toolbar"
+        aria-label="Application header"
       >
         <div className="flex items-center gap-3">
           <Button
             variant="ghost"
             size="icon"
-            onClick={toggleSidebar}
-            aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            onClick={() =>
+              narrow ? setMobileNavOpen(!mobileNavOpen) : toggleSidebar()
+            }
+            aria-expanded={showSidebar}
+            aria-controls="workspace-navigation"
+            aria-label={showSidebar ? "Hide sidebar" : "Show sidebar"}
             title="Toggle sidebar"
           >
             <PanelLeft className="h-4 w-4" aria-hidden="true" />
           </Button>
-          <FolderOpen className="h-5 w-5 text-[color:var(--color-primary)]" aria-hidden="true" />
-          <h1 className="text-[length:var(--font-size-md)] font-semibold text-[color:var(--color-text)]">
+          <FolderOpen
+            className="h-5 w-5 text-[color:var(--color-primary)]"
+            aria-hidden="true"
+          />
+          <h1 className="whitespace-nowrap text-[length:var(--font-size-md)] font-semibold text-[color:var(--color-text)]">
             File Manager
           </h1>
         </div>
@@ -174,47 +219,69 @@ export function SimpleModeWrapper({
           >
             <HelpCircle className="h-4 w-4" aria-hidden="true" />
           </Button>
-          <ThemeSwitcher />
+          <ThemeSwitcher compact />
         </div>
       </header>
 
       {/* Main content area */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="relative flex flex-1 min-h-0 overflow-hidden">
         {/* Simple sidebar */}
-        {sidebarOpen && (
+        {showSidebar && (
           <aside
-            className="border-r border-[var(--color-border)] shrink-0 overflow-hidden"
-            style={{ width: activeSection === "files" ? 64 : sidebarWidth }}
+            ref={mobileNavRef}
+            id="workspace-navigation"
+            role={narrow ? "dialog" : undefined}
+            aria-modal={narrow || undefined}
+            className={cn(
+              "border-r border-[var(--color-border)] shrink-0 overflow-hidden bg-[var(--color-sidebar-bg)]",
+              narrow &&
+                "absolute inset-y-0 left-0 z-40 shadow-xl flex flex-col",
+            )}
+            style={{ width: "clamp(160px, 19vw, 208px)" }}
             aria-label="Application sections"
           >
+            {narrow && (
+              <Button
+                variant="ghost"
+                onClick={closeNavigation}
+                className="shrink-0 justify-between"
+              >
+                Navigation
+                <X className="h-4 w-4" aria-hidden="true" />
+              </Button>
+            )}
             <SimpleSidebar
-              compact={activeSection === "files"}
+              className={narrow ? "flex-1 min-h-0" : undefined}
               activeSection={activeSection}
-              onSectionChange={setActiveSection}
+              onSectionChange={(section) => {
+                setActiveSection(section);
+                closeNavigation();
+              }}
             />
           </aside>
         )}
 
+        {narrow && showSidebar && (
+          <div
+            className="absolute inset-0 z-30 bg-[var(--color-bg-overlay)]"
+            aria-hidden="true"
+            onClick={closeNavigation}
+          />
+        )}
         {/* Content area */}
-        <main id="simple-main-content" tabIndex={-1} className="flex-1 min-w-0 overflow-auto">
+        <main
+          inert={(narrow && showSidebar) || undefined}
+          id="main-content"
+          tabIndex={-1}
+          className="flex-1 min-w-0 overflow-auto"
+        >
           {renderSection()}
         </main>
       </div>
 
-      {/* Simple status bar */}
-      <footer
-        className="flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4"
-        style={{ height: "var(--status-bar-height)" }}
-        role="contentinfo"
-        aria-label="Status bar"
-      >
-        <span className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)]">
-          Ready
-        </span>
-        <span className="text-[length:var(--font-size-xs)] text-[color:var(--color-text-tertiary)]">
-          Simple Mode
-        </span>
-      </footer>
+      <div inert={(narrow && showSidebar) || undefined}>
+        {transferWorkspace}
+      </div>
     </div>
   );
 }
@@ -277,7 +344,8 @@ function SimpleSettingsView({
           </label>
           <p className="text-xs text-[color:var(--color-text-secondary)]">
             Simple mode shows a clean interface with essential features.
-            Advanced mode unlocks regex renaming, checksums, scripting, and more.
+            Advanced mode unlocks regex renaming, checksums, scripting, and
+            more.
           </p>
           <div className="flex gap-3 mt-2">
             <button
@@ -287,6 +355,7 @@ function SimpleSettingsView({
                   ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[color:var(--color-primary)]"
                   : "border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:border-[var(--color-text-tertiary)]",
               )}
+              aria-pressed={appMode === "simple"}
               onClick={() => setAppMode("simple")}
             >
               <span className="text-sm font-medium block">Simple</span>
@@ -301,6 +370,7 @@ function SimpleSettingsView({
                   ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[color:var(--color-primary)]"
                   : "border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:border-[var(--color-text-tertiary)]",
               )}
+              aria-pressed={appMode === "advanced"}
               onClick={() => setAppMode("advanced")}
             >
               <span className="text-sm font-medium block">Advanced</span>
@@ -317,20 +387,23 @@ function SimpleSettingsView({
             Appearance
           </label>
           <div className="flex gap-2">
-            {(["system", "light", "dark", "high-contrast"] as const).map((t) => (
-              <button
-                key={t}
-                className={cn(
-                  "px-3 py-2 rounded-lg border text-xs transition-all capitalize",
-                  theme === t
-                    ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[color:var(--color-primary)]"
-                    : "border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:border-[var(--color-text-tertiary)]",
-                )}
-                onClick={() => setTheme(t)}
-              >
-                {t === "high-contrast" ? "High Contrast" : t}
-              </button>
-            ))}
+            {(["system", "light", "dark", "high-contrast"] as const).map(
+              (t) => (
+                <button
+                  key={t}
+                  className={cn(
+                    "px-3 py-2 rounded-lg border text-xs transition-all capitalize",
+                    theme === t
+                      ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[color:var(--color-primary)]"
+                      : "border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:border-[var(--color-text-tertiary)]",
+                  )}
+                  aria-pressed={theme === t}
+                  onClick={() => setTheme(t)}
+                >
+                  {t === "high-contrast" ? "High Contrast" : t}
+                </button>
+              ),
+            )}
           </div>
         </div>
 
@@ -350,5 +423,59 @@ function SimpleSettingsView({
         )}
       </div>
     </div>
+  );
+}
+
+function SavedLocations({ onOpen }: { onOpen: () => void }) {
+  const favorites = useFileManagerStore((s) => s.favorites);
+  const recent = useFileManagerStore((s) => s.recentLocations);
+  const open = (path: string) => {
+    const store = useFileManagerStore.getState();
+    const index = store.activePaneIndex;
+    store.revealPath(index, path, true);
+    onOpen();
+  };
+  return (
+    <section className="p-5 space-y-5" aria-label="Saved locations">
+      <h2 className="text-lg font-semibold">Favorites</h2>
+      {favorites.length ? (
+        <ul className="space-y-2">
+          {favorites.map((f) => (
+            <li key={f.id}>
+              <Button variant="ghost" onClick={() => open(f.path)}>
+                <FolderOpen className="h-4 w-4 mr-2" />
+                {f.name}
+              </Button>
+              <p className="text-xs break-all text-[color:var(--color-text-secondary)]">
+                {f.path}
+              </p>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-sm text-[color:var(--color-text-secondary)]">
+          No favorites yet. Save a folder from the file browser to find it here.
+        </p>
+      )}
+      <h3 className="font-medium">Recent folders</h3>
+      {recent.length ? (
+        <ul>
+          {recent.map(({ path }) => (
+            <li key={path}>
+              <button
+                className="py-2 text-sm text-left break-all hover:underline"
+                onClick={() => open(path)}
+              >
+                {path}
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-sm text-[color:var(--color-text-secondary)]">
+          Folders you visit will appear here.
+        </p>
+      )}
+    </section>
   );
 }

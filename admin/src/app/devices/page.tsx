@@ -104,6 +104,7 @@ export default function DevicesPage() {
               className="sm:w-72"
             />
             <Select
+              aria-label="Filter devices by status"
               options={[
                 { value: '', label: 'All Statuses' },
                 { value: 'online', label: 'Online' },

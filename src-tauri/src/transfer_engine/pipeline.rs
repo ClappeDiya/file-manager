@@ -13,7 +13,7 @@ use crate::transfer_engine::chunk;
 use crate::transfer_engine::journal::TransferJournal;
 use crate::transfer_engine::verification;
 use crate::transfer_engine::JobControl;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 
@@ -78,6 +78,33 @@ pub async fn transfer_chunk(
     semaphore: &Arc<Semaphore>,
     control: Option<Arc<JobControl>>,
 ) -> Result<ChunkResult, AppError> {
+    transfer_chunk_reporting(
+        source_path,
+        dest_path,
+        chunk,
+        tier,
+        config,
+        journal,
+        job_id,
+        semaphore,
+        control,
+        None,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn transfer_chunk_reporting(
+    source_path: &str,
+    dest_path: &str,
+    chunk: &ChunkSpec,
+    tier: VerifyTier,
+    config: &TransferConfig,
+    journal: Option<&TransferJournal>,
+    job_id: Option<&str>,
+    semaphore: &Arc<Semaphore>,
+    control: Option<Arc<JobControl>>,
+    progress: Option<Arc<AtomicU64>>,
+) -> Result<ChunkResult, AppError> {
     let _permit = semaphore.acquire().await.map_err(|_| AppError::Transfer {
         message: "Worker pool exhausted".to_string(),
         advice: "Too many concurrent transfers. Try again later.".to_string(),
@@ -102,7 +129,8 @@ pub async fn transfer_chunk(
     }
 
     // Step 1: Read chunk from source and compute xxHash3 inline
-    let (data, source_xxhash) = read_chunk_with_hash(source_path, chunk.offset, chunk.length).await?;
+    let (data, source_xxhash) =
+        read_chunk_with_hash(source_path, chunk.offset, chunk.length).await?;
 
     // Step 1b: Compute SHA-256 if Tier 2+ (can be done on the same data)
     let source_sha256 = if tier >= VerifyTier::Verified {
@@ -127,9 +155,14 @@ pub async fn transfer_chunk(
     let write_start = std::time::Instant::now();
 
     // Step 2: Write chunk to destination at offset
-    write_chunk_at_offset(dest_path, chunk.offset, &data).await?;
-    // Bandwidth limits: the transfer queue's and the machine-wide one.
-    super::throttle::pace_chunk(data.len(), start).await;
+    write_chunk_with_progress(
+        dest_path,
+        chunk.offset,
+        &data,
+        control.as_deref(),
+        progress.as_deref(),
+    )
+    .await?;
     let write_time_ms = write_start.elapsed().as_millis() as u32;
 
     // Step 3: fsync if required by tier
@@ -235,7 +268,6 @@ pub async fn transfer_chunk(
         bytes_transferred: chunk.length,
     })
 }
-
 /// Result of transferring a single chunk.
 #[derive(Debug)]
 pub struct ChunkResult {
@@ -332,14 +364,92 @@ async fn write_chunk_at_offset(
     Ok(())
 }
 
+/// Bound I/O and pacing to small blocks so byte progress, pause and cancel
+/// remain responsive even when the whole file fits in one engine chunk.
+async fn write_chunk_with_progress(
+    path: &str,
+    offset: u64,
+    data: &[u8],
+    control: Option<&JobControl>,
+    progress: Option<&AtomicU64>,
+) -> Result<(), AppError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .await
+        .map_err(|e| {
+            AppError::file_op(
+                format!("Cannot open destination file: {e}"),
+                "Check destination permissions.",
+            )
+        })?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| {
+            AppError::file_op(
+                format!("Cannot seek destination: {e}"),
+                "Check the destination drive.",
+            )
+        })?;
+    for block in data.chunks(256 * 1024) {
+        if let Some(c) = control {
+            c.wait_if_paused().await;
+            if c.is_cancelled() {
+                return Err(cancelled_error());
+            }
+        }
+        let started = std::time::Instant::now();
+        file.write_all(block).await.map_err(|e| {
+            AppError::file_op(
+                format!("Cannot write destination: {e}"),
+                "Check free space and permissions.",
+            )
+        })?;
+        let pace = super::throttle::pace_chunk(block.len(), started);
+        tokio::pin!(pace);
+        if let Some(c) = control {
+            loop {
+                tokio::select! {
+                    _ = &mut pace => break,
+                    _ = c.stopped() => {
+                        c.wait_if_paused().await;
+                        if c.is_cancelled() { return Err(cancelled_error()); }
+                    }
+                }
+            }
+        } else {
+            pace.await;
+        }
+        if let Some(bytes) = progress {
+            bytes.fetch_add(block.len() as u64, Ordering::Relaxed);
+        }
+    }
+    file.flush().await.map_err(|e| {
+        AppError::file_op(
+            format!("Cannot flush destination: {e}"),
+            "Check free space and drive health.",
+        )
+    })?;
+    Ok(())
+}
 /// Perform the atomic rename from temp path to final destination.
 pub async fn atomic_rename(temp_path: &str, final_path: &str) -> Result<(), AppError> {
-    tokio::fs::rename(temp_path, final_path)
-        .await
-        .map_err(|e| AppError::Transfer {
-            message: format!("Atomic rename failed: {e}"),
-            advice: "The transfer completed but the file could not be moved to its final location.".to_string(),
-        })
+    let temp_path = temp_path.to_owned();
+    let final_path = final_path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut temp = tempfile::TempPath::try_from_path(temp_path)?;
+        // Preserve the verified partial file for recovery if publication fails.
+        temp.disable_cleanup(true);
+        temp.persist_noclobber(final_path).map_err(|e| e.error)
+    })
+    .await
+    .map_err(|_| AppError::internal("The transfer commit task stopped"))?
+    .map_err(|e| AppError::Transfer {
+        message: format!("Cannot commit the transferred file without overwriting the destination: {e}"),
+        advice: "The destination was preserved. Check it and choose another name or destination before retrying.".to_string(),
+    })
 }
 
 // ──────────────────────────────────────────────
@@ -472,10 +582,13 @@ pub async fn execute_file_transfer(
     let mut total_transferred: u64 = 0;
     let mut chunk_results: Vec<ChunkResult> = Vec::with_capacity(chunks.len());
     let mut all_verified = true;
+    let byte_progress = Arc::new(AtomicU64::new(0));
+    let mut progress_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // For small files or single chunk, just do it sequentially
     if chunks.len() == 1 {
-        let result = transfer_chunk(
+        let work = transfer_chunk_reporting(
             source_path,
             &temp_path,
             &chunks[0],
@@ -485,8 +598,16 @@ pub async fn execute_file_transfer(
             Some(job_id),
             &semaphore,
             control.clone(),
-        )
-        .await;
+            Some(byte_progress.clone()),
+        );
+        tokio::pin!(work);
+        let result = loop {
+            tokio::select! {
+                result = &mut work => break result,
+                _ = progress_tick.tick() => if let Some(cb) = on_progress { cb(0, byte_progress.load(Ordering::Relaxed), file_size); },
+            }
+        };
+
         let result = match result {
             Err(e) if control.as_ref().is_some_and(|c| c.is_cancelled()) => {
                 let _ = e;
@@ -520,9 +641,10 @@ pub async fn execute_file_transfer(
             let job_id_str = job_id.to_string();
             let journal = journal.clone();
             let control = control.clone();
+            let byte_progress = byte_progress.clone();
 
             tokio::spawn(async move {
-                let result = transfer_chunk(
+                let result = transfer_chunk_reporting(
                     &source,
                     &dest,
                     &chunk_spec,
@@ -532,6 +654,7 @@ pub async fn execute_file_transfer(
                     Some(&job_id_str),
                     &sem,
                     control,
+                    Some(byte_progress),
                 )
                 .await;
                 let _ = tx.send(result).await;
@@ -542,13 +665,20 @@ pub async fn execute_file_transfer(
         drop(tx);
 
         // Collect results
-        while let Some(result) = rx.recv().await {
+        loop {
+            let result = tokio::select! {
+                result = rx.recv() => match result { Some(result) => result, None => break },
+                _ = progress_tick.tick() => {
+                    if let Some(cb) = on_progress { cb(0, byte_progress.load(Ordering::Relaxed), file_size); }
+                    continue;
+                }
+            };
             match result {
                 Ok(cr) => {
                     total_transferred += cr.bytes_transferred;
                     all_verified = all_verified && cr.verified;
                     if let Some(cb) = on_progress {
-                        cb(cr.chunk_index, total_transferred, file_size);
+                        cb(cr.chunk_index, total_transferred.max(byte_progress.load(Ordering::Relaxed)), file_size);
                     }
                     chunk_results.push(cr);
                 }
@@ -739,6 +869,18 @@ mod tests {
         let content = tokio::fs::read(&path).await.unwrap();
         assert_eq!(content.len(), 1024);
         assert_eq!(&content[512..512 + data.len()], data);
+    }
+
+    #[tokio::test]
+    async fn final_commit_preserves_a_destination_created_during_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join(".file.txt.ufop-partial");
+        let dest = dir.path().join("file.txt");
+        std::fs::write(&temp, b"new transferred content").unwrap();
+        std::fs::write(&dest, b"existing destination content").unwrap();
+        assert!(atomic_rename(temp.to_str().unwrap(), dest.to_str().unwrap()).await.is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing destination content");
+        assert_eq!(std::fs::read(&temp).unwrap(), b"new transferred content");
     }
 
     #[tokio::test]

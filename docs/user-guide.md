@@ -215,6 +215,16 @@ Transfers can be started via:
 - The command palette
 - The CLI (`ufop transfer`)
 
+### Source, destination and live results
+
+The workspace opens with **Source folder** and **Destination folder** panes. The sidebar keeps **Files**, **Search** and **Favorites** together, with **Transfers**, **Sync**, **Backups & Restore** and **Cloud & Servers** under File operations. **Locations** opens the optional drive and folder rail. Simple and Advanced modes use this same navigation.
+
+Choose **New transfer**, review the source, destination and Copy/Move effect, then start. Local files and folders enter the real transfer queue. Each local file is checksum verified automatically. Copy preserves existing items and assigns incoming copies a new name; Move stops if a destination name already exists. Original files are removed only after their individual moves succeed. A cancelled or failed move may therefore leave some files at each location; inspect the file results before retrying.
+
+The report below the folder panes remains visible when you change sections. **% transferred** measures bytes reported by the engine. **% file success** measures completed files divided by all queued files, including failed and cancelled files. These are different measures: a finished attempt can have a success rate below 100%. A checksum-verified count requires matching source and destination hashes, rather than a requested verification setting. Remote services may report progress only as each file completes and may not supply checksum evidence.
+
+Use **File results** for individual paths and errors, **Retry failed** after correcting a problem, and **Save report** for a JSON record of the selected transfer. Saved reports are historical outcomes, not a new check of today's destination contents. Queue controls and bandwidth settings remain available from **Transfers**. Browser views without the desktop connection show a connection requirement instead of fabricated folder contents.
+
 ### Transfer Queue
 
 Active and queued transfers appear in the Transfer panel. Each transfer shows:

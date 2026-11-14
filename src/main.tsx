@@ -1,4 +1,5 @@
 import React from "react";
+import { AppErrorScreen } from "./components/app-error-screen";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import "./styles/globals.css";
@@ -22,27 +23,7 @@ class RootErrorBoundary extends React.Component<
   }
   render() {
     if (this.state.error) {
-      return React.createElement(
-        "div",
-        {
-          style: {
-            padding: 32,
-            fontFamily: "monospace",
-            background: "#fef2f2",
-            color: "#991b1b",
-            height: "100%",
-            overflow: "auto",
-          },
-        },
-        React.createElement("h1", null, "⚠️  Application Error"),
-        React.createElement(
-          "pre",
-          { style: { whiteSpace: "pre-wrap", fontSize: 13, marginTop: 12 } },
-          String(this.state.error),
-          "\n\n",
-          this.state.error?.stack,
-        ),
-      );
+      return <AppErrorScreen error={this.state.error} showDetails={import.meta.env.DEV} />;
     }
     return this.props.children;
   }
@@ -100,7 +81,7 @@ async function bootstrap() {
         </RootErrorBoundary>
       </React.StrictMode>,
     );
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Application failed to initialize:", err);
     try {
       const root = document.getElementById("root");
@@ -112,12 +93,17 @@ async function bootstrap() {
         heading.textContent = "Application failed to initialize";
         const pre = document.createElement("pre");
         pre.style.cssText = "white-space:pre-wrap;color:#111;background:#fee;padding:12px;border-radius:6px;";
-        pre.textContent = String(err && err.stack ? err.stack : err);
+        pre.textContent = String(err instanceof Error ? err.stack : err);
         const hint = document.createElement("p");
-        hint.textContent = "Please check the browser console for more details.";
+        hint.textContent = "Reload FileManager to try again, then check your recent operation results.";
         wrapper.appendChild(heading);
-        wrapper.appendChild(pre);
+        if (import.meta.env.DEV) wrapper.appendChild(pre);
         wrapper.appendChild(hint);
+        const reload = document.createElement("button");
+        reload.textContent = "Reload FileManager";
+        reload.onclick = () => window.location.reload();
+        wrapper.appendChild(reload);
+        wrapper.setAttribute("role", "alert");
         root.replaceChildren(wrapper);
       }
     } catch (_e) {

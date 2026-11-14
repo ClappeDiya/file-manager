@@ -1,69 +1,29 @@
-import { Check, X, Minus } from 'lucide-react';
+import Link from 'next/link';
 
-type Cell = '✓' | '✗' | '~' | string;
-
-const rows: { label: string; cells: [Cell, Cell, Cell, Cell] }[] = [
-  { label: 'Free for individuals', cells: ['✓', '✗', '✗', '✓'] },
-  { label: 'macOS / Windows / Linux', cells: ['✓', 'macOS only', 'macOS only', '✓'] },
-  { label: 'Built-in protocols', cells: ['17', '11', '8', '~10'] },
-  { label: 'Crash-safe resume', cells: ['✓', '~', '~', '✗'] },
-  { label: 'Real-time bidirectional sync', cells: ['✓', '✗', '✗', '~'] },
-  { label: 'Built-in local AI', cells: ['✓', '✗', '✗', '✗'] },
-  { label: 'Encryption + vault', cells: ['✓', '✗', '~', '~'] },
-  { label: 'Team governance (audit / SSO)', cells: ['✓ Business', '✗', '✗', '✗'] },
-  { label: 'Source-available', cells: ['✓', '✗', '✗', '✓'] },
+const capabilities = [
+  ['Transfer files', 'Browse two locations and copy or move files between them. Follow progress and inspect individual results.'],
+  ['Compare and sync folders', 'Preview folder differences and choose how changes should flow before applying them.'],
+  ['Back up and restore', 'Keep versioned backups and restore selected files to a folder you choose.'],
+  ['Connect storage', 'Open saved cloud and server connections alongside local folders. Availability depends on the provider and your credentials.'],
+  ['Automate from the CLI', 'Use dry runs and structured output for repeatable local file operations.'],
+  ['Manage a team', 'The Business admin console provides role-based access, policies, approvals and audit history.'],
 ];
 
-const cols = ['FileManager', 'ForkLift', 'Transmit', 'Cyberduck'] as const;
-
-function renderCell(value: Cell, isFileManager: boolean) {
-  if (value === '✓') return <Check size={18} className={isFileManager ? 'text-success' : 'text-foreground-secondary'} />;
-  if (value === '✗') return <X size={18} className="text-foreground-tertiary" />;
-  if (value === '~') return <Minus size={18} className="text-warning" />;
-  return <span className={`text-xs ${isFileManager ? 'text-success' : 'text-foreground-secondary'}`}>{value}</span>;
-}
-
+/** Describe our workflows instead of publishing unsourced competitor scores. */
 export function ComparisonTable() {
-  return (
-    <section className="marketing-section">
-      <div className="container-page">
-        <div className="text-center max-w-3xl mx-auto mb-10">
-          <h2 className="marketing-heading">How it compares</h2>
-          <p className="marketing-subheading mt-4">
-            We checked, you can verify. Marketing claims of competing products as of {new Date().getFullYear()}.
-          </p>
-        </div>
-
-        <div className="overflow-x-auto rounded-lg border border-border bg-background-elevated">
-          <table className="w-full text-sm">
-            <thead className="bg-background-secondary">
-              <tr>
-                <th className="text-left px-4 py-3 font-medium text-foreground-secondary">Feature</th>
-                {cols.map((col, idx) => (
-                  <th
-                    key={col}
-                    className={`text-center px-4 py-3 font-semibold ${idx === 0 ? 'text-primary' : 'text-foreground-secondary'}`}
-                  >
-                    {col}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, idx) => (
-                <tr key={row.label} className={idx % 2 === 0 ? '' : 'bg-background-secondary/40'}>
-                  <td className="px-4 py-3 text-foreground">{row.label}</td>
-                  {row.cells.map((cell, cellIdx) => (
-                    <td key={cellIdx} className="px-4 py-3">
-                      <div className="flex items-center justify-center">{renderCell(cell, cellIdx === 0)}</div>
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+  return <section className="marketing-section" aria-labelledby="workflow-heading">
+    <div className="container-page">
+      <div className="max-w-3xl mb-8">
+        <h2 id="workflow-heading" className="marketing-heading">Choose the workflow you need</h2>
+        <p className="marketing-subheading mt-4">Start with files and folders. Open more tools when your task calls for them.</p>
       </div>
-    </section>
-  );
+      <dl className="grid gap-6 md:grid-cols-2">
+        {capabilities.map(([label, description]) => <div key={label}>
+          <dt className="font-semibold text-foreground">{label}</dt>
+          <dd className="mt-2 text-foreground-secondary">{description}</dd>
+        </div>)}
+      </dl>
+      <Link href="/docs" className="inline-block mt-8 underline underline-offset-4">Read the guides and requirements</Link>
+    </div>
+  </section>;
 }

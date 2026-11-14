@@ -72,7 +72,7 @@ export default function SecurityPage() {
       <section className="mt-16 max-w-3xl mx-auto text-sm text-foreground-secondary leading-relaxed space-y-4">
         <h2 className="text-xl font-bold text-foreground mb-3">Code signing &amp; updates</h2>
         <p>
-          All macOS and Windows installers are code-signed with our Apple Developer ID and Windows EV certificate.
+          Check the download page for available installers and the signing information attached to each release.
           The Tauri auto-updater verifies an Ed25519 signature on every update before applying it; a tampered
           update is rejected, not installed.
         </p>

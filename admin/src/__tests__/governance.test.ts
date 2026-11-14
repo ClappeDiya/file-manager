@@ -13,6 +13,8 @@ import * as gov from '@/app/api/ai-governance/route';
 import * as sync from '@/app/api/sync/route';
 import * as transfers from '@/app/api/transfers/route';
 import * as connectors from '@/app/api/connectors/route';
+import * as connector from '@/app/api/connectors/[id]/route';
+import * as workspaces from '@/app/api/workspaces/route';
 
 const P = (id: string) => ({ params: Promise.resolve({ id }) });
 
@@ -93,6 +95,10 @@ describe('features without a backend', () => {
       ['sync', sync.GET(await req('GET', '/api/sync', { as: admin }))],
       ['transfers', transfers.GET(await req('GET', '/api/transfers', { as: admin }))],
       ['connectors', connectors.GET(await req('GET', '/api/connectors', { as: admin }))],
+      ['connector test', connector.POST(await req('POST', '/api/connectors/id', { as: admin, body: { action: 'test' } }))],
+      ['workspace read', workspaces.GET(await req('GET', '/api/workspaces', { as: admin }))],
+      ['workspace share', workspaces.POST(await req('POST', '/api/workspaces', { as: admin, body: { action: 'share_connection' } }))],
+      ['workspace propagation', workspaces.POST(await req('POST', '/api/workspaces', { as: admin, body: { action: 'propagate' } }))],
     ];
     for (const [name, p] of cases) {
       const res = await p;

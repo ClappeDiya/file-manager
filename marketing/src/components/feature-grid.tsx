@@ -17,13 +17,13 @@ const features = [
   },
   {
     icon: Network,
-    title: '17 protocols, one app',
-    body: 'SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB, NFS, FTP, B2, Azure Blob, Swift, mDNS peer, and more — all first-class.',
+    title: 'Cloud and server connections',
+    body: 'SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB, NFS, FTP, B2, Azure Blob, Swift, mDNS peer, and more; supported operations vary by service.',
   },
   {
     icon: ShieldCheck,
     title: 'Crash-safe transfers',
-    body: 'Three-layer engine: worker pool + checksums (xxHash3 / SHA-256) + journal-backed crash recovery. Resume any transfer at any time.',
+    body: 'Three-layer engine: worker pool + checksums (xxHash3 / SHA-256) + journal-backed crash recovery. Local file copies verify checksums and support pause, resume and cancellation. Remote recovery depends on the provider.',
   },
   {
     icon: RefreshCw,
@@ -48,7 +48,7 @@ const features = [
   {
     icon: History,
     title: 'Audit + version history',
-    body: 'Every operation ledgered locally. Lineage tracking shows what a file is derived from. Undo across the entire session.',
+    body: 'Every operation ledgered locally. Lineage tracking shows what a file is derived from. Undo is available for supported operations.',
   },
 ];
 
@@ -64,7 +64,7 @@ export function FeatureGrid() {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          {features.map((feature) => (
+          {features.slice(0, 4).map((feature) => (
             <div key={feature.title} className="marketing-card">
               <feature.icon size={24} className="text-primary mb-3" />
               <h3 className="font-semibold text-foreground mb-2">{feature.title}</h3>
@@ -72,6 +72,10 @@ export function FeatureGrid() {
             </div>
           ))}
         </div>
+        <details className="mt-6">
+          <summary className="cursor-pointer py-3 text-primary font-medium">Explore AI, encryption, terminal and history</summary>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">{features.slice(4).map((feature) => <div key={feature.title}><h3 className="font-semibold text-foreground">{feature.title}</h3><p className="text-sm text-foreground-secondary mt-2">{feature.body}</p></div>)}</div>
+        </details>
       </div>
     </section>
   );

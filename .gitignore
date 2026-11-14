@@ -35,6 +35,9 @@ src-tauri/WixTools/
 
 # Runtime data
 .data/
+/admin/admin-data.db
+/admin/admin-data.db-shm
+/admin/admin-data.db-wal
 
 # Playwright MCP logs
 .playwright-mcp/

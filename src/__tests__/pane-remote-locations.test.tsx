@@ -79,6 +79,10 @@ beforeEach(() => {
       case "connector_stat":
         if (args?.path === "/Docs/Q1") return entry("/d1/q1", "Q1", true, 0); // an id-path provider resolves names
         return args?.path === "/Reports" ? entry("/Reports", "Reports", true, 0) : null;
+      case "get_file_metadata":
+        return { is_dir: false };
+      case "enqueue_local_transfer":
+        return { jobs: [], folders_created: 0, dest_paths: (args?.sourcePaths as string[]).map((s) => `${args?.destDir}/${s.split("/").pop()}`) };
       case "enqueue_location_transfer":
         return { jobs: [], moved: [], folders_created: 0 };
       case "connector_quota":
@@ -165,12 +169,38 @@ describe("connections in the panes", () => {
     });
   });
 
+  it("shows an explicit connection requirement in a browser instead of invented files", async () => {
+    delete (window as unknown as Record<string, unknown>).__TAURI__;
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    setPanes("/home", "/home", true);
+    render(<FileManager />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("no filesystem connection");
+    expect(screen.queryByText("readme.md")).not.toBeInTheDocument();
+    expect(screen.queryByText("Documents")).not.toBeInTheDocument();
+  });
+
+  it("keeps file undo shortcuts out of text fields and modal dialogs", async () => {
+    setPanes("/home", "/home", true);
+    render(<FileManager />);
+    await screen.findByText("local.txt");
+    const input = document.createElement("input");
+    document.body.appendChild(input); input.focus();
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(calls("undo_last")).toHaveLength(0);
+    input.remove();
+    const dialog = document.createElement("div"); dialog.setAttribute("role", "dialog");
+    document.body.appendChild(dialog); document.body.focus();
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(calls("undo_last")).toHaveLength(0);
+    dialog.remove();
+  });
+
   it("asks before a drop when drag-and-drop confirmation is on; local→connection is a copy", async () => {
     useUIStore.setState({ confirmDragDrop: true });
     setPanes(ROOT, "/home", true);
     render(<FileManager />);
     await screen.findByText("Reports");
-    const target = screen.getByTestId("pane-0").firstElementChild as HTMLElement;
+    const target = screen.getByTestId("pane-0").querySelector("[data-os-drop-dir]") as HTMLElement;
     const data = new Map<string, string>([["application/x-ufop-files", JSON.stringify(["/home/local.txt"])]]);
     fireEvent.drop(target, { dataTransfer: { getData: (t: string) => data.get(t) ?? "", types: [...data.keys()] } });
     const confirm = await screen.findByTestId("drag-drop-confirm");
@@ -188,14 +218,14 @@ describe("connections in the panes", () => {
     expect(calls("enqueue_location_transfer")).toHaveLength(1);
   });
 
-  it("without the confirmation a same-location drop moves at once, as before", async () => {
+  it("without drag confirmation a local drop queues a move through the safety check", async () => {
     setPanes("/home", "/home", true);
     render(<FileManager />);
     await screen.findByText("local.txt");
-    const target = screen.getByTestId("pane-0").firstElementChild as HTMLElement;
+    const target = screen.getByTestId("pane-0").querySelector("[data-os-drop-dir]") as HTMLElement;
     const data = new Map<string, string>([["application/x-ufop-files", JSON.stringify(["/other/x.txt"])]]);
     fireEvent.drop(target, { dataTransfer: { getData: (t: string) => data.get(t) ?? "", types: [...data.keys()] } });
-    await waitFor(() => expect(calls("move_files")).toContainEqual({ sourcePaths: ["/other/x.txt"], destDir: "/home" }));
+    await waitFor(() => expect(calls("enqueue_local_transfer")).toContainEqual({ sourcePaths: ["/other/x.txt"], destDir: "/home", mode: "move" }));
     expect(screen.queryByTestId("drag-drop-confirm")).not.toBeInTheDocument();
   });
 
@@ -366,7 +396,7 @@ describe("connections in the panes", () => {
     setPanes(ROOT, "/home", true);
     render(<FileManager />);
     await screen.findByText("Reports");
-    const target = screen.getByTestId("pane-0").firstElementChild as HTMLElement;
+    const target = screen.getByTestId("pane-0").querySelector("[data-os-drop-dir]") as HTMLElement;
     const data = new Map<string, string>([["application/x-ufop-files", JSON.stringify(["/home/big"])]]);
     fireEvent.drop(target, { dataTransfer: { getData: (t: string) => data.get(t) ?? "", types: [...data.keys()] } });
     const confirm = await screen.findByTestId("drag-drop-confirm");
@@ -428,7 +458,7 @@ describe("connections in the panes", () => {
     setPanes(ROOT, "/home", true);
     render(<FileManager />);
     const row = await settled("a.txt");
-    const target = screen.getByTestId("pane-0").firstElementChild as HTMLElement;
+    const target = screen.getByTestId("pane-0").querySelector("[data-os-drop-dir]") as HTMLElement;
     const data = new Map<string, string>([["application/x-ufop-files", JSON.stringify([`conn://${ID}/shared-drives/D/x9`])]]);
     fireEvent.drop(target, { dataTransfer: { getData: (t: string) => data.get(t) ?? "", types: [...data.keys()] } });
     fireEvent.click(row);

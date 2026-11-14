@@ -157,6 +157,7 @@ export default function AuditPage() {
               className="sm:w-80"
             />
             <Select
+              aria-label="Filter audit severity"
               options={[
                 { value: '', label: 'All Severities' },
                 { value: 'info', label: 'Info' },
@@ -168,7 +169,7 @@ export default function AuditPage() {
               onChange={(e) => setSeverityFilter(e.target.value)}
               className="sm:w-40"
             />
-            <Select
+            <Select aria-label="Filter audit category"
               options={[
                 { value: '', label: 'All Categories' },
                 ...Object.keys(AUDIT_EVENT_CATEGORIES).map(c => ({ value: c, label: c })),

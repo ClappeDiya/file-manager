@@ -21,6 +21,8 @@ export const FEATURES = {
   webhooks: true,
   /** Org-level connector definitions (use Fleet → Credentials meanwhile). */
   connectors: false,
+  /** Persisted grants and delivery of shared workspaces to clients. */
+  sharedWorkspaces: false,
   /** Server-side sync-pair and transfer management. */
   syncApi: false,
   transferApi: false,
@@ -35,6 +37,7 @@ export const FEATURE_LABELS: Record<FeatureKey, string> = {
   billing: 'Billing',
   webhooks: 'Webhooks',
   connectors: 'Connectors',
+  sharedWorkspaces: 'Shared workspace delivery',
   syncApi: 'Sync management API',
   transferApi: 'Transfer management API',
 };

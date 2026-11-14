@@ -12,7 +12,7 @@ const plans = [
     tagline: 'Everything an individual needs.',
     cta: { label: 'Download', href: '/download', primary: true },
     features: [
-      'All 17 protocols',
+      'Local, cloud and server connections',
       'Crash-safe transfers + resume',
       'Real-time bidirectional sync',
       'Local AI assistant (Ollama)',
@@ -29,7 +29,7 @@ const plans = [
     note: `or ${BUSINESS_ANNUAL_PRICE}${BUSINESS_ANNUAL_PERIOD} (save ${ANNUAL_SAVINGS_PERCENT}%). ${TRIAL_DAYS}-day free trial, no card to start.`,
     tagline: 'Shared workspaces + governance for teams.',
     cta: { label: 'Join waitlist', href: '/pricing#waitlist', primary: false },
-    badge: 'Coming Q3 2026',
+    badge: 'Early access · join the waitlist',
     features: [
       'Everything in Free',
       'Team workspaces (shared connections + configs)',
@@ -60,12 +60,13 @@ const plans = [
 ];
 
 export function PricingCards({ variant = 'full' }: { variant?: PricingVariant }) {
+  const PlanHeading = variant === 'full' ? 'h2' : 'h3';
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
       {plans.map((plan) => (
         <div key={plan.name} className="marketing-card flex flex-col">
-          <div className="flex items-center justify-between mb-1">
-            <h3 className="text-lg font-bold text-foreground">{plan.name}</h3>
+          <div className="flex flex-wrap gap-2 items-center justify-between mb-1">
+            <PlanHeading className="text-lg font-bold text-foreground">{plan.name}</PlanHeading>
             {plan.badge && <span className="pill">{plan.badge}</span>}
           </div>
           <p className="text-sm text-foreground-secondary mb-5">{plan.tagline}</p>

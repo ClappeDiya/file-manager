@@ -14,6 +14,7 @@
  * - Re-accessible from Help > Getting Started
  * - Remembers completion state
  */
+import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { useState, useCallback } from "react";
 import { useUIStore, type OnboardingStep, type UserStyle } from "@/stores/ui-store";
 import { LanguagePicker } from "./appearance-settings";
@@ -114,14 +115,17 @@ export function OnboardingWizard({ onComplete, onOpenGuidedFlow }: OnboardingWiz
     onComplete();
   }, [setOnboardingComplete, addActivity, onComplete]);
 
+  const focusRef = useFocusTrap<HTMLDivElement>({ active: true, onEscape: handleSkip });
+
   return (
     <div
+      ref={focusRef}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
       aria-label="Setup wizard"
     >
-      <div className="w-full max-w-2xl mx-4 bg-[var(--color-bg)] rounded-2xl shadow-2xl overflow-hidden">
+      <div className="w-full max-w-2xl mx-4 bg-[var(--color-bg)] rounded-2xl shadow-2xl overflow-y-auto max-h-[90dvh]">
         {/* Step indicator */}
         <div className="flex items-center justify-between px-6 pt-5">
           <div className="flex items-center gap-2">

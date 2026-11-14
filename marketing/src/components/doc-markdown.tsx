@@ -31,6 +31,7 @@ export function DocMarkdown({ content }: { content: string }) {
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHeadingIds]}
       components={{
+        pre: ({ node: _node, ...rest }) => <pre {...rest} tabIndex={0} role="region" aria-label="Code sample" />,
         a: ({ node: _node, href, ...rest }) => <a {...rest} href={href === undefined ? undefined : resolveDocHref(href)} />,
       }}
     >

@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
@@ -15,6 +15,7 @@ import {
   Brain,
   CreditCard,
   FolderSync,
+  X,
   ChevronLeft,
   ChevronRight,
   Settings,
@@ -95,6 +96,31 @@ export function Sidebar() {
   const branding = useBrandingStore((s) => s.branding);
   const brandName = branding && branding.displayName !== 'UFOP' ? branding.displayName : null;
   const { sidebarCollapsed, toggleSidebar, sidebarMobileOpen, toggleMobileSidebar } = useAdminStore();
+  const panelRef = useRef<HTMLElement>(null);
+  const closeMobileRef = useRef(toggleMobileSidebar);
+  closeMobileRef.current = toggleMobileSidebar;
+  useEffect(() => {
+    if (!sidebarMobileOpen) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const panel = panelRef.current;
+    const media = window.matchMedia('(min-width: 1024px)');
+    const closeOnDesktop = () => { if (media.matches) closeMobileRef.current(); };
+    const items = () => [...(panel?.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),[tabindex="0"]') ?? [])].filter((el) => el.getClientRects().length > 0);
+    items()[0]?.focus();
+    const keys = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); closeMobileRef.current(); }
+      if (event.key !== 'Tab') return;
+      const focusables = items();
+      const first = focusables[0], last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
+    document.addEventListener('keydown', keys);
+    media.addEventListener('change', closeOnDesktop);
+    closeOnDesktop();
+    return () => { document.removeEventListener('keydown', keys); media.removeEventListener('change', closeOnDesktop); previouslyFocused?.focus(); };
+  }, [sidebarMobileOpen]);
+  const collapsed = sidebarCollapsed && !sidebarMobileOpen;
   const checkPermission = useAuthStore((s) => s.checkPermission);
   const t = useTranslate();
 
@@ -111,15 +137,21 @@ export function Sidebar() {
       {/* Mobile overlay */}
       {sidebarMobileOpen && (
         <div
+          aria-hidden="true"
           className="fixed inset-0 z-40 bg-black/50 lg:hidden"
           onClick={toggleMobileSidebar}
         />
       )}
 
       <aside
+        ref={panelRef}
+        id="admin-navigation"
+        role={sidebarMobileOpen ? "dialog" : undefined}
+        aria-modal={sidebarMobileOpen || undefined}
+        aria-label="Administration navigation"
         className={cn(
           'fixed top-0 left-0 z-50 h-full bg-sidebar-bg border-r border-sidebar-border flex flex-col transition-all duration-slow',
-          sidebarCollapsed ? 'w-16' : 'w-64',
+          collapsed ? 'w-16' : 'w-64',
           'hidden lg:flex lg:relative',
           sidebarMobileOpen ? '!flex translate-x-0' : '-translate-x-full lg:translate-x-0'
         )}
@@ -127,33 +159,34 @@ export function Sidebar() {
         {/* Logo area */}
         <div className={cn(
           'flex items-center h-14 border-b border-sidebar-border px-4',
-          sidebarCollapsed ? 'justify-center' : 'justify-between'
+          collapsed ? 'justify-center' : 'justify-between'
         )}>
-          {!sidebarCollapsed && (
+          {!collapsed && (
             <Link href="/dashboard" className="flex items-center gap-2 min-w-0">
               <BrandMark />
               <span className="font-semibold text-sidebar-text-active text-sm truncate">{brandName ? brandName : 'UFOP Admin'}</span>
             </Link>
           )}
-          {sidebarCollapsed && <BrandMark />}
+          {collapsed && <BrandMark />}
+          {sidebarMobileOpen && <button onClick={toggleMobileSidebar} aria-label="Close navigation" className="p-2 rounded-md lg:hidden hover:bg-background-tertiary"><X size={20} aria-hidden="true" /></button>}
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 overflow-y-auto py-3 px-2">
+        <nav aria-label="Admin sections" className="flex-1 overflow-y-auto py-3 px-2">
           <ul className="space-y-0.5">
             {itemsWithPermission.map(({ item, allowed }) => {
               const isActive = allowed && (pathname === item.href || (!item.exact && pathname?.startsWith(item.href + '/')));
               const Icon = item.icon;
               const label = t(item.i18nKey);
               const lockedTitle = `${label} — requires ${item.requiredPermission} permission`;
-              const tooltip = sidebarCollapsed
+              const tooltip = collapsed
                 ? allowed ? label : lockedTitle
                 : allowed ? undefined : lockedTitle;
 
               const inner = (
                 <>
                   <Icon size={18} className="shrink-0" aria-hidden="true" />
-                  {!sidebarCollapsed && (
+                  {!collapsed && (
                     <>
                       <span className="flex-1">{label}</span>
                       {!allowed && (
@@ -173,7 +206,7 @@ export function Sidebar() {
 
               const baseClass = cn(
                 'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-                sidebarCollapsed && 'justify-center px-2',
+                collapsed && 'justify-center px-2',
               );
 
               return (
@@ -181,6 +214,7 @@ export function Sidebar() {
                   {allowed ? (
                     <Link
                       href={item.href}
+                      aria-current={isActive ? "page" : undefined}
                       onClick={() => sidebarMobileOpen && toggleMobileSidebar()}
                       className={cn(
                         baseClass,
@@ -214,10 +248,11 @@ export function Sidebar() {
           <button
             onClick={toggleSidebar}
             className="w-full flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm text-sidebar-text hover:bg-background-tertiary transition-colors"
-            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           >
-            {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
-            {!sidebarCollapsed && <span>Collapse</span>}
+            {collapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+            {!collapsed && <span>Collapse</span>}
           </button>
         </div>
       </aside>

@@ -29,44 +29,31 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [issues, setIssues] = useState<Record<string, string>>({});
   const notify = useToastStore((s) => s.notify);
   const t = useTranslate();
 
   const fetchDashboardData = useCallback(async () => {
-    try {
-      const [usersRes, approvalsRes, devicesRes, auditRes, policiesRes] = await Promise.all([
-        fetch('/api/users'),
-        fetch('/api/approvals'),
-        fetch('/api/devices'),
-        fetch('/api/audit?pageSize=5'),
-        fetch('/api/policies'),
-      ]);
-
-      if (!usersRes.ok || !approvalsRes.ok || !devicesRes.ok || !auditRes.ok || !policiesRes.ok) {
-        throw new Error('Failed to fetch dashboard data');
-      }
-
-      const [usersData, approvalsData, devicesData, auditData, policiesData] = await Promise.all([
-        usersRes.json(),
-        approvalsRes.json(),
-        devicesRes.json(),
-        auditRes.json(),
-        policiesRes.json(),
-      ]);
-
-      setUsers(usersData.users || []);
-      setApprovals(approvalsData.approvals || []);
-      setDevices(devicesData.devices || []);
-      setAuditEntries(auditData.entries || []);
-      setPolicies(policiesData.policies || []);
-      setLastUpdated(new Date());
-      setError(null);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to load dashboard';
-      setError(message);
-      throw err;
-    }
+    const sections = [
+      { key: 'users', url: '/api/users', field: 'users', apply: setUsers },
+      { key: 'approvals', url: '/api/approvals', field: 'approvals', apply: setApprovals },
+      { key: 'devices', url: '/api/devices', field: 'devices', apply: setDevices },
+      { key: 'audit', url: '/api/audit?pageSize=5', field: 'entries', apply: setAuditEntries },
+      { key: 'policies', url: '/api/policies', field: 'policies', apply: setPolicies },
+    ];
+    const failures: Record<string, string> = {};
+    await Promise.allSettled(sections.map(async (section) => {
+      try {
+        const response = await fetch(section.url);
+        if (!response.ok) throw new Error(response.status === 403 ? 'You do not have access to this section.' : `Request failed (${response.status}).`);
+        const data = await response.json();
+        if (!Array.isArray(data[section.field])) throw new Error('The server returned an invalid response.');
+        section.apply(data[section.field]);
+      } catch (e) { failures[section.key] = e instanceof Error ? e.message : 'Could not load this section.'; }
+    }));
+    setIssues(failures);
+    if (!Object.keys(failures).length) setLastUpdated(new Date());
+    return Object.keys(failures).length;
   }, []);
 
   useEffect(() => {
@@ -78,8 +65,9 @@ export default function DashboardPage() {
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      await fetchDashboardData();
-      notify(t('dashboard.refreshSuccess'), 'success');
+      const failures = await fetchDashboardData();
+      if (failures) notify(`${failures} dashboard section(s) could not refresh. Other sections are up to date.`, 'error');
+      else notify(t('dashboard.refreshSuccess'), 'success');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Refresh failed';
       notify(t('dashboard.refreshError', { message }), 'error');
@@ -94,18 +82,6 @@ export default function DashboardPage() {
         <PageHeader title="Dashboard" description="Overview of your organization's file operations" />
         <div className="flex items-center justify-center py-20">
           <div className="animate-spin h-8 w-8 border-4 border-primary border-t-transparent rounded-full" />
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div>
-        <PageHeader title="Dashboard" description="Overview of your organization's file operations" />
-        <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p role="alert" className="text-sm text-error">{error}</p>
-          <Button onClick={handleRefresh} loading={refreshing}>Retry</Button>
         </div>
       </div>
     );
@@ -140,33 +116,38 @@ export default function DashboardPage() {
         }
       />
 
+      {Object.keys(issues).length > 0 && <div role="alert" className="mb-4 rounded-md border border-error/20 bg-error-bg p-3 text-sm text-error">
+        Some sections could not refresh. Their data is unavailable or last known; other sections remain usable.
+        <ul className="mt-2">{Object.entries(issues).map(([key, message]) => <li key={key} className="capitalize">{key}: {message}</li>)}</ul>
+        <Button variant="outline" size="sm" onClick={handleRefresh} loading={refreshing}>Retry unavailable sections</Button>
+      </div>}
       {/* Stats Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <StatCard
           title="Active Users"
-          value={activeUsers}
-          subtitle={`${users.length} total`}
+          value={issues.users ? "Unavailable" : activeUsers}
+          subtitle={issues.users ? "Could not refresh users" : `${users.length} total`}
           icon={Users}
           variant="info"
         />
         <StatCard
           title="Pending Approvals"
-          value={pendingApprovals}
-          subtitle={pendingApprovals ? "Requires attention" : "No pending reviews"}
+          value={issues.approvals ? "Unavailable" : pendingApprovals}
+          subtitle={issues.approvals ? "Could not refresh approvals" : pendingApprovals ? "Requires attention" : "No pending reviews"}
           icon={CheckSquare}
-          variant={pendingApprovals > 0 ? 'warning' : 'success'}
+          variant={issues.approvals ? 'default' : pendingApprovals > 0 ? 'warning' : 'success'}
         />
         <StatCard
           title="Online Devices"
-          value={`${onlineDevices}/${devices.length}`}
-          subtitle={devices.length === 0 ? 'No devices enrolled' : nonCompliantDevices > 0 ? `${nonCompliantDevices} non-compliant` : 'All compliant'}
+          value={issues.devices ? "Unavailable" : `${onlineDevices}/${devices.length}`}
+          subtitle={issues.devices ? "Could not refresh device health" : devices.length === 0 ? 'No devices enrolled' : nonCompliantDevices > 0 ? `${nonCompliantDevices} non-compliant` : 'All compliant'}
           icon={Monitor}
-          variant={nonCompliantDevices > 0 ? 'warning' : 'success'}
+          variant={issues.devices || devices.length === 0 ? 'default' : nonCompliantDevices > 0 ? 'warning' : 'success'}
         />
         <StatCard
           title="Active Policies"
-          value={activePolicies}
-          subtitle="Across all domains"
+          value={issues.policies ? "Unavailable" : activePolicies}
+          subtitle={issues.policies ? "Could not refresh policies" : "Across all domains"}
           icon={Shield}
           variant="default"
         />
@@ -210,7 +191,7 @@ export default function DashboardPage() {
                   <Badge variant="warning">Pending</Badge>
                 </div>
               ))}
-            {pendingApprovals === 0 && (
+            {!issues.approvals && pendingApprovals === 0 && (
               <p className="text-sm text-foreground-secondary text-center py-6">
                 No pending approvals
               </p>
@@ -264,7 +245,7 @@ export default function DashboardPage() {
               </div>
             )) : (
               <p className="text-sm text-foreground-secondary text-center py-6">
-                No recent activity
+                {issues.audit ? "Activity unavailable. Retry to refresh." : "No recent activity"}
               </p>
             )}
           </CardContent>
@@ -315,7 +296,7 @@ export default function DashboardPage() {
               </div>
             )) : (
               <p className="text-sm text-foreground-secondary text-center py-6">
-                No devices registered
+                {issues.devices ? "Device health unavailable. Retry to refresh." : "No devices registered"}
               </p>
             )}
           </CardContent>
@@ -355,7 +336,7 @@ export default function DashboardPage() {
                 </div>
               )) : (
               <p className="text-sm text-foreground-secondary text-center py-6">
-                No active policies
+                {issues.policies ? "Policies unavailable. Retry to refresh." : "No active policies"}
               </p>
             )}
           </CardContent>

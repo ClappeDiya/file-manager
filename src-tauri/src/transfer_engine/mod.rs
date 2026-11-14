@@ -327,7 +327,7 @@ impl TransferManager {
 
     /// After a location job ended: finish its part of a move.
     async fn settle_move(&self, job_id: Uuid, status: TransferStatus) {
-        let Some(resolver) = self.remote_resolver() else { return };
+        let resolver = self.remote_resolver().unwrap_or_else(|| Arc::new(location::LocalOnlyResolver));
         // A failed job with no retries left will not complete: release it
         // like a cancelled one (the move keeps its source folders), so the
         // group does not wait for it for the rest of the session.
@@ -550,8 +550,15 @@ impl TransferManager {
         if let Err(message) = self.run_local_job_inner(job_id).await {
             // A cancelled job already has its final status — don't overwrite it.
             if !self.control(job_id).await.is_cancelled() {
+                if let Some(journal) = self.try_journal().await {
+                    let _ = journal.fail_job(&job_id.to_string(), &message).await;
+                }
                 let _ = self.fail_job(job_id, &message).await;
             }
+        }
+        let status = self.jobs.read().await.get(&job_id).map(|j| j.status);
+        if let Some(status) = status {
+            self.settle_move(job_id, status).await;
         }
         self.record_history(job_id, started_at, started.elapsed()).await;
     }
@@ -596,7 +603,7 @@ impl TransferManager {
 
     async fn run_local_job_inner(&self, job_id: Uuid) -> Result<(), String> {
         let control = self.control(job_id).await;
-        let (source, dest) = {
+        let (source, dest, retrying) = {
             let mut map = self.jobs.write().await;
             let job = map.get_mut(&job_id).ok_or_else(|| "Transfer job not found".to_string())?;
             if job.status != TransferStatus::Queued {
@@ -604,7 +611,7 @@ impl TransferManager {
             }
             job.status = TransferStatus::Active;
             job.updated_at = Utc::now();
-            (job.source_path.clone(), job.dest_path.clone())
+            (job.source_path.clone(), job.dest_path.clone(), job.retry_count > 0)
         };
         if control.is_cancelled() {
             return Ok(());
@@ -660,8 +667,28 @@ impl TransferManager {
             .try_journal()
             .await
             .ok_or_else(|| "Transfer journal is not ready yet; try again in a moment.".to_string())?;
+        if retrying {
+            // Retry starts this attempt from scratch; crash recovery has its
+            // own resume path that retains the verified chunk bitmap.
+            journal.delete_job(&job_id.to_string()).await.map_err(|e| e.to_string())?;
+        }
         let config = self.config().await;
         let tier = config.default_verify_tier;
+        // Consume progress in order. The UI must see bytes while chunks are
+        // copied, and no late update may race with the terminal state.
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let progress_manager = self.clone();
+        let progress_started = std::time::Instant::now();
+        let progress_task = tokio::spawn(async move {
+            while let Some(bytes) = progress_rx.recv().await {
+                let elapsed = progress_started.elapsed().as_secs_f64();
+                let speed = (bytes as f64 / elapsed.max(0.001)) as u64;
+                let _ = progress_manager.update_progress(job_id, bytes, speed).await;
+            }
+        });
+        let on_progress: pipeline::ProgressCallback = Box::new(move |_, bytes, _| {
+            let _ = progress_tx.send(bytes);
+        });
         let result = pipeline::execute_file_transfer(
             &source,
             &dest_file,
@@ -671,11 +698,13 @@ impl TransferManager {
             &journal,
             self.worker_pool(),
             &job_id.to_string(),
-            None,
+            Some(&on_progress),
             Some(control),
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+        drop(on_progress);
+        let _ = progress_task.await;
+        let result = result.map_err(|e| e.to_string())?;
 
         let _ = self.update_progress(job_id, result.file_size, result.speed_bps).await;
         // Persist the pipeline's verified hashes on the job so history can
@@ -1039,6 +1068,11 @@ impl TransferManager {
         if can_retry {
             job.status = TransferStatus::Queued;
             job.error_message = None;
+            job.transferred_bytes = 0;
+            job.speed_bps = 0;
+            job.eta_seconds = None;
+            job.source_checksum = None;
+            job.dest_checksum = None;
         }
         job.updated_at = Utc::now();
         drop(map);
@@ -1075,6 +1109,11 @@ impl TransferManager {
             if job.status == TransferStatus::Failed && !job.external && job.retry_count < policy.max_retries {
                 job.status = TransferStatus::Queued;
                 job.error_message = None;
+                job.transferred_bytes = 0;
+                job.speed_bps = 0;
+                job.eta_seconds = None;
+                job.source_checksum = None;
+                job.dest_checksum = None;
                 job.retry_count += 1;
                 job.updated_at = Utc::now();
                 requeued.push(job.id);
@@ -1535,6 +1574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bandwidth_throttle() {
+        let _rates = throttle::global_rates_test_lock().await;
         let mgr = TransferManager::new();
         let conn_id = Uuid::new_v4();
 
@@ -1549,6 +1589,7 @@ mod tests {
 
         mgr.set_global_throttle(1_000_000).await;
         assert_eq!(mgr.effective_throttle(Some(conn_id)).await, 500_000);
+        mgr.set_global_throttle(0).await;
     }
 
     #[tokio::test]
@@ -1662,6 +1703,136 @@ mod tests {
         mgr
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_runner_reports_partial_bytes_before_completion() {
+        let mgr = mgr_with_journal().await;
+        let mut config = mgr.config().await;
+        config.chunk_threshold = 1;
+        config.chunk_size_override = Some(64 * 1024);
+        mgr.set_config(config).await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        let data = vec![37; 8 * 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let job = mgr
+            .enqueue(
+                src.to_str().unwrap(),
+                dst.to_str().unwrap(),
+                data.len() as u64,
+            )
+            .await
+            .unwrap();
+        let mut progress = mgr.subscribe_progress();
+        mgr.spawn_runner(job.id).await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                progress.changed().await.unwrap();
+                let p = progress.borrow_and_update().clone().unwrap();
+                if p.transferred_bytes > 0 && p.transferred_bytes < data.len() as u64 {
+                    break;
+                }
+                assert_ne!(
+                    p.status,
+                    TransferStatus::Completed,
+                    "No partial progress was published"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while mgr.get_job(job.id).await.unwrap().unwrap().status != TransferStatus::Completed {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(dst).unwrap(), data);
+    }
+    #[tokio::test]
+    async fn default_single_chunk_copy_reports_live_bytes() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        let data = vec![19; 2 * 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let job = mgr
+            .enqueue(
+                src.to_str().unwrap(),
+                dst.to_str().unwrap(),
+                data.len() as u64,
+            )
+            .await
+            .unwrap();
+        let mut progress = mgr.subscribe_progress();
+        let rate = Arc::new(ufop_core::throttle::SharedRate::new());
+        rate.set(2 * 1024 * 1024);
+        let copy = throttle::TEST_TRANSFER_RATE.scope(rate, mgr.run_local_job(job.id));
+        let observe = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    progress.changed().await.unwrap();
+                    let p = progress.borrow_and_update().clone().unwrap();
+                    if p.transferred_bytes > 0 && p.transferred_bytes < data.len() as u64 {
+                        break;
+                    }
+                    assert_ne!(
+                        p.status,
+                        TransferStatus::Completed,
+                        "A single-chunk copy never published partial bytes"
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        };
+        tokio::join!(copy, observe);
+        assert_eq!(
+            mgr.get_job(job.id).await.unwrap().unwrap().status,
+            TransferStatus::Completed
+        );
+        assert_eq!(std::fs::read(dst).unwrap(), data);
+    }
+    #[tokio::test]
+    async fn cancellation_interrupts_a_throttled_block_wait() {
+        let mgr = mgr_with_journal().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        let data = vec![23; 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let job = mgr
+            .enqueue(
+                src.to_str().unwrap(),
+                dst.to_str().unwrap(),
+                data.len() as u64,
+            )
+            .await
+            .unwrap();
+        let rate = Arc::new(ufop_core::throttle::SharedRate::new());
+        rate.set(1); // Waiting for a whole block must not hold cancellation.
+        let copy = throttle::TEST_TRANSFER_RATE.scope(rate, mgr.run_local_job(job.id));
+        let cancel = async {
+            let temp = chunk::temp_path_for(dst.to_str().unwrap());
+            wait_until(|| std::path::Path::new(&temp).exists(), "temporary file").await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            mgr.cancel(job.id).await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(copy, cancel);
+        })
+        .await
+        .expect("Cancellation waited for the bandwidth allocation");
+        assert_eq!(
+            mgr.get_job(job.id).await.unwrap().unwrap().status,
+            TransferStatus::Cancelled
+        );
+        assert!(!dst.exists());
+        assert!(!std::path::Path::new(&chunk::temp_path_for(dst.to_str().unwrap())).exists());
+        assert_eq!(std::fs::read(src).unwrap(), data);
+    }
     /// Regression: enqueue used to only record a Queued job that never ran.
     /// run_local_job must actually copy the bytes and mark the job Completed.
     #[tokio::test]
@@ -1775,6 +1946,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_local_writes_retry_with_a_fresh_journal_and_real_bytes() {
+        for retry_all in [false, true] {
+            let mgr = mgr_with_journal().await;
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("source.bin");
+            let dst = dir.path().join("destination.bin");
+            let bytes = vec![71; 65_536];
+            std::fs::write(&src, &bytes).unwrap();
+            let partial = chunk::temp_path_for(dst.to_str().unwrap());
+            // The journal is created before pre-allocation fails on this directory.
+            std::fs::create_dir(&partial).unwrap();
+            let job = mgr.enqueue(src.to_str().unwrap(), dst.to_str().unwrap(), bytes.len() as u64).await.unwrap();
+            mgr.run_local_job(job.id).await;
+            assert_eq!(mgr.get_job(job.id).await.unwrap().unwrap().status, TransferStatus::Failed);
+            assert!(!dst.exists());
+            std::fs::remove_dir(&partial).unwrap();
+            if retry_all {
+                assert_eq!(mgr.retry_all_failed().await.unwrap(), vec![job.id]);
+            } else {
+                assert!(mgr.increment_retry(job.id).await.unwrap());
+            }
+            mgr.run_local_job(job.id).await;
+            let done = mgr.get_job(job.id).await.unwrap().unwrap();
+            assert_eq!(done.status, TransferStatus::Completed, "{:?}", done.error_message);
+            assert_eq!(done.source_checksum, done.dest_checksum);
+            assert!(done.source_checksum.is_some());
+            assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+            assert_eq!(std::fs::read(&src).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
     async fn test_run_local_job_never_overwrites() {
         let mgr = mgr_with_journal().await;
         let dir = tempfile::tempdir().unwrap();
@@ -1857,17 +2060,19 @@ mod tests {
 
         mgr.resume(job.id).await.unwrap();
 
-        // The parked worker wakes and the same copy finishes.
-        for _ in 0..500 {
-            let j = mgr.get_job(job.id).await.unwrap().unwrap();
-            if j.status == TransferStatus::Completed {
-                assert_eq!(std::fs::read(&dst).unwrap(), bytes);
-                return;
+        // Wait for the state transition, allowing contention with the
+        // full native suite's other filesystem and crypto work.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let j = mgr.get_job(job.id).await.unwrap().unwrap();
+                if j.status == TransferStatus::Completed {
+                    assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+                    break;
+                }
+                assert_ne!(j.status, TransferStatus::Failed, "job failed: {:?}", j.error_message);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            assert_ne!(j.status, TransferStatus::Failed, "job failed: {:?}", j.error_message);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("job did not complete after resume");
+        }).await.expect("job did not complete after resume");
     }
 
     /// Cancel must stop a running transfer, remove the partial temp file, and

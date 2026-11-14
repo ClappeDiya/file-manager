@@ -152,7 +152,7 @@ export default function EnrollPage() {
                 <TableHead className="hidden md:table-cell">Expires</TableHead>
                 <TableHead className="hidden md:table-cell">Default tags</TableHead>
                 <TableHead>State</TableHead>
-                <TableHead />
+                <TableHead><span className="sr-only">Actions</span></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>

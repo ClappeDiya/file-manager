@@ -52,7 +52,8 @@ import {
 } from "@/lib/selection-stats";
 import { archiveExtractDest } from "@/lib/archive-paths";
 import { pickFolder } from "@/lib/folder-picker";
-import { planPaneCopy, awaitPaneCopyJobs } from "@/lib/pane-copy";
+import { queueWorkspaceItems, useTransferWorkspace, type WorkspaceJob } from "@/stores/transfer-workspace-store";
+import { awaitPaneCopyJobs } from "@/lib/pane-copy";
 import { isTextEntry, resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveNewWindowKey, resolveParentFolderKey } from "@/lib/file-action-keys";
 import { isSecondaryWindow, openNewWindow } from "@/lib/app-window";
 import { useAppLockStore } from "@/stores/app-lock-store";
@@ -387,7 +388,8 @@ function refuseRemoteBatchRename() {
 let migrationRun: MigrationRunState | null = null;
 let migrationRunDest: string | null = null;
 
-export function FileManager() {
+export function FileManager({ embedded = false }: { embedded?: boolean }) {
+  const [locationsOpen, setLocationsOpen] = useState(false);
   useOsFileDrop();
   useTextSizeShortcuts();
   // Re-render the window when the size units change (formatBytes reads the setting).
@@ -518,6 +520,11 @@ export function FileManager() {
   // zero importers — the features existed but no UI path reached them.
   const [vaultOpen, setVaultOpen] = useState(false);
   const [transfersOpen, setTransfersOpen] = useState(false);
+  useEffect(() => {
+    const open = () => setTransfersOpen(true);
+    window.addEventListener("ufop:open-transfer-queue", open);
+    return () => window.removeEventListener("ufop:open-transfer-queue", open);
+  }, []);
   const [migrationOpen, setMigrationOpen] = useState(false);
   // Drive inventory for the migration wizard — fetched lazily when the
   // wizard opens via the real `detect_drives` IPC (T-025). Without this
@@ -1326,6 +1333,15 @@ export function FileManager() {
   // Global keyboard shortcuts
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k" && useFileManagerStore.getState().commandPaletteOpen) {
+          e.preventDefault(); setCommandPaletteOpen(false);
+        }
+        return;
+      }
+      const focused = document.activeElement as HTMLElement | null;
+      const editing = focused?.matches('input, textarea, select') || focused?.isContentEditable;
+      if (editing && !((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k")) return;
       // ? (Shift+/) toggles the keyboard cheat sheet overlay. Pure
       // discoverability gesture: lists every palette entry with a
       // bound shortcut, grouped by category, auto-updated from the
@@ -2498,16 +2514,17 @@ export function FileManager() {
       {/* "What happened while you were away?" mount-time summary toast */}
       <SinceLastSeenToast summary={sinceSummary} onDismiss={() => setSinceSummary(null)} />
       {/* Toolbar */}
-      <header
-        className="relative flex items-center justify-between border-b border-[var(--color-border)] bg-[var(--color-toolbar-bg)] px-4"
+      <div
+        className="relative flex shrink-0 items-center justify-between overflow-x-auto border-b border-[var(--color-border)] bg-[var(--color-toolbar-bg)] px-4"
         style={{ height: "var(--toolbar-height)" }}
         role="toolbar"
-        aria-label="Main toolbar"
+        aria-label={embedded ? "File actions" : "Main toolbar"}
         onContextMenu={(e) => { e.preventDefault(); toggleToolbarCustomizer(); }}
       >
         <div className="flex items-center gap-3">
+          {embedded && <Button size="sm" variant="ghost" className="hidden [@media(max-height:700px)]:inline-flex" aria-expanded={locationsOpen} onClick={() => setLocationsOpen(!locationsOpen)}><PanelLeft className="h-4 w-4 mr-1" />Locations</Button>}
           {/* In Simple Mode the outer SimpleModeWrapper provides sidebar toggle + title; suppress the duplicates here. */}
-          {appMode !== "simple" && toolbarItems.includes("sidebar") && (
+          {!embedded && appMode !== "simple" && toolbarItems.includes("sidebar") && (
             <Button
               variant="ghost"
               size="icon"
@@ -2518,7 +2535,7 @@ export function FileManager() {
               <PanelLeft className="h-4 w-4" aria-hidden="true" />
             </Button>
           )}
-          {appMode !== "simple" && (
+          {!embedded && appMode !== "simple" && (
             <>
               <FolderOpen className="h-5 w-5 text-[color:var(--color-primary)]" aria-hidden="true" />
               <h1 className="text-[length:var(--font-size-md)] font-semibold text-[color:var(--color-text)]">
@@ -2770,11 +2787,11 @@ export function FileManager() {
             </Button>
           )}
           {/* In Simple Mode the outer SimpleModeWrapper renders the ThemeSwitcher; suppress duplicate. */}
-          {appMode !== "simple" && toolbarItems.includes("theme") && <ThemeSwitcher />}
+          {!embedded && appMode !== "simple" && toolbarItems.includes("theme") && <ThemeSwitcher />}
           {/* Same rule for the notification bell: SimpleModeWrapper owns it in
               Simple Mode, but that wrapper early-returns in Advanced Mode, so
               without this mount structured errors would have no render surface. */}
-          {appMode !== "simple" && <NotificationBell />}
+          {!embedded && appMode !== "simple" && <NotificationBell />}
         </div>
 
         {/* Toolbar Customizer (#14) */}
@@ -2815,11 +2832,15 @@ export function FileManager() {
             </div>
           </div>
         )}
-      </header>
+      </div>
 
+      {embedded && <div className="flex flex-wrap items-center gap-2 px-3 py-1 border-b border-[var(--color-border)] text-xs [@media(max-height:700px)]:hidden">
+        <Button size="sm" variant="ghost" aria-expanded={locationsOpen} onClick={() => setLocationsOpen(!locationsOpen)}><PanelLeft className="h-4 w-4 mr-1" />Locations</Button>
+        <span className="hidden sm:inline text-[color:var(--color-text-secondary)]">Browse the source and destination below. Start a transfer to copy or move between them.</span>
+      </div>}
       {/* Main content area */}
-      <div id="main-content" tabIndex={-1} className="flex flex-1 overflow-hidden">
-        {sidebarOpen && (
+      <div id={embedded ? "file-workspace" : "main-content"} tabIndex={-1} className="flex flex-1 overflow-hidden">
+        {(embedded ? locationsOpen : sidebarOpen) && (
           <aside
             className="border-r border-[var(--color-border)] shrink-0 overflow-hidden"
             style={{ width: sidebarWidth }}
@@ -2896,8 +2917,8 @@ export function FileManager() {
           </aside>
         )}
 
-        <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="flex-1 overflow-hidden">
+        <div className="min-w-0 flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 min-h-0 overflow-auto">
             <DualPaneLayout
               renderPane={(paneIndex) => (
                 <FilePane
@@ -2909,14 +2930,14 @@ export function FileManager() {
                     setIntegrityToolsOpen({ dir, files })
                   }
                   onCompress={(files) => setCreateArchiveSources(files)}
-                  onShowTransfers={() => setTransfersOpen(true)}
+                  onShowTransfers={() => window.dispatchEvent(new CustomEvent("ufop:show-workspace"))}
                   onSendToComputer={openNearby}
                   onOpenConnections={() => setConnectionsOpen(true)}
                 />
               )}
             />
           </div>
-          <TerminalPanel />
+          <TerminalPanel compactWhenClosed={embedded} />
         </div>
 
         {/* Lazy-mount: only render side panels when their toggle is on, so a fresh window
@@ -2975,18 +2996,18 @@ export function FileManager() {
           >
             <X className="h-3.5 w-3.5" />
           </button>
-          <TransferPanel />
+          <TransferPanel initialMode="full" />
         </div>
       )}
 
-      <footer
-        className="relative flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4"
+      <div
+        className={cn("relative items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4", embedded ? "hidden sm:flex [@media(max-height:700px)]:hidden" : "flex")}
         style={{ height: "var(--status-bar-height)" }}
-        role="contentinfo"
+        role="status"
         aria-label="Status bar"
       >
         <StatusBarContent />
-      </footer>
+      </div>
 
       <ContextMenu
         items={contextMenu?.items || []}
@@ -3788,7 +3809,8 @@ function FilePane({
         if (!isCurrent()) return;
         setFiles(entries);
       } else {
-        setFiles(isRemotePath(path) ? [] : generateDemoFiles(path));
+        setFiles([]);
+        setError("Open the desktop app to browse files. This browser view has no filesystem connection.");
       }
     } catch (err) {
       if (!isCurrent()) return;
@@ -3808,7 +3830,7 @@ function FilePane({
       // this path so we can show the user where it went. Fail-soft:
       // any error during the lineage fetch is silently swallowed,
       // leaving pathRecall=null and the user with the existing
-      // demo-files behaviour. The IPC already exists and is read-
+      // empty error state. The IPC already exists and is read-
       // only (one SQL scan), so this adds no operational cost.
       if (isTauriAvailable()) {
         try {
@@ -3825,7 +3847,7 @@ function FilePane({
             setPathRecall(inferPathRecall(lineage, path));
           }
         } catch {
-          /* lineage best-effort; keep demo-files fallback */
+          /* lineage is best effort; retain the empty error state */
         }
       }
     } finally {
@@ -4189,7 +4211,7 @@ function FilePane({
         if (isTauriAvailable()) {
           entries = await tauriInvoke<FileEntryData[]>("list_directory", { path: dirPath });
         } else {
-          entries = generateDemoFiles(dirPath);
+          throw new Error("Open the desktop app to calculate folder sizes.");
         }
         let totalSize = 0;
         for (const entry of entries) {
@@ -4282,6 +4304,12 @@ function FilePane({
           )
         : await run();
       if (outcome === null) return false;
+      useTransferWorkspace.getState().add({
+        id: crypto.randomUUID(), source: paths[0], sources: paths, sourceFolder: currentPath,
+        destination: destDir, mode, jobs: outcome.jobs as WorkspaceJob[],
+        foldersCreated: outcome.folders_created, movedCount: outcome.moved.length,
+        kept: outcome.kept ?? [], createdAt: new Date().toISOString(),
+      });
       const kept = outcome.kept ?? [];
       if (kept.length > 0) {
         useUIStore.getState().addStructuredError({
@@ -4310,114 +4338,40 @@ function FilePane({
     }
   }, [files, currentPath, onShowTransfers]);
 
-  const transferPaths = useCallback(async (paths: string[], destDir: string, mode: "copy" | "move"): Promise<boolean> => {
+  const transferPaths = useCallback(async (paths: string[], destDir: string, mode: "copy" | "move", preconfirmed = false): Promise<boolean> => {
     if (paths.length === 0) return false;
     const label = mode === "copy" ? "Copy" : "Move";
-    if (!isTauriAvailable()) { console.log(`${label} (demo mode):`, paths); return false; }
-    // Either end on a connection: the location route (transfer queue).
-    if (needsLocationTransfer(paths, destDir)) return transferAcrossLocations(paths, destDir, mode);
+    if (!isTauriAvailable()) return false;
+    if (needsLocationTransfer(paths, destDir)) return transferAcrossLocations(paths, destDir, mode, preconfirmed);
     try {
-      // Copying into the folder an item already lives in just makes a
-      // "(copy)" sibling, so there is nothing to confirm.
-      const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
-      const needsCheck = paths.filter((p) => parentOf(p) !== destDir);
-      if (needsCheck.length > 0 && !(await checkConflicts(needsCheck, destDir, mode))) return false;
-      const prefix = destDir === "/" ? "" : destDir;
-      const destPaths = paths.map((p) => `${prefix}/${p.split("/").pop()}`);
-      if (mode === "copy") {
-        // Files ride the transfer engine so pane copies get a real
-        // progress bar, pause/resume/cancel and a verified history row —
-        // the old copy_files route completed invisibly. Directories stay
-        // on copy_files (the engine moves single files only).
-        const parentDirs = [...new Set(paths.map(parentOf))];
-        const entryByPath = new Map<string, { is_dir: boolean; size: number }>();
-        for (const dir of parentDirs) {
-          try {
-            for (const e of await tauriInvoke<FileEntryData[]>("list_directory", { path: dir })) {
-              entryByPath.set(e.path, e);
-            }
-          } catch {
-            // Unclassifiable paths are treated as files; if the engine
-            // rejects them the queue shows the failure instead of a
-            // silent no-op.
-          }
+      if (!preconfirmed && !(await checkConflicts(paths, destDir, mode))) return false;
+      const run = () => queueWorkspaceItems(paths, destDir, mode);
+      const measured = mode === "move" && !preconfirmed ? await measureSelection(paths) : null;
+      const result = measured ? await assessBeforeExecute({
+        engine: "fs", kind: FS_INTENT_KIND.move, affected_files: measured.files,
+        total_bytes: measured.bytes, subject_path: currentPath,
+        summary: `Move ${paths.length} item(s) → ${destDir}`,
+      }, run) : await run();
+      if (!result) return false;
+      const touched = [currentPath, destDir, ...paths];
+      // Undo is offered only after every queued file actually completed.
+      // A failed or cancelled partial copy must not create a misleading undo.
+      void awaitPaneCopyJobs(result.jobs.map((j) => j.id), () => tauriInvoke<{ id: string; status: string }[]>("list_transfers"), {
+        onSettle: () => dispatchRefresh(touched),
+      }).then(({ completed, failed }) => {
+        if (failed === 0 && completed === result.jobs.length && result.destinationPaths?.length === paths.length) {
+          pushUndo({ id: `${mode}-${result.id}`, type: mode, sourcePaths: paths, destPaths: result.destinationPaths, timestamp: Date.now() });
         }
-        const destNames = new Set(
-          await tauriInvoke<FileEntryData[]>("list_directory", { path: destDir })
-            .then((entries) => entries.map((e) => e.name))
-            .catch(() => [] as string[]),
-        );
-        const { dirPaths, fileJobs } = planPaneCopy(paths, destDir, entryByPath, destNames);
-        if (dirPaths.length > 0) {
-          await tauriInvoke("copy_files", { sourcePaths: dirPaths, destDir });
-        }
-        const jobIds: string[] = [];
-        for (const job of fileJobs) {
-          const created = await tauriInvoke<{ id: string }>("enqueue_transfer", {
-            source: job.source,
-            dest: job.dest,
-            totalBytes: job.totalBytes,
-          });
-          jobIds.push(created.id);
-        }
-        if (fileJobs.length > 0) {
-          onShowTransfers();
-          // The engine is async with no finish event — poll until each
-          // job settles, refreshing the destination pane as files land
-          // so the copy leaves visible evidence of completion.
-          void awaitPaneCopyJobs(jobIds, () =>
-            tauriInvoke<{ id: string; status: string }[]>("list_transfers", undefined, []),
-            { onSettle: () => dispatchRefresh([destDir]) },
-          ).then(() => dispatchRefresh([destDir]));
-        }
-        const jobDestBySource = new Map(fileJobs.map((j) => [j.source, j.dest]));
-        pushUndo({
-          id: `copy-${Date.now()}`,
-          type: "copy",
-          sourcePaths: paths,
-          destPaths: paths.map((p) => jobDestBySource.get(p) ?? `${prefix}/${p.split("/").pop()}`),
-          timestamp: Date.now(),
-        });
-      } else {
-        const measured = await measureSelection(paths);
-        const result = await assessBeforeExecute(
-          {
-            engine: "fs",
-            kind: FS_INTENT_KIND.move,
-            affected_files: measured.files,
-            total_bytes: measured.bytes,
-            subject_path: currentPath,
-            summary: `Move ${paths.length} item${paths.length === 1 ? "" : "s"} → ${destDir}`,
-          },
-          () => tauriInvoke("move_files", { sourcePaths: paths, destDir }),
-        );
-        if (result === null) return false;
-        pushUndo({ id: `move-${Date.now()}`, type: "move", sourcePaths: paths, destPaths, timestamp: Date.now() });
-      }
-      // Path-aware refresh: the source pane(s) and the destination pane(s).
-      dispatchRefresh([currentPath, destDir, ...paths]);
+        dispatchRefresh(touched);
+      });
+      dispatchRefresh(touched);
       return true;
-    } catch (err) {
-      reportOperationFailure(label, err);
-      return false;
-    }
-  }, [pushUndo, checkConflicts, currentPath, onShowTransfers, transferAcrossLocations]);
+    } catch (err) { reportOperationFailure(label, err); return false; }
+  }, [pushUndo, checkConflicts, currentPath, transferAcrossLocations]);
 
-  /** Run a (confirmed) drop: the location route when a connection is
-   *  involved, else copy_files / move_files exactly as before. */
   const performDrop = useCallback(async (sources: string[], mode: "copy" | "move", preconfirmed = true) => {
-    if (needsLocationTransfer(sources, currentPath)) {
-      await transferAcrossLocations(sources, currentPath, mode, preconfirmed);
-      return;
-    }
-    const command = mode === "copy" ? "copy_files" : "move_files";
-    try {
-      await tauriInvoke(command, { sourcePaths: sources, destDir: currentPath });
-      dispatchRefresh([currentPath, ...sources]);
-    } catch (err) {
-      console.error(`${mode === "copy" ? "Copy" : "Move"} via DnD failed:`, err);
-    }
-  }, [currentPath, transferAcrossLocations]);
+    await transferPaths(sources, currentPath, mode, preconfirmed);
+  }, [currentPath, transferPaths]);
 
   // Palette "Go to Address…": edit this pane's address when it is the active one.
   useEffect(() => {
@@ -5300,6 +5254,7 @@ function FilePane({
   // always advertised but never bound.
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return;
       if ((e.metaKey || e.ctrlKey) && e.key === "=") {
         e.preventDefault();
         if (selectedPaths.length === 2) { handleCompareFiles(); }
@@ -5429,19 +5384,7 @@ function FilePane({
               return;
             }
             const isCopy = mode === "copy";
-            const command = isCopy ? "copy_files" : "move_files";
-            tauriInvoke(command, { sourcePaths: droppedPaths, destDir: currentPath })
-              .then(() => {
-                // Iter 19: drag-drop between panes needs to
-                // refresh BOTH the source (move only) and the
-                // destination. Passing droppedPaths covers the
-                // source side because the source paths are
-                // children of whatever directory they came from,
-                // and the path-aware helper's prefix match finds
-                // those panes. currentPath is the destination.
-                dispatchRefresh([currentPath, ...droppedPaths]);
-              })
-              .catch((err) => { console.error(`${isCopy ? "Copy" : "Move"} via DnD failed:`, err); });
+            void performDrop(droppedPaths, isCopy ? "copy" : "move", false);
           } else {
             console.log("Dropped files (demo mode):", droppedPaths, "into", currentPath);
           }
@@ -5450,6 +5393,7 @@ function FilePane({
     >
       <TabBar paneIndex={paneIndex} />
       <BreadcrumbBar
+        ariaLabel={`${paneIndex === 0 ? "Source" : "Destination"} folder navigation`}
         path={currentPath}
         onNavigate={handleNavigate}
         onBack={() => useFileManagerStore.getState().navigateBack(paneIndex)}
@@ -5563,7 +5507,7 @@ function FilePane({
       )}
 
       {error && (
-        <div className="px-3 py-1.5 text-[length:var(--font-size-xs)] text-[color:var(--color-error)] bg-[var(--color-error)]/10 border-b border-[var(--color-border)]">
+        <div className="px-3 py-1.5 text-[length:var(--font-size-xs)] text-[color:var(--color-error-foreground)] bg-[var(--color-error-bg)] border-b border-[var(--color-border)]">
           <span role="alert">{error}</span>
           <button type="button" className="ml-3 underline" onClick={() => void loadDirectory(currentPath)}>Retry</button>
         </div>
@@ -5572,8 +5516,7 @@ function FilePane({
       {/* Path Recall — ledger-powered "where did my file go?" banner.
           Rendered only when (a) the most recent loadDirectory call
           failed and (b) the unified ledger has a usable history for
-          the path. Closes the cognitive gap left by the demo-files
-          fallback by telling the user precisely why the pane is
+          the path. Explains the empty error state by telling the user precisely why the pane is
           empty, what happened to the original file, and (when the
           ledger knows) where it lives now. */}
       {pathRecall && (
@@ -5623,6 +5566,7 @@ function FilePane({
         </div>
       )}
 
+      <div id={`pane-tabpanel-${paneIndex}`} role="tabpanel" aria-labelledby={`pane-${paneIndex}-tab-${pane.activeTabId}`} className="flex-1 min-h-0 overflow-hidden">
       <FileList
         files={visibleFiles}
         viewMode={pane.viewMode}
@@ -5641,6 +5585,7 @@ function FilePane({
           useLineageStore.getState().beginRequest(path)
         }
       />
+      </div>
 
       {/* Feature 5: Get Info dialog with editable comments (#82) */}
       {infoDialog && (
@@ -5966,36 +5911,4 @@ function StatusBarContent() {
       )}
     </>
   );
-}
-
-// ──────────────────────────────────────────────
-// Demo data generator
-// ──────────────────────────────────────────────
-
-function generateDemoFiles(path: string): FileEntryData[] {
-  const segments = path.split("/").filter(Boolean);
-  const depth = segments.length;
-
-  const folders = ["Documents", "Downloads", "Pictures", "Music", "Videos", "Desktop", "Projects", "Archives"];
-  const files = ["readme.md", "config.json", "index.ts", "styles.css", "package.json", "tsconfig.json", "vite.config.ts", "app.tsx", ".gitignore", ".env"];
-
-  const entries: FileEntryData[] = [];
-
-  const folderCount = Math.max(2, 8 - depth * 2);
-  for (let i = 0; i < folderCount; i++) {
-    const name = folders[i % folders.length] + (depth > 0 ? `-${depth}` : "");
-    entries.push({ name, path: `${path === "/" ? "" : path}/${name}`, is_dir: true, is_symlink: false, size: 0, modified: new Date(Date.now() - i * 86400000).toISOString(), created: new Date(Date.now() - i * 86400000 * 7).toISOString(), is_hidden: false, extension: null, permissions: "755" });
-  }
-
-  // Hidden folder for demo
-  entries.push({ name: ".config", path: `${path === "/" ? "" : path}/.config`, is_dir: true, is_symlink: false, size: 0, modified: new Date().toISOString(), created: new Date().toISOString(), is_hidden: true, extension: null, permissions: "755" });
-
-  const fileCount = Math.max(3, 12 - depth);
-  for (let i = 0; i < fileCount; i++) {
-    const name = files[i % files.length];
-    const ext = name.split(".").pop() || null;
-    entries.push({ name, path: `${path === "/" ? "" : path}/${name}`, is_dir: false, is_symlink: false, size: Math.floor(Math.random() * 1024 * 100) + 100, modified: new Date(Date.now() - i * 3600000).toISOString(), created: new Date(Date.now() - i * 86400000 * 3).toISOString(), is_hidden: name.startsWith("."), extension: ext, permissions: "644" });
-  }
-
-  return entries;
 }

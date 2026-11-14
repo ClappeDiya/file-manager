@@ -98,7 +98,7 @@ function formatEta(seconds: number | null): string {
 
 function progressPercent(job: TransferJob): number {
   if (job.total_bytes === 0) return 0;
-  return Math.round((job.transferred_bytes / job.total_bytes) * 100);
+  return Math.max(0, Math.min(100, Math.floor((job.transferred_bytes / job.total_bytes) * 100)));
 }
 
 function statusLabel(status: string): string {
@@ -386,7 +386,8 @@ export function TransferItem({
           className={`h-full rounded-full transition-all duration-300 ${progressBarColor(job.status)}`}
           style={{ width: `${Math.min(pct, 100)}%` }}
           role="progressbar"
-          aria-valuenow={pct}
+          aria-label={`Transfer of ${fileName(job.source_path)}`}
+          aria-valuenow={job.total_bytes > 0 ? pct : undefined}
           aria-valuemin={0}
           aria-valuemax={100}
         />
@@ -1110,8 +1111,8 @@ function TransferPanelFull({
 
 // ── Main Transfer Panel ──
 
-export function TransferPanel() {
-  const [mode, setMode] = useState<TransferPanelMode>("mini");
+export function TransferPanel({ initialMode = "mini" }: { initialMode?: TransferPanelMode }) {
+  const [mode, setMode] = useState<TransferPanelMode>(initialMode);
   const [jobs, setJobs] = useState<TransferJob[]>([]);
   const [showFailedOnly, setShowFailedOnly] = useState(false);
   const [throttleConfig, setThrottleConfig] = useState<ThrottleConfig>({

@@ -9,7 +9,8 @@
  * - Validation per step
  * - Consistent styling
  */
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
 import { errorText } from "@/lib/error-text";
@@ -83,6 +84,22 @@ export function WizardShell({
   const [validationError, setValidationError] = useState<string | null>(null);
   const [completing, setCompleting] = useState(false);
   const busy = loading || completing;
+  const focusRef = useFocusTrap<HTMLDivElement>({
+    active: true,
+    initialFocusSelector: "input,select,textarea",
+    onEscape: () => {
+      if (!busy) onCancel();
+    },
+  });
+  const stepRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const step = stepRef.current;
+    const target =
+      step?.querySelector<HTMLElement>(
+        "input:not([disabled]),select:not([disabled]),textarea:not([disabled]),button:not([disabled])",
+      ) ?? step;
+    target?.focus();
+  }, [currentStep]);
 
   const isLastStep = currentStep === steps.length - 1;
   const isFirstStep = currentStep === 0;
@@ -122,6 +139,7 @@ export function WizardShell({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      ref={focusRef}
       role="dialog"
       aria-modal="true"
       aria-label={title}
@@ -155,6 +173,7 @@ export function WizardShell({
               variant="ghost"
               size="icon"
               onClick={onCancel}
+              disabled={busy}
               aria-label="Cancel wizard"
             >
               <X className="h-4 w-4" aria-hidden="true" />
@@ -220,7 +239,13 @@ export function WizardShell({
         )}
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-5">
+        <div
+          ref={stepRef}
+          tabIndex={-1}
+          role="group"
+          aria-label={`Step ${currentStep + 1}: ${currentStepDef.label}`}
+          className="flex-1 overflow-y-auto px-6 py-5"
+        >
           {children}
 
           {/* Validation error */}
@@ -253,7 +278,10 @@ export function WizardShell({
             <Button variant="default" onClick={handleNext} disabled={busy}>
               {busy ? (
                 <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" aria-hidden="true" />
+                  <Loader2
+                    className="h-4 w-4 mr-2 animate-spin"
+                    aria-hidden="true"
+                  />
                   Processing...
                 </>
               ) : isLastStep ? (

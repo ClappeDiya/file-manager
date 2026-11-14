@@ -121,7 +121,7 @@ function LoginForm() {
   );
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background-secondary p-4">
+    <main className="min-h-screen flex items-center justify-center bg-background-secondary p-4">
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
           <div className="w-12 h-12 rounded-xl bg-primary flex items-center justify-center mb-3">
@@ -219,7 +219,7 @@ function LoginForm() {
           </Card>
         )}
       </div>
-    </div>
+    </main>
   );
 }
 

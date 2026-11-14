@@ -5,7 +5,7 @@ import { ANNUAL_SAVINGS_PERCENT, BUSINESS_ANNUAL_PERIOD, BUSINESS_ANNUAL_PRICE, 
 
 export const metadata: Metadata = {
   title: 'Pricing',
-  description: `Free for individuals. Business ${BUSINESS_MONTHLY_PRICE}${BUSINESS_MONTHLY_PERIOD} or ${BUSINESS_ANNUAL_PRICE}${BUSINESS_ANNUAL_PERIOD}, with a ${TRIAL_DAYS}-day free trial (coming Q3). Enterprise custom.`,
+  description: `Free for individuals. Business ${BUSINESS_MONTHLY_PRICE}${BUSINESS_MONTHLY_PERIOD} or ${BUSINESS_ANNUAL_PRICE}${BUSINESS_ANNUAL_PERIOD}, with a ${TRIAL_DAYS}-day free trial when available. Enterprise custom.`,
 };
 
 const faq = [

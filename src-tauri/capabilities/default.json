@@ -1,12 +1,13 @@
 {
   "identifier": "default",
-  "description": "The app windows: core (events, paths, window) and the updater. The web view uses no fs/shell/dialog/os plugin commands directly (the Rust commands do that work), so none are granted: while the app lock is on, nothing but the lock screen's commands reaches the backend.",
+  "description": "The app windows: core (events, paths, window), the updater and a read-only notification permission-status query used by the notification plugin at startup. Notification sending and filesystem operations remain behind the app's Rust commands and lock checks.",
   "windows": [
     "main",
     "win-*"
   ],
   "permissions": [
     "core:default",
-    "updater:default"
+    "updater:default",
+    "notification:allow-is-permission-granted"
   ]
 }

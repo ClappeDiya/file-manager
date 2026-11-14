@@ -855,7 +855,10 @@ function FileTableView({
 
   return (
     <div
-      className={cn("flex flex-col h-full", className)}
+      className={cn("@container flex flex-col h-full min-h-0", className)}
+      role="grid"
+      aria-label="File listing"
+      aria-rowcount={(groupBy ? groupedFlatItems.length : rows.length) + 1}
       data-testid="file-list"
     >
       {/* Table Header */}
@@ -876,7 +879,8 @@ function FileTableView({
                     : "none"
               }
               className={cn(
-                "flex items-center h-8 px-3",
+                "flex items-center h-8 px-3 min-w-0 overflow-hidden whitespace-nowrap",
+                header.id !== "name" && header.id !== "size" && "@max-[480px]:hidden",
                 "text-[length:var(--font-size-xs)] font-medium text-[color:var(--color-text-secondary)] uppercase tracking-wider",
                 "select-none relative",
                 header.column.getCanSort() && "cursor-pointer",
@@ -972,9 +976,7 @@ function FileTableView({
             "flex-1 overflow-auto",
             "focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--color-focus-ring)]",
           )}
-          role="grid"
-          aria-label="File listing"
-          aria-rowcount={groupedFlatItems.length}
+          role="rowgroup"
           tabIndex={0}
           onKeyDown={handleKeyDown}
           data-testid="file-list-body"
@@ -1011,7 +1013,7 @@ function FileTableView({
                 <div
                   key={entry.path}
                   role="row"
-                  aria-rowindex={virtualRow.index + 1}
+                  aria-rowindex={virtualRow.index + 2}
                   aria-selected={isSelected}
                   className={cn(
                     "absolute left-0 top-0 w-full flex",
@@ -1033,7 +1035,7 @@ function FileTableView({
                   }}
                   data-path={entry.path}
                 >
-                  <div className="flex items-center gap-2 px-3 min-w-0 flex-1" style={{ height: `${virtualRow.size}px` }}>
+                  <div role="gridcell" className="flex items-center gap-2 px-3 min-w-0 flex-1" style={{ height: `${virtualRow.size}px` }}>
                     {getFileIcon(entry)}
                     <span className={cn(
                       "truncate text-[length:var(--font-size-sm)]",
@@ -1076,9 +1078,7 @@ function FileTableView({
             "flex-1 overflow-auto",
             "focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--color-focus-ring)]",
           )}
-          role="grid"
-          aria-label="File listing"
-          aria-rowcount={rows.length}
+          role="rowgroup"
           tabIndex={0}
           onKeyDown={handleKeyDown}
           data-testid="file-list-body"
@@ -1099,7 +1099,7 @@ function FileTableView({
                 <div
                   key={row.id}
                   role="row"
-                  aria-rowindex={virtualRow.index + 1}
+                  aria-rowindex={virtualRow.index + 2}
                   aria-selected={isSelected}
                   className={cn(
                     "absolute left-0 top-0 w-full flex",
@@ -1128,7 +1128,8 @@ function FileTableView({
                     <div
                       key={cell.id}
                       role="gridcell"
-                      className="flex items-center px-3"
+                      className={cn("flex items-center px-3 min-w-0 overflow-hidden whitespace-nowrap [&>span]:truncate", cell.column.id !== "name" && cell.column.id !== "size" && "@max-[480px]:hidden")}
+                      title={cell.column.id === "modified" ? formatDate(row.original.modified) : String(cell.getValue() ?? "")}
                       style={{
                         width: cell.column.getSize(),
                         height: `${virtualRow.size}px`,

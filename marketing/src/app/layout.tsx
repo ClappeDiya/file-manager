@@ -13,7 +13,7 @@ export const metadata: Metadata = {
     template: '%s · FileManager',
   },
   description:
-    'Local + remote browsing, 17 protocols, crash-safe transfers, real-time sync, and a local AI assistant. Free for individuals. Cross-platform — macOS, Windows, Linux.',
+    'Local and remote browsing, verified local transfers, folder sync, and an optional local AI assistant. Free for individuals. Cross-platform — macOS, Windows, Linux.',
   openGraph: {
     type: 'website',
     siteName: 'FileManager',
