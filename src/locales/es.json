@@ -115,7 +115,15 @@
     "diskFull": "No hay suficiente espacio en disco",
     "copyingFiles": "Copiando {{count}} archivos...",
     "movingFiles": "Moviendo {{count}} archivos...",
-    "deletingFiles": "Eliminando {{count}} archivos..."
+    "deletingFiles": "Eliminando {{count}} archivos...",
+    "folders": "Carpetas",
+    "smart": "Inteligentes",
+    "copyPath": "Copiar ruta",
+    "deletePermanently": "Eliminar permanentemente",
+    "openWith": "Abrir con...",
+    "extractHere": "Extraer aqu\u00ed",
+    "openInNewWindow": "Abrir en una ventana nueva",
+    "cloudFolders": "Carpetas en la nube"
   },
   "transfer": {
     "title": "Transferencia",
@@ -268,7 +276,17 @@
     "rollback": "Revertir a Versi\u00f3n Anterior",
     "rollbackConfirm": "\u00bfEst\u00e1 seguro de que desea revertir a la versi\u00f3n anterior?",
     "rollbackSuccess": "Reversi\u00f3n exitosa. Reinicie para aplicar.",
-    "rollbackFailed": "Reversi\u00f3n fallida: {{error}}"
+    "rollbackFailed": "Reversi\u00f3n fallida: {{error}}",
+    "languageSystem": "Predeterminado del sistema ({{name}})",
+    "languageHint": "Los men\u00fas, la barra lateral, los t\u00edtulos de la configuraci\u00f3n y el men\u00fa de la bandeja usan este idioma; el resto del texto sigue en ingl\u00e9s.",
+    "notifications": "Notificaciones",
+    "privacy": "Privacidad",
+    "network": "Red",
+    "logging": "Registro",
+    "startupTray": "Inicio y bandeja",
+    "appLock": "Bloqueo de la aplicaci\u00f3n",
+    "reset": "Restablecer",
+    "accentColor": "Color de acento"
   },
   "onboarding": {
     "welcome": "Bienvenido a la Plataforma Unificada de Operaciones de Archivos",
@@ -361,5 +379,11 @@
     "rollbackDescription": "Si la versi\u00f3n actual tiene problemas, puede revertir a la versi\u00f3n anterior.",
     "differentialUpdate": "Descargando actualizaci\u00f3n diferencial...",
     "fullUpdate": "Descargando actualizaci\u00f3n completa..."
+  },
+  "nav": {
+    "back": "Atr\u00e1s",
+    "forward": "Adelante",
+    "up": "Ir a la carpeta superior",
+    "root": "Ir a la ra\u00edz"
   }
 }

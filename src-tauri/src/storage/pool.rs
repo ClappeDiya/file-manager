@@ -94,15 +94,8 @@ impl DbPool {
 
     /// Get the OS-appropriate application data directory for the database.
     pub fn default_db_path() -> Result<PathBuf, AppError> {
-        let proj_dirs = directories::ProjectDirs::from("com", "ufop", "unified-file-ops")
-            .ok_or_else(|| {
-                AppError::database(
-                    "Cannot determine application data directory.",
-                    "Check your OS user profile configuration.",
-                )
-            })?;
-        let data_dir = proj_dirs.data_dir();
-        Ok(data_dir.join("ufop.db"))
+        // Portable mode moves it with the rest of the app data (`crate::paths`).
+        Ok(crate::paths::data_dir().join("ufop.db"))
     }
 }
 

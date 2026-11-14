@@ -150,6 +150,9 @@ body,
 /* Prevent flash of wrong theme on load */
 html {
   transition: none;
+  /* Text size setting (Settings → Appearance, Ctrl/Cmd +/−/0): scales the
+     root font size, so every rem-based size follows. */
+  font-size: calc(var(--font-size-base) * var(--ufop-font-scale, 1));
 }
 
 /* ===== Focus Management ===== */

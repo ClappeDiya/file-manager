@@ -1,0 +1,25 @@
+# UFOP backup server behind an optional reverse proxy.
+# The proxy authenticates users and forwards X-UFOP-PreAuth; set the same
+# token in UFOP_SERVER_PREAUTH_TOKENS. Without a proxy, publish port 8200.
+services:
+  ufop-server:
+    build:
+      context: ..
+      dockerfile: docker/ufop-server.Dockerfile
+    environment:
+      UFOP_SERVER_PASSWORD: ${UFOP_SERVER_PASSWORD:?set a password}
+      UFOP_SERVER_ALLOWED_HOSTNAMES: ${UFOP_HOSTNAME:-backup.localhost}
+      UFOP_SERVER_PREAUTH_TOKENS: ${UFOP_PREAUTH_TOKEN:-}
+      UFOP_SETTINGS_ENCRYPTION_KEY: ${UFOP_SETTINGS_ENCRYPTION_KEY:-}
+    volumes:
+      - ufop-data:/data
+      - ${UFOP_SOURCE:-/home}:/source:ro
+    ports:
+      - "8200:8200"
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ufop.rule=Host(`${UFOP_HOSTNAME:-backup.localhost}`)
+      - traefik.http.services.ufop.loadbalancer.server.port=8200
+volumes:
+  ufop-data:

@@ -15,6 +15,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
+import { formatBytes } from "@/lib/format-bytes";
 
 // ── Types (mirrors Rust types) ──
 
@@ -60,13 +61,8 @@ interface DirectTransferCapability {
 
 // ── Helpers ──
 
-function formatFileSize(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const size = bytes / Math.pow(1024, i);
-  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-}
+/** Sizes follow Settings → Appearance → Size units. */
+const formatFileSize = (bytes: number): string => formatBytes(bytes);
 
 function formatTimestamp(ts: string): string {
   try {

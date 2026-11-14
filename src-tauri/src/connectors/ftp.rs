@@ -860,6 +860,12 @@ impl Default for FtpConnector {
 // ── Connector trait implementation ──
 
 impl super::Connector for FtpConnector {
+    fn rename_entry(&self, from: &str, to: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::core::error::AppError>> + Send + '_>> {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::pin(async move { self.rename(&from, &to).await })
+    }
+
+
     fn connect(
         &self,
         profile: &ConnectionProfile,
@@ -1000,7 +1006,7 @@ impl super::Connector for FtpConnector {
                 let mut stream = ftp_stream;
                 stream
                     .login(&username_for_auth, &password)
-                    .map_err(|e| AppError::Connection {
+                    .map_err(|e| AppError::Authentication {
                         message: format!("FTP authentication failed: {e}"),
                         advice: "Check your username and password.".to_string(),
                     })?;
@@ -1105,7 +1111,15 @@ impl super::Connector for FtpConnector {
 
     fn upload(&self, local_path: &str, remote_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {
         let (l, r) = (local_path.to_string(), remote_path.to_string());
-        Box::pin(async move { self.upload_file(&l, &r, None).await })
+        Box::pin(async move {
+            super::staged_upload(
+                &r,
+                |temp| async move { self.upload_file(&l, &temp, None).await },
+                |from, to| async move { self.rename(&from, &to).await },
+                |p| async move { self.delete_file(&p).await },
+            )
+            .await
+        })
     }
 
     fn download(&self, remote_path: &str, local_path: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, AppError>> + Send + '_>> {

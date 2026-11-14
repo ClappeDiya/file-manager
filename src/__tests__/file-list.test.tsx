@@ -31,7 +31,9 @@ describe("T-007: FileList utilities", () => {
     });
 
     it("should format gigabytes", () => {
-      expect(formatFileSize(1073741824)).toBe("1.0 GB");
+      // Decimal units by default: 1 GiB = 1.07 GB.
+      expect(formatFileSize(1073741824)).toBe("1.1 GB");
+      expect(formatFileSize(1_000_000_000)).toBe("1.0 GB");
     });
   });
 

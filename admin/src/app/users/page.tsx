@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   UserPlus, Upload, Download, Shield,
-  Mail, UserX, Trash2, Key,
+  Mail, UserX, Trash2, Key, CalendarClock, HelpCircle, Eye,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
@@ -19,8 +19,20 @@ import { StatCard } from '@/components/ui/stat-card';
 import { ROLE_LABELS, ROLE_PERMISSIONS, type Role, type AdminUser } from '@/lib/types/auth';
 import { formatDate, formatRelativeTime } from '@/lib/utils/format';
 import { useAuthStore } from '@/lib/stores/auth-store';
+import type { Invitation } from '@/lib/db/repos/invitations';
 import { useToastStore } from '@/lib/stores/toast-store';
 import { z } from 'zod';
+import Link from 'next/link';
+import { ComingSoon } from '@/components/ui/coming-soon';
+import { ScimProvisioning } from '@/components/users/scim-provisioning';
+import { CsvImportDialog } from '@/components/users/csv-import-dialog';
+import { isEnabled } from '@/lib/features';
+import { api, errorText } from '@/lib/api-client';
+import { MembershipExpiryDialog, RemoveMemberDialog, RemovedMembers } from '@/components/users/offboarding';
+import { ExplainAccessDialog } from '@/components/users/explain-access';
+import type { RemovedMember } from '@/lib/offboarding';
+
+type Member = AdminUser & { expiresAt?: string | null };
 
 const inviteSchema = z.object({
   email: z.string().trim().min(1, 'Email is required').email('Enter a valid email address'),
@@ -37,11 +49,21 @@ export default function UsersPage() {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<Role>('user');
   const [inviteErrors, setInviteErrors] = useState<{ email?: string; role?: string }>({});
-  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [users, setUsers] = useState<Member[]>([]);
+  const [removed, setRemoved] = useState<RemovedMember[]>([]);
+  const [restoreDays, setRestoreDays] = useState(30);
+  const [removing, setRemoving] = useState<AdminUser | null>(null);
+  const [expiring, setExpiring] = useState<Member | null>(null);
+  const [explaining, setExplaining] = useState<AdminUser | null>(null);
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [importCsv, setImportCsv] = useState<string | null>(null);
   const _currentUser = useAuthStore((s) => s.user);
+  const canViewAs = useAuthStore((s) => s.checkPermission)('users.write');
+  const startViewAs = useAuthStore((s) => s.startViewAs);
   const notify = useToastStore((s) => s.notify);
 
   useEffect(() => {
@@ -50,7 +72,7 @@ export default function UsersPage() {
         if (!res.ok) throw new Error('Failed to fetch users');
         return res.json();
       })
-      .then((data) => { setUsers(data.users || []); setLoading(false); })
+      .then((data) => { setUsers(data.users || []); setInvitations(data.invitations || []); setRemoved(data.removed || []); setRestoreDays(data.restoreDays ?? 30); setLoading(false); })
       .catch((err) => { setError(err instanceof Error ? err.message : String(err)); setLoading(false); });
   }, []);
 
@@ -86,13 +108,14 @@ export default function UsersPage() {
           name: parsed.data.email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
         }),
       });
-      if (!res.ok) throw new Error(`Failed to invite user (${res.status})`);
       const data = await res.json();
-      setUsers([...users, data.user]);
+      if (!res.ok) throw new Error(data.error || `Failed to invite user (${res.status})`);
+      setInvitations([data.invitation, ...invitations]);
       setShowInviteDialog(false);
       setInviteEmail('');
       setInviteRole('user');
-      notify('Invitation sent', 'success');
+      if (data.emailed) notify('Invitation emailed', 'success');
+      else setInviteLink(data.link);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
@@ -100,10 +123,27 @@ export default function UsersPage() {
     }
   };
 
-  const handleRoleChange = (userId: string, newRole: Role) => {
-    setUsers(users.map(u => u.id === userId ? { ...u, role: newRole } : u));
+  const handleRoleChange = async (userId: string, newRole: Role) => {
+    try {
+      // Through the API client: a role change may ask the admin to confirm it is them.
+      await api('/api/users', { method: 'PATCH', body: { action: 'set_role', userIds: [userId], role: newRole } });
+      setUsers(users.map(u => u.id === userId ? { ...u, role: newRole } : u));
+      notify('Role updated', 'success');
+    } catch (err) {
+      notify(`Could not change the role. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
+    }
     setShowRoleDialog(false);
     setSelectedUser(null);
+  };
+
+  const handleRevokeInvitation = async (id: string) => {
+    try {
+      const response = await fetch(`/api/invitations/${id}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
+      setInvitations(invitations.map((i) => (i.id === id ? { ...i, status: 'revoked' as const } : i)));
+    } catch (err) {
+      notify(`Could not revoke. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
+    }
   };
 
   const handleDeactivate = async (userId: string) => {
@@ -124,49 +164,23 @@ export default function UsersPage() {
     }
   };
 
-  const handleRemove = async (userId: string) => {
-    try {
-      const response = await fetch('/api/users', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'remove', userIds: [userId] }),
-      });
-      if (!response.ok) throw new Error(`Request failed (${response.status})`);
-      setUsers(users.filter(u => u.id !== userId));
-      notify('User removed', 'success');
-    } catch (err) {
-      notify(`Could not remove user. ${err instanceof Error ? err.message : ''}`.trim(), 'error');
-    }
-  };
-
   const handleCSVImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      const lines = text.split('\n').slice(1); // skip header
-      const imported: AdminUser[] = lines
-        .filter(line => line.trim())
-        .map((line, i) => {
-          const [email, name, role] = line.split(',').map(s => s.trim());
-          return {
-            id: `usr_import_${Date.now()}_${i}`,
-            email: email || '',
-            name: name || email?.split('@')[0] || '',
-            role: (role as Role) || 'user',
-            permissions: [],
-            organizationId: 'org_001',
-            createdAt: new Date().toISOString(),
-            isActive: true,
-          };
-        });
-      setUsers([...users, ...imported]);
-    };
-    reader.readAsText(file);
     e.target.value = '';
+    if (!file) return;
+    // Parsed and checked on the server (preview first, then invitations).
+    void file.text().then(setImportCsv);
   };
+
+  const reloadUsers = () =>
+    fetch('/api/users')
+      .then((res) => res.json())
+      .then((data) => {
+        setUsers(data.users || []);
+        setInvitations(data.invitations || []);
+        setRemoved(data.removed || []);
+      })
+      .catch(() => undefined);
 
   const handleCSVExport = () => {
     const header = 'Email,Name,Role,Status,Created At,Last Login';
@@ -222,7 +236,13 @@ export default function UsersPage() {
               onChange={handleCSVImport}
               className="hidden"
             />
-            <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()}>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!isEnabled('csvUserImport')}
+              title={isEnabled('csvUserImport') ? undefined : 'CSV import is coming soon. Use Invite User meanwhile.'}
+              onClick={() => fileInputRef.current?.click()}
+            >
               <Upload size={14} /> Import CSV
             </Button>
             <Button variant="outline" size="sm" onClick={handleCSVExport}>
@@ -326,7 +346,30 @@ export default function UsersPage() {
                           <UserX size={14} className="text-foreground-secondary" />
                         </button>
                         <button
-                          onClick={() => handleRemove(user.id)}
+                          onClick={() => setExplaining(user)}
+                          className="p-1.5 rounded hover:bg-background-secondary"
+                          title="Explain access"
+                        >
+                          <HelpCircle size={14} className="text-foreground-secondary" />
+                        </button>
+                        {canViewAs && user.id !== _currentUser?.id && user.isActive && (
+                          <button
+                            onClick={() => void startViewAs(user.id).then(() => notify(`Viewing the console as ${user.email} (read-only)`, 'success'), (e) => notify(errorText(e), 'error'))}
+                            className="p-1.5 rounded hover:bg-background-secondary"
+                            title="View as this member (read-only)"
+                          >
+                            <Eye size={14} className="text-foreground-secondary" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setExpiring(user)}
+                          className="p-1.5 rounded hover:bg-background-secondary"
+                          title={user.expiresAt ? `Membership ends ${formatDate(user.expiresAt)}` : 'Set membership end'}
+                        >
+                          <CalendarClock size={14} className={user.expiresAt ? 'text-warning' : 'text-foreground-secondary'} />
+                        </button>
+                        <button
+                          onClick={() => setRemoving(user)}
                           className="p-1.5 rounded hover:bg-error-bg"
                           title="Remove"
                         >
@@ -346,6 +389,33 @@ export default function UsersPage() {
               </TableBody>
             </Table>
           </Card>
+          {invitations.some((i) => i.status === 'pending') && (
+            <Card className="mt-4">
+              <h3 className="mb-2 text-sm font-semibold">Pending invitations</h3>
+              <ul className="divide-y divide-border">
+                {invitations.filter((i) => i.status === 'pending').map((i) => (
+                  <li key={i.id} className="flex items-center justify-between py-2 text-sm">
+                    <span>
+                      {i.email} <span className="text-xs text-foreground-tertiary">as {ROLE_LABELS[i.role]} · invited by {i.invitedBy} · expires {formatRelativeTime(i.expiresAt)}</span>
+                    </span>
+                    <Button size="sm" variant="ghost" onClick={() => void handleRevokeInvitation(i.id)}>
+                      Revoke
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          )}
+          <RemovedMembers removed={removed} onRestored={() => { void reloadUsers(); notify('Member restored', 'success'); }} />
+          <RemoveMemberDialog
+            user={removing}
+            members={users}
+            restoreDays={restoreDays}
+            onClose={() => setRemoving(null)}
+            onDone={() => { setRemoving(null); void reloadUsers(); notify('User removed', 'success'); }}
+          />
+          <ExplainAccessDialog user={explaining} onClose={() => setExplaining(null)} />
+          <MembershipExpiryDialog user={expiring} onClose={() => setExpiring(null)} onDone={() => { setExpiring(null); void reloadUsers(); notify('Membership end saved', 'success'); }} />
         </TabContent>
 
         <TabContent tabId="roles" activeTab={activeTab}>
@@ -382,54 +452,34 @@ export default function UsersPage() {
           <div className="grid gap-6 max-w-2xl">
             <Card>
               <CardContent>
-                <h3 className="text-lg font-semibold text-foreground mb-4">SAML 2.0 Configuration (Business)</h3>
-                <div className="space-y-4">
-                  <Input label="Entity ID / Issuer" placeholder="https://idp.example.com/saml/metadata" />
-                  <Input label="SSO URL" placeholder="https://idp.example.com/saml/sso" />
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-sm font-medium text-foreground">X.509 Certificate</label>
-                    <textarea
-                      className="w-full h-32 rounded-md border border-border bg-background px-3 py-2 text-sm font-mono placeholder:text-foreground-disabled focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                      placeholder="Paste your IdP certificate here..."
-                    />
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <input type="checkbox" id="saml-enabled" className="rounded" />
-                    <label htmlFor="saml-enabled" className="text-sm text-foreground">Enable SAML SSO</label>
-                  </div>
-                  <Button>Save SAML Configuration</Button>
-                </div>
+                <h3 className="text-lg font-semibold text-foreground mb-2">Single sign-on (OIDC / SAML)</h3>
+                <p className="text-sm text-foreground-secondary mb-4">
+                  Identity providers, just-in-time accounts, group mapping and MFA requirements are configured per organization.
+                </p>
+                <Link href="/settings/sso" className="text-sm font-medium text-primary hover:underline">
+                  Open SSO settings →
+                </Link>
               </CardContent>
             </Card>
 
             <Card>
               <CardContent>
                 <h3 className="text-lg font-semibold text-foreground mb-4">SCIM Provisioning (Enterprise)</h3>
-                <div className="space-y-4">
-                  <Input
-                    label="SCIM Endpoint"
-                    value={`${typeof window !== 'undefined' ? window.location.origin : ''}/api/scim/v2`}
-                    readOnly
-                    hint="Provide this URL to your identity provider"
+                {isEnabled('scim') ? (
+                  <ScimProvisioning />
+                ) : (
+                  <ComingSoon
+                    feature="scim"
+                    description="Your identity provider will create, update and deactivate users and groups here automatically. Until then, use just-in-time provisioning in SSO settings."
                   />
-                  <Input
-                    label="SCIM Bearer Token"
-                    type="password"
-                    value="••••••••••••••••"
-                    readOnly
-                    hint="Generate a token to enable SCIM provisioning"
-                  />
-                  <div className="flex items-center gap-2">
-                    <input type="checkbox" id="scim-enabled" className="rounded" />
-                    <label htmlFor="scim-enabled" className="text-sm text-foreground">Enable SCIM Provisioning</label>
-                  </div>
-                  <Button>Regenerate SCIM Token</Button>
-                </div>
+                )}
               </CardContent>
             </Card>
           </div>
         </TabContent>
       </Tabs>
+
+      <CsvImportDialog csv={importCsv} onClose={() => setImportCsv(null)} onImported={() => void reloadUsers()} />
 
       {/* Invite Dialog */}
       <Dialog
@@ -493,12 +543,23 @@ export default function UsersPage() {
               label="New Role"
               options={roleOptions}
               value={selectedUser.role}
-              onChange={(e) => handleRoleChange(selectedUser.id, e.target.value as Role)}
+              onChange={(e) => void handleRoleChange(selectedUser.id, e.target.value as Role)}
             />
           </div>
         )}
         <DialogFooter>
           <Button variant="outline" onClick={() => { setShowRoleDialog(false); setSelectedUser(null); }}>Cancel</Button>
+        </DialogFooter>
+      </Dialog>
+      <Dialog open={!!inviteLink} onClose={() => setInviteLink(null)}>
+        <DialogHeader>
+          <DialogTitle>Invitation created</DialogTitle>
+          <DialogDescription>No email channel is set up for invitations. Send this one-time link yourself.</DialogDescription>
+        </DialogHeader>
+        <code className="block break-all rounded bg-background-secondary p-2 text-xs">{inviteLink}</code>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => inviteLink && void navigator.clipboard.writeText(inviteLink)}>Copy</Button>
+          <Button onClick={() => setInviteLink(null)}>Done</Button>
         </DialogFooter>
       </Dialog>
     </div>

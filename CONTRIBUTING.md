@@ -1,5 +1,7 @@
 # Contributing & Development
 
+Found a security issue? Please report it privately as described in [SECURITY.md](SECURITY.md), not in a public issue.
+
 ## Project layout
 
 ```

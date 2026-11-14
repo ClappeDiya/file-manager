@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@ufop/ui-components";
 import { useUIStore } from "@/stores/ui-store";
+import { t } from "@/lib/i18n";
 import {
   Copy,
   Scissors,
@@ -21,6 +22,7 @@ import {
   Calculator,
   ExternalLink,
   ArrowLeftRight,
+  AppWindow,
   GitBranch,
   Lock,
   Link,
@@ -38,6 +40,7 @@ import {
   PinOff,
   X as CloseIcon,
   ChevronsRight,
+  MonitorSmartphone,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -50,6 +53,8 @@ export interface ContextMenuItem {
   icon?: React.ReactNode;
   shortcut?: string;
   disabled?: boolean;
+  /** Why it is disabled (shown as the item's tooltip). */
+  disabledReason?: string;
   danger?: boolean;
   separator?: boolean;
   advancedOnly?: boolean;
@@ -227,6 +232,8 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
               index === focusedIndex && !item.disabled && "bg-[var(--color-hover-bg)]",
             )}
             disabled={item.disabled}
+            title={item.disabled ? item.disabledReason : undefined}
+            aria-description={item.disabled ? item.disabledReason : undefined}
             onClick={() => {
               if (!item.disabled) {
                 item.action?.();
@@ -267,6 +274,33 @@ function shortenFolderName(path: string): string {
   return tail.length > 0 ? tail : trimmed;
 }
 
+/** Menu actions that only make sense for files on this computer. */
+const LOCAL_ONLY_ITEM_IDS = new Set([
+  "reveal-in-os",
+  "extract-here",
+  "edit-remote",
+  "open-with",
+  "open-in-editor",
+  "verify-integrity",
+  "copy-remote-path",
+  "copy-url",
+  "copy-relative-path",
+  "copy-to-many",
+  "duplicate",
+  "compress",
+  "send-to-computer",
+  "convert",
+  "show-history",
+  "show-folder-activity",
+  "new-file",
+  "set-permissions",
+  "create-symlink",
+  "copy-as-script",
+  "open-in-terminal",
+  "git-add",
+  "git-commit",
+]);
+
 export function getFileContextMenuItems(options: {
   hasSelection: boolean;
   isDirectory: boolean;
@@ -276,6 +310,15 @@ export function getFileContextMenuItems(options: {
   /** Direct pane-to-pane transfers (dual-pane workflows). */
   onCopyToOtherPane?: () => void;
   onMoveToOtherPane?: () => void;
+  /** Copy the selection into several folders at once. */
+  onCopyToMany?: () => void;
+  /** OpenPGP actions on the selected files; `gpgDecrypt` / `gpgVerify`
+   *  say whether the selection looks encrypted / like signatures. */
+  onGpg?: (mode: "encrypt" | "decrypt" | "recrypt" | "sign" | "verify") => void;
+  gpgDecrypt?: boolean;
+  gpgVerify?: boolean;
+  /** Convert the selected images or documents (only when the selection is convertible). */
+  onConvert?: () => void;
   onPaste: () => void;
   onDelete: () => void;
   onRename: () => void;
@@ -294,6 +337,8 @@ export function getFileContextMenuItems(options: {
   onCompareFiles?: () => void;
   onExplainError?: () => void;
   onOpenInTerminal?: () => void;
+  /** Folders: open in another app window. */
+  onOpenInNewWindow?: () => void;
   onGitAdd?: () => void;
   onGitCommit?: () => void;
   onSetPermissions?: () => void;
@@ -322,6 +367,8 @@ export function getFileContextMenuItems(options: {
    *  infrastructure. Hidden when the caller omits the prop so the
    *  pane-only-selection (Paste-only) menu stays untouched. */
   onCompress?: () => void;
+  /** Send the selection to another computer running UFOP (local files only). */
+  onSendToComputer?: () => void;
   /** **Extract Here** — mirror of iter 14's `onCompress`. Pre-wired
    *  `archive_extract` IPC already supports zip / tar / tar.gz / 7z
    *  with optional password. The caller (FilePane) sets this prop only
@@ -352,6 +399,12 @@ export function getFileContextMenuItems(options: {
   /** Handler invoked when the user clicks a Send-To entry. Receives
    *  the destination directory the user picked. */
   onSendTo?: (destDir: string) => void;
+  /** Create a share link for the item (connection folders whose provider has links). */
+  onShareLink?: () => void;
+  /** Set when the pane shows a connection folder: actions that only work
+   *  on this computer's files stay listed but disabled with this reason,
+   *  and "Move to Trash" reads "Delete" (servers have no local Trash). */
+  remoteReason?: string;
 }): ContextMenuItem[] {
   const items: ContextMenuItem[] = [];
   const isMac = typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
@@ -400,7 +453,7 @@ export function getFileContextMenuItems(options: {
     if (options.onExtract) {
       items.push({
         id: "extract-here",
-        label: "Extract Here",
+        label: t("fileManager.extractHere"),
         icon: <PackageOpen className="h-3.5 w-3.5" />,
         action: options.onExtract,
       });
@@ -428,10 +481,19 @@ export function getFileContextMenuItems(options: {
       });
     }
 
+    if (options.onOpenInNewWindow && options.isDirectory && options.selectionCount <= 1) {
+      items.push({
+        id: "open-in-new-window",
+        label: t("fileManager.openInNewWindow"),
+        icon: <AppWindow className="h-3.5 w-3.5" />,
+        action: options.onOpenInNewWindow,
+      });
+    }
+
     if (options.onOpenWith && !options.isDirectory) {
       items.push({
         id: "open-with",
-        label: "Open With...",
+        label: t("fileManager.openWith"),
         icon: <FolderOpen className="h-3.5 w-3.5" />,
         action: options.onOpenWith,
       });
@@ -466,7 +528,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "copy",
-      label: "Copy",
+      label: t("common.copy"),
       icon: <Copy className="h-3.5 w-3.5" />,
       shortcut: `${cmdKey}C`,
       action: options.onCopy,
@@ -477,7 +539,7 @@ export function getFileContextMenuItems(options: {
       items.push({ id: "sep-copy-path", label: "", separator: true });
       items.push({
         id: "copy-path",
-        label: "Copy Path",
+        label: t("fileManager.copyPath"),
         icon: <Clipboard className="h-3.5 w-3.5" />,
         shortcut: `${cmdKey}Shift+C`,
         action: options.onCopyPath,
@@ -510,7 +572,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "cut",
-      label: "Cut",
+      label: t("common.cut"),
       icon: <Scissors className="h-3.5 w-3.5" />,
       shortcut: `${cmdKey}X`,
       action: options.onCut,
@@ -523,6 +585,22 @@ export function getFileContextMenuItems(options: {
         icon: <Copy className="h-3.5 w-3.5" />,
         shortcut: "F5",
         action: options.onCopyToOtherPane,
+      });
+    }
+    if (options.onShareLink) {
+      items.push({
+        id: "share-link",
+        label: "Share Link…",
+        icon: <Link className="h-3.5 w-3.5" />,
+        action: options.onShareLink,
+      });
+    }
+    if (options.onCopyToMany) {
+      items.push({
+        id: "copy-to-many",
+        label: "Copy to Several Folders…",
+        icon: <Copy className="h-3.5 w-3.5" />,
+        action: options.onCopyToMany,
       });
     }
     if (options.onMoveToOtherPane) {
@@ -559,7 +637,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "paste",
-    label: "Paste",
+    label: t("common.paste"),
     icon: <ClipboardPaste className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}V`,
     action: options.onPaste,
@@ -591,11 +669,34 @@ export function getFileContextMenuItems(options: {
       });
     }
 
+    if (options.onSendToComputer) {
+      items.push({
+        id: "send-to-computer",
+        label: "Send to Another Computer…",
+        icon: <MonitorSmartphone className="h-3.5 w-3.5" />,
+        action: options.onSendToComputer,
+      });
+    }
+
+    if (options.onConvert && !options.isDirectory) {
+      items.push({ id: "convert", label: options.selectionCount > 1 ? `Convert ${options.selectionCount} Files…` : "Convert…", icon: <RefreshCw className="h-3.5 w-3.5" />, action: options.onConvert });
+    }
+
+    // OpenPGP: files only; decrypt/verify only where the names fit.
+    if (options.onGpg && !options.isDirectory) {
+      const gpg = options.onGpg;
+      items.push({ id: "gpg-encrypt", label: "Encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("encrypt") });
+      if (options.gpgDecrypt) items.push({ id: "gpg-decrypt", label: "Decrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("decrypt") });
+      if (options.gpgDecrypt) items.push({ id: "gpg-recrypt", label: "Re-encrypt with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("recrypt") });
+      items.push({ id: "gpg-sign", label: "Sign with GPG…", icon: <Lock className="h-3.5 w-3.5" />, advancedOnly: true, action: () => gpg("sign") });
+      if (options.gpgVerify) items.push({ id: "gpg-verify", label: "Verify Signature", icon: <Lock className="h-3.5 w-3.5" />, action: () => gpg("verify") });
+    }
+
     items.push({ id: "sep2", label: "", separator: true });
 
     items.push({
       id: "rename",
-      label: "Rename",
+      label: t("common.rename"),
       icon: <Pencil className="h-3.5 w-3.5" />,
       shortcut: "F2",
       action: options.onRename,
@@ -604,7 +705,7 @@ export function getFileContextMenuItems(options: {
 
     items.push({
       id: "delete",
-      label: "Move to Trash",
+      label: t("fileManager.moveToTrash"),
       icon: <Trash2 className="h-3.5 w-3.5" />,
       shortcut: `${cmdKey}Backspace`,
       danger: true,
@@ -614,7 +715,7 @@ export function getFileContextMenuItems(options: {
     if (options.onDeletePermanently) {
       items.push({
         id: "delete-permanently",
-        label: "Delete Permanently",
+        label: t("fileManager.deletePermanently"),
         icon: <Trash2 className="h-3.5 w-3.5 text-red-500" />,
         shortcut: "\u21E7\u232B",
         danger: true,
@@ -684,7 +785,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "new-folder",
-    label: "New Folder",
+    label: t("fileManager.newFolder"),
     icon: <FolderPlus className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}Shift+N`,
     action: options.onNewFolder,
@@ -701,7 +802,7 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "select-all",
-    label: "Select All",
+    label: t("common.selectAll"),
     icon: <CheckSquare className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}A`,
     action: options.onSelectAll,
@@ -767,7 +868,7 @@ export function getFileContextMenuItems(options: {
     if (options.onOpenInTerminal && options.hasSelection && options.isDirectory) {
       items.push({
         id: "open-in-terminal",
-        label: "Open in Terminal",
+        label: t("fileManager.openInTerminal"),
         icon: <Terminal className="h-3.5 w-3.5" />,
         action: options.onOpenInTerminal,
       });
@@ -803,11 +904,23 @@ export function getFileContextMenuItems(options: {
 
   items.push({
     id: "refresh",
-    label: "Refresh",
+    label: t("common.refresh"),
     icon: <RefreshCw className="h-3.5 w-3.5" />,
     shortcut: `${cmdKey}R`,
     action: options.onRefresh,
   });
+
+  if (options.remoteReason) {
+    const reason = options.remoteReason;
+    for (const item of items) {
+      if (item.separator) continue;
+      if (LOCAL_ONLY_ITEM_IDS.has(item.id) || item.id.startsWith("gpg-") || item.id.startsWith("send-to-")) {
+        item.disabled = true;
+        item.disabledReason = reason;
+      }
+      if (item.id === "delete") item.label = "Delete";
+    }
+  }
 
   return items;
 }

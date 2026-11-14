@@ -643,6 +643,108 @@ POST /api/ai-governance
 
 ---
 
+## ufop-server REST API (`/api/v1`)
+
+The headless backup server (`ufop-server`, also `ufop server` in the CLI) has its own versioned API, described by a live **OpenAPI 3.1** document at `GET /api/v1/openapi.json` (public, like `/api/v1/health`). Load it into Swagger UI, Postman or a client generator.
+
+- **Authentication**: `Authorization: Bearer <token>` with an access token from `POST /api/v1/auth/login` (refreshed through the `ufop_refresh` cookie), an automation token, or an API token (`ufop_pat_…`); or reverse-proxy pre-authentication (`X-UFOP-Preauth`).
+- **API token scopes**: `read` < `run` < `write` < `admin`. Each operation's `x-required-scope` in the document comes from the same function that enforces it: GETs need `read`; starting backups, operations, cancelling tasks and the scheduler need `run`; other changes need `write`; `/auth/*`, `/rpc/*`, `/oauth/*` and changing settings need `admin`.
+- **CSRF**: requests authenticated by the `ufop_refresh` cookie (`POST /auth/refresh`, `/auth/logout`) must send `X-CSRF-Token` equal to the `ufop_csrf` cookie (also returned as `csrf_token`); otherwise `403` (`error_type: csrf`). Bearer requests are exempt. See [server-operations.md](server-operations.md#browser-sessions-and-csrf).
+- **Request ids**: send `X-Request-Id` (1–128 safe characters) or get a generated UUIDv4; it is echoed in the response and included as `request_id` in error bodies.
+- **Metrics**: `GET /api/v1/metrics` (scope `read`) returns Prometheus text; see [server-operations.md](server-operations.md#prometheus-metrics).
+- **Ransomware hardening**: `GET /api/v1/jobs/{id}/hardening` (scope `read`) returns the checklist `{passed, total, checks: [{id, title, status: pass|warn|fail|unknown|info, detail, advice, doc}], probe}`; `POST /api/v1/jobs/{id}/hardening/probe` (scope `run`) writes a probe object and tries to delete it with the backup credentials first. See [backup-ransomware-hardening.md](backup-ransomware-hardening.md).
+- **Shutdown**: `POST /api/v1/server/shutdown` with `{grace_secs}` (scope `admin`, answers `202`) stops the server gracefully; while it drains, state-changing requests get `503` with `Retry-After`. See [server-operations.md](server-operations.md#graceful-shutdown).
+- **Branding**: `GET /api/v1/branding` (public: title prefix, product name, accent color, logo and stylesheet URLs), `GET /branding/logo`, `GET /branding/custom.css`; administrators read and save the layers with `GET`/`PUT /api/v1/server/branding`. See [server-operations.md](server-operations.md#web-ui-branding).
+- **Accounts and access rules**: `POST /auth/login` takes `username` (default `admin`); `GET /auth/me`; administrators manage `/users` and `/acl` (with `GET /acl/{id}/preview-delete`). Non-administrators reach only the jobs their rules allow (403 otherwise; lists are filtered). See [server-operations.md](server-operations.md#accounts-roles-and-access-rules).
+- **Tokens limited to jobs**: `POST /auth/api-tokens` takes `job_ids` (null = every job). Such a token only reaches those jobs (403 otherwise; lists are filtered) and no server-wide routes unless its scope is `admin`. See [server-operations.md](server-operations.md#api-tokens-limited-to-jobs).
+- **Errors**: `{error_type, message, advice}`; 401 (not signed in, invalid token or too narrow a scope), 403 (client address outside `--allowed-cidrs`), 421 (host not in `--allowed-hostnames`), 404, 409, 429 (sign-in throttling).
+- Areas: `auth` (sign-in, tokens, password), `jobs` (CRUD, run, operations including `upgrade_format`, `reshard`, `format_info`, `set_version_metadata`, `apply_retention`, `copy_versions` (target `{"type":"job","job_id":…}` or `{"type":"destination",…}`), `enable_sharing`, `sync_sources` and `delete_versions` with `force` for pinned versions, `PUT /jobs/{id}/passphrase` to change an encrypted job's passphrase, `POST /jobs/{id}/point-in-time` with `{at, name}` to open a versioned S3 destination as it was at a time as a new read-only job (scope `write`; see [backup-destinations.md](backup-destinations.md)), `GET`/`DELETE /jobs/{id}/lock` for the repository lock (break needs `confirm=true`, optionally `owner_id`), `PUT /jobs/{id}/database-encryption` to encrypt the local database, import/export, destination test, `POST /jobs/run-all` with `{job_ids, scheduled_only, dry_run}` to back up every job (scope `run`; read-only and busy jobs are skipped and listed), `GET /jobs/{id}/estimate?assumed_bytes_per_sec=` for the pre-backup estimate; see [backup-sources-and-runs.md](backup-sources-and-runs.md)), `browse` (versions with note, tags, pin, identity and storage added, `?source=` for another source of a shared repository and `?tags=k=v,k2` to filter; `PATCH /jobs/{id}/versions/{version}` with `note`, `tags`, `pinned`, `pin_reason` to change one; `GET /jobs/{id}/sources`; `POST /jobs/{id}/retention/preview` with an optional unsaved `policy`; files, search and compare also take `source`; files also take `version=latest|oldest|N|<id>`, `time` (as of) and `allow_partial`, and any of `offset`, `limit`, `sort` (`path`, `size`, `kind`, `modified`), `desc` and `filter` returns one page `{items, total, offset, limit}` instead of the array; `GET /jobs/{id}/versions/resolve` says which version a time picks; `GET /jobs/{id}/file?path=` streams one file with single `Range` support (`206`/`416`); restore operations take `selector`, `archive`, `delete_extraneous` (with `overrides.confirm_delete: true`), `restore_owner`, `error_policy`, `sparse` and `use_cache`; see [backup-restore.md](backup-restore.md)), `tasks` (tasks, run history — `GET /runs` with `offset`, `sort` (`started_at`, `finished_at`, `status`, `operation`, `job_id`), `desc` or `filter` returns a page of `limit` runs with the total —, scheduler), `oauth` (cloud authorization broker) and `general` (health, status, modules, settings, filesystem, the volume cache: `GET`/`DELETE /backup-cache` and `GET`/`PUT /backup-cache/settings`, `rpc/{command}` for any desktop IPC command).
+
+### Policy templates, effective settings and schedules
+
+See [backup-policies-and-schedules.md](backup-policies-and-schedules.md).
+
+| Method and path | Scope | |
+|---|---|---|
+| `GET /api/v1/backup-templates` | read | Local templates, then the organization's (`managed`, `enforced`, ids `org:…`) |
+| `POST /api/v1/backup-templates` | write | Create `{name, description, settings}`; `settings` is a partial job: `options`, `filter`, `retention`, `schedule`, `maintenance`, `scripts`, `notifications`, `notification_profile_ids`, `notify_on`, `throttle`, `retry`, `prevent_sleep` |
+| `GET` / `PUT` / `DELETE /api/v1/backup-templates/{id}` | read / write / write | One template; organization templates cannot be changed (`403`); deleting one in use is `409` |
+| `POST /api/v1/backup-templates/{id}/apply` | write | `{job_id}`: append the template to the job's `template_ids` |
+| `GET /api/v1/backup-templates/export?ids=a,b` | read | Template file (`format: ufop-backup-templates`) |
+| `POST /api/v1/backup-templates/import` | write | Body: a template file, list or single template; same id or name updates |
+| `GET /api/v1/jobs/{id}/effective-settings` | read | `{job_id, template_ids, overrides, settings: [{field_path, value, source, inherited}], warnings}` |
+| `POST /api/v1/backup-schedule/preview` | read | `{schedule, count}`: validate an interval or cron schedule and list the next runs (`[{at, skipped_by}]`) |
+
+Jobs have three new optional fields: `template_ids` (ordered), `overrides` (field paths the job sets itself; `null` for older jobs) and `maintenance` (`{compact, verify: {schedule, options}, retention}`). `schedule.cron` takes cron expressions. `scripts.before_mode` and `scripts.after_mode` take `required`, `optional` or `async`. The `verify` operation takes `options`: `{scope: {versions, paths}, mode: {type: structure | sample_volumes, count | sample_percent, percent | full}, files_percent, parallelism, max_errors, use_cache}`. `GET /api/v1/status` lists upcoming maintenance in `next_maintenance`.
+
+### Notification profiles, previews and webhook presets
+
+See [backup-notifications.md](backup-notifications.md).
+
+| Method and path | Scope | |
+|---|---|---|
+| `GET /api/v1/notification-profiles` | read | Local profiles, then the organization's (`managed`, ids `org:…`) |
+| `POST /api/v1/notification-profiles` | write | Create `{name, description, notification, min_severity, secret}`; `secret` and secret header values go to the secure store and are never returned |
+| `GET` / `PUT` / `DELETE /api/v1/notification-profiles/{id}` | read / write / write | One profile; organization profiles cannot be changed (`403`); deleting one in use is `409` unless `?force=true`, which returns `{removed_from, warnings}` |
+| `POST /api/v1/notification-profiles/{id}/test` | write | Send a test message through the profile |
+| `POST /api/v1/notifications/preview` | any | `{notification, result}` → `{subject, text, html, request}` for a sample run (secrets masked) |
+| `POST /api/v1/notifications/webhook-preset` | any | `{preset, params: {server, topic, user, bearer}}` → a webhook channel |
+
+Jobs and template settings take `notification_profile_ids`. Notification channels gain `slack`, `teams` and `webhook` (`url`, `method`, `content_type`, `headers: [{name, value, secret, credential_id}]`, `body_template`, `preset`); email channels gain `html` and `html_template`. HTTP reports (`reports`) take `headers` and the `PATCH` method.
+
+### Share portal
+
+Start the server with `--share-root <folder>` (repeatable, or `UFOP_SERVER_SHARE_ROOTS`) to share files and folders under it by link; without it sharing is off. Links are created in the web UI (*Share links*), with `ufop server shares create <path>` or `POST /api/v1/shares`, and open at `/s/<token>` without an account:
+
+- **download** — a file, or a folder to browse (subfolders included) and download from; **upload** — a drop box: visitors upload into the folder and see nothing in it; **both**.
+- Options: password (8+ characters; argon2; 10 wrong tries lock the link for 15 minutes), expiry in days, download limit, largest upload per file (default 1 GB).
+- Only a hash of the token is stored, so the link is shown once. Paths are confined to the shared folder after resolving symbolic links, dot-files are never listed or served, downloads are sent as attachments, uploads never overwrite (`name (2).ext`), and pages carry a strict Content-Security-Policy. The server's `--allowed-cidrs` and host checks apply to links too.
+- Every view, download, upload, refusal and wrong password is logged per link (`GET /api/v1/shares/{id}/events`, `ufop server shares log <id>`); links can be turned off at any time.
+
+### Folder policies
+
+Folders under `--share-root` can carry a policy (web UI *Share links → Folder policies*, `ufop server folders`, `/api/v1/folder-policies`); subfolders inherit, and for each setting the nearest folder that sets it wins:
+
+- **Lock** — the folder takes no uploads (existing upload links stop accepting files) and no new upload links.
+- **Accepted / blocked extensions** and the **largest upload** (the smaller of this and the link's limit applies). Refused files are skipped and reported; the rest of an upload goes through.
+- **Link rules** — links to the folder need a password, and/or must expire within N days.
+- **Intake order** — uploads keep their names (`name (2).ext` on a clash), get an arrival-time prefix (`2026-10-22T16-30-01.123Z name.pdf`), or a per-folder sequence number (`000042-name.pdf`), so listing by name lists by arrival.
+- **Copy** a folder's policy to another folder (`POST /api/v1/folder-policies/copy`); an empty policy removes a folder's own settings.
+
+A test fails the build when a route is added without an OpenAPI entry (or an entry outlives its route), and another checks every documented scope against the running server.
+
+---
+
+### WebDAV (read-only)
+
+Start the server with `--dav-root <folder>` (repeatable, or `UFOP_SERVER_DAV_ROOTS`) to serve folders read-only over WebDAV at `/dav/<folder name>/`; without it WebDAV is off. Any WebDAV client works (Windows *Map network drive*, macOS *Connect to Server*, rclone `webdav`, Cyberduck, `davfs2`):
+
+- **Methods:** `OPTIONS`, `PROPFIND` with `Depth: 0` or `1` (infinity is refused with `propfind-finite-depth`), `GET`/`HEAD` with single byte ranges, `ETag` and `If-None-Match`. `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `PROPPATCH`, `LOCK` and every other method get `405 Method Not Allowed`.
+- **Sign-in:** HTTP Basic with any user name and the server password or an API token (`ufop_pat_…`, any scope) as the password, or `Authorization: Bearer`. An accepted password is remembered for a minute; changing the password or resetting tokens forgets it, and a revoked API token stops working at once.
+- **Network:** `--allowed-cidrs` applies as everywhere; `--dav-allowed-cidrs` (or `UFOP_SERVER_DAV_ALLOWED_CIDRS`) restricts WebDAV further. Basic sends the password with every request, so use `--https` or a TLS reverse proxy when the server is reachable from other machines (the server warns otherwise).
+- **Confinement:** paths are resolved after following symlinks and must stay inside the folder; dot-files and links pointing outside are neither listed nor served.
+
+### MCP over HTTP (OAuth)
+
+Start the server with `--mcp-root <folder>` (repeatable, or `UFOP_SERVER_MCP_ROOTS`) to offer the same file tools as `ufop mcp` to remote AI clients at `POST /mcp` (Streamable HTTP; JSON responses; `GET`/`DELETE` → 405). Read-only unless `--mcp-allow-write`; behind a proxy set `--public-url https://files.example.com` so the OAuth metadata names the right origin.
+
+- **Authorization** follows the MCP authorization spec, so clients such as Claude connect by URL alone: an unauthenticated request gets `401` with `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource"`; the client reads `/.well-known/oauth-authorization-server`, registers itself at `/oauth2/register` (public clients; redirect URIs must be `https` or `http` on `localhost`/`127.0.0.1`), and sends the user to `/oauth2/authorize`, a consent page where the server password approves it. PKCE (`S256`) is required; scopes are `mcp:read` and `mcp:write` (granted only with `--mcp-allow-write`); the authorization response carries `iss`.
+- **Tokens:** `/oauth2/token` exchanges the code (single use, two minutes) for a one-day access token and a 30-day refresh token. Refresh tokens rotate: each use revokes it and the access token it issued, and a second use fails. `/oauth2/revoke` revokes either kind. Access tokens are API tokens named `MCP: <client name>` with the `read` or `write` scope — they appear in the API token list and can be revoked there; API tokens and sessions work on `/mcp` too.
+- **Tools:** write tools exist only with `--mcp-allow-write` and a token that may write. Paths are confined to the roots exactly as with `ufop mcp`. Requests whose `Origin` is another site (DNS rebinding) are refused; use `--https` or a TLS proxy when reachable from other machines (the server warns).
+
+### File gateways
+
+On-premises agents (`ufop gateway serve`) serve folders through the server without an inbound port. An agent long-polls `POST /api/v1/gateway/poll` with an API token of the **write** scope, receives jobs (`list`, `download`, `upload`) and streams its answers to `POST /api/v1/gateway/jobs/{id}/reply`. For uploads it reads the client's data from `GET /api/v1/gateway/jobs/{id}/body`. Nothing is stored on the server.
+
+| Client call | Scope | |
+|---|---|---|
+| `GET /api/v1/gateways` | read | Gateways, nodes (host, address, roots, writable, last seen, jobs) |
+| `GET /api/v1/gateways/{name}/files?path=/root/dir` | read | One folder (`/` = the roots) |
+| `GET /api/v1/gateways/{name}/download?path=/root/file` | read | The file, streamed |
+| `PUT /api/v1/gateways/{name}/upload?path=/root/file` | write | The request body becomes the file (writable gateways only) |
+
+Nodes that share a gateway name form a pool: each job goes to the first node that polls, read-only nodes leave uploads to writable ones, and a stopping agent leaves the pool at once (others drop out after 60 s without polling). With no node online, a request fails with `503`; a job no node answers within 60 s fails with `504`. Agent errors map to `404`, `403` or `400`.
+
 ## Tauri IPC Commands
 
 The desktop application uses Tauri IPC for communication between the frontend (React/TypeScript) and backend (Rust). These are not REST endpoints but are documented here for extension developers.
@@ -669,3 +771,7 @@ The desktop application uses Tauri IPC for communication between the frontend (R
 | **Preview** | `preview_file`, `preview_get_exif` |
 | **Archive** | `archive_browse`, `archive_create`, `archive_extract`, `archive_info` |
 | **Integrity** | `integrity_checksum`, `integrity_verify`, `integrity_find_duplicates`, `integrity_resolve_duplicates`, `integrity_create_tag`, `integrity_list_tags`, `integrity_tag_file`, `integrity_create_smart_folder`, `integrity_run_smart_folder` |
+
+## Client libraries
+
+Generated TypeScript and Python clients live in [`sdk/`](../sdk/README.md) and are served by every server at `GET /api/v1/sdk/typescript` and `GET /api/v1/sdk/python` (public, like `/api/v1/openapi.json`). They cover the JSON API under `/api/v1`, are regenerated from the OpenAPI document (`UPDATE_SDK=1 cargo test --lib sdk`), and a test fails when the committed clients drift from the API.

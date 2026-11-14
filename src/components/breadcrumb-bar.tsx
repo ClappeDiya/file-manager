@@ -1,11 +1,17 @@
 import { useMemo } from "react";
 import { cn } from "@ufop/ui-components";
-import { ChevronLeft, ChevronRight, Home } from "lucide-react";
+import { ArrowUp, ChevronLeft, ChevronRight, Cloud, Home } from "lucide-react";
+import { AddressBar, type AddressBarProps } from "./address-bar";
+import { useT } from "@/lib/i18n";
+import { isRemotePath, locationConnectionId, locationRoot, locationSegments } from "@/lib/location";
 
 /**
  * Breadcrumb bar with clickable path segments and back/forward navigation.
  * Shows the current directory path as breadcrumbs that can be clicked
- * to navigate to any parent directory.
+ * to navigate to any parent directory. Connection folders (`conn://…`)
+ * start at the connection (its name, a cloud icon) and name their folders
+ * from the listing. With `address` set, clicking the empty part of the bar
+ * (or `editing` from Ctrl/Cmd+L) turns it into the editable address bar.
  */
 interface BreadcrumbBarProps {
   path: string;
@@ -14,8 +20,20 @@ interface BreadcrumbBarProps {
   onForward?: () => void;
   canGoBack?: boolean;
   canGoForward?: boolean;
+  /** Go to the parent folder (shown when given). */
+  onUp?: () => void;
+  canGoUp?: boolean;
   className?: string;
+  /** Name of a connection id (remote roots show it). */
+  connectionName?: (id: string) => string | undefined;
+  /** Makes the bar editable: what the address field needs. */
+  address?: Omit<AddressBarProps, "path" | "onNavigate" | "onCancel">;
+  /** Whether the address field is showing (controlled). */
+  editing?: boolean;
+  onEditingChange?: (editing: boolean) => void;
 }
+
+const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
 export function BreadcrumbBar({
   path,
@@ -24,15 +42,19 @@ export function BreadcrumbBar({
   onForward,
   canGoBack = false,
   canGoForward = false,
+  onUp,
+  canGoUp = false,
   className,
+  connectionName,
+  address,
+  editing = false,
+  onEditingChange,
 }: BreadcrumbBarProps) {
-  const segments = useMemo(() => {
-    const parts = path.split("/").filter(Boolean);
-    return parts.map((part, index) => ({
-      label: part,
-      path: "/" + parts.slice(0, index + 1).join("/"),
-    }));
-  }, [path]);
+  const t = useT();
+  const segments = useMemo(() => locationSegments(path), [path]);
+  const remote = isRemotePath(path);
+  const rootLabel = remote ? connectionName?.(locationConnectionId(path) ?? "") ?? "Connection" : null;
+  const showAddress = !!address && editing;
 
   return (
     <nav
@@ -42,7 +64,7 @@ export function BreadcrumbBar({
         "overflow-x-auto scrollbar-none",
         className,
       )}
-      aria-label="Breadcrumb navigation"
+      aria-label={t("accessibility.breadcrumb")}
       data-testid="breadcrumb-bar"
     >
       {/* Back / Forward buttons */}
@@ -57,7 +79,7 @@ export function BreadcrumbBar({
         )}
         onClick={canGoBack ? onBack : undefined}
         disabled={!canGoBack}
-        aria-label="Navigate back"
+        aria-label={t("nav.back")}
         data-testid="breadcrumb-back"
         type="button"
       >
@@ -74,12 +96,32 @@ export function BreadcrumbBar({
         )}
         onClick={canGoForward ? onForward : undefined}
         disabled={!canGoForward}
-        aria-label="Navigate forward"
+        aria-label={t("nav.forward")}
         data-testid="breadcrumb-forward"
         type="button"
       >
         <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
+      {onUp && (
+        <button
+          className={cn(
+            "flex items-center justify-center w-6 h-6 rounded-[var(--radius-sm)]",
+            "transition-theme shrink-0",
+            "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
+            canGoUp
+              ? "text-[color:var(--color-text-secondary)] hover:text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)]"
+              : "text-[color:var(--color-text-tertiary)] opacity-40 cursor-default",
+          )}
+          onClick={canGoUp ? onUp : undefined}
+          disabled={!canGoUp}
+          aria-label={t("nav.up")}
+          title={`Parent folder (${isMac ? "⌘↑" : "Alt+↑"} or Backspace)`}
+          data-testid="breadcrumb-up"
+          type="button"
+        >
+          <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      )}
 
       {/* Separator */}
       <div className="w-px h-4 bg-[var(--color-border)] shrink-0 mx-0.5" />
@@ -93,15 +135,35 @@ export function BreadcrumbBar({
           "transition-theme shrink-0",
           "focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]",
         )}
-        onClick={() => onNavigate("/")}
-        aria-label="Navigate to root"
+        onClick={() => onNavigate(locationRoot(path))}
+        aria-label={rootLabel ? `Navigate to the top of ${rootLabel}` : t("nav.root")}
+        title={rootLabel ?? undefined}
         data-testid="breadcrumb-root"
         type="button"
       >
-        <Home className="h-3.5 w-3.5" aria-hidden="true" />
+        {rootLabel ? (
+          <>
+            <Cloud className="h-3.5 w-3.5" aria-hidden="true" />
+            <span className="truncate max-w-[140px]" data-testid="breadcrumb-connection">{rootLabel}</span>
+          </>
+        ) : (
+          <Home className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
       </button>
 
-      {segments.map((segment, index) => (
+      {showAddress && address && (
+        <AddressBar
+          {...address}
+          path={path}
+          onNavigate={(p) => {
+            onEditingChange?.(false);
+            onNavigate(p);
+          }}
+          onCancel={() => onEditingChange?.(false)}
+        />
+      )}
+
+      {!showAddress && segments.map((segment, index) => (
         <div key={segment.path} className="flex items-center gap-0.5 min-w-0">
           <ChevronRight
             className="h-3 w-3 text-[color:var(--color-text-tertiary)] shrink-0"
@@ -127,6 +189,17 @@ export function BreadcrumbBar({
           </button>
         </div>
       ))}
+
+      {address && !showAddress && (
+        <button
+          type="button"
+          className="flex-1 self-stretch min-w-[24px] cursor-text"
+          onClick={() => onEditingChange?.(true)}
+          aria-label="Edit address"
+          title="Type a path (Ctrl+L)"
+          data-testid="breadcrumb-edit"
+        />
+      )}
     </nav>
   );
 }

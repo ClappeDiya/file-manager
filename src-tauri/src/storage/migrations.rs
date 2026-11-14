@@ -77,8 +77,484 @@ fn all_migrations() -> Vec<Migration> {
             description: "Sync pairs - Robocopy-equivalent copy options",
             sql: V12_SCHEMA,
         },
+        Migration {
+            version: 13,
+            description: "Backup engine - versioned backup jobs and run history",
+            sql: V13_SCHEMA,
+        },
+        Migration {
+            version: 14,
+            description: "Server auth tokens - refresh tokens and used sign-in tokens",
+            sql: V14_SCHEMA,
+        },
+        Migration {
+            version: 15,
+            description: "Sync pairs - destination-state mode and checksum algorithm",
+            sql: V15_SCHEMA,
+        },
+        Migration {
+            version: 16,
+            description: "Sync run history",
+            sql: V16_SCHEMA,
+        },
+        Migration {
+            version: 17,
+            description: "Security audit log - hash chain, signed anchors, append-only triggers",
+            // The work needs SHA-256, so it runs in Rust: see `rust_step`.
+            sql: "",
+        },
+        Migration {
+            version: 18,
+            description: "File metadata - color tags, labels, key-value metadata, smart folders",
+            sql: V18_SCHEMA,
+        },
+        Migration {
+            version: 19,
+            description: "Automation v1.5 - condition trees, steps, options; per-step run results",
+            sql: V19_SCHEMA,
+        },
+        Migration {
+            version: 20,
+            description: "Sync run options - settle window, completion marker, version naming",
+            sql: V20_SCHEMA,
+        },
+        Migration {
+            version: 21,
+            description: "Connection settings_json - persists advanced options and extras",
+            sql: V21_SCHEMA,
+        },
+        Migration {
+            version: 22,
+            description: "ufop-server scoped, expiring API tokens",
+            sql: V22_SCHEMA,
+        },
+        Migration {
+            version: 23,
+            description: "Metadata schemas - typed, required fields per folder",
+            sql: V23_SCHEMA,
+        },
+        Migration {
+            version: 24,
+            description: "ufop-server share portal - links and their access log",
+            sql: V24_SCHEMA,
+        },
+        Migration {
+            version: 25,
+            description: "Mount options - cache mode, cache limits, read-only; mount error column",
+            sql: V25_SCHEMA,
+        },
+        Migration {
+            version: 26,
+            description: "ufop-server folder policies - lock, extensions, limits, link rules, intake naming",
+            sql: V26_SCHEMA,
+        },
+        Migration {
+            version: 27,
+            description: "Named schedules and holiday calendars shared by sync, automation and backup",
+            sql: V27_SCHEMA,
+        },
+        Migration {
+            version: 28,
+            description: "Automation rule revisions (workflow history)",
+            sql: V28_SCHEMA,
+        },
+        Migration {
+            version: 29,
+            description: "OAuth clients and refresh tokens for ufop-server's MCP endpoint",
+            sql: V29_SCHEMA,
+        },
+        Migration {
+            version: 30,
+            description: "ufop-server API tokens limited to jobs",
+            sql: V30_SCHEMA,
+        },
+        Migration {
+            version: 31,
+            description: "ufop-server accounts, per-job access rules, token owners",
+            sql: V31_SCHEMA,
+        },
+        Migration {
+            version: 32,
+            description: "Starred connections and the credentials-rejected flag",
+            sql: V32_SCHEMA,
+        },
+        Migration {
+            version: 33,
+            description: "Two-way sync baselines and user-saved filter presets",
+            sql: V33_SCHEMA,
+        },
+        Migration {
+            version: 34,
+            description: "Run history detail - run triggers, per-run changed items, per-replica backup results",
+            sql: V34_SCHEMA,
+        },
     ]
 }
+
+/// A migration step written in Rust.
+type RustStep = fn(&Connection) -> Result<(), AppError>;
+
+/// Migration steps that cannot be expressed as static SQL. They run in the
+/// same transaction as the migration's `sql`, after it.
+fn rust_step(version: u32) -> Option<RustStep> {
+    match version {
+        // Hash existing audit rows into a chain, then lock the table down.
+        17 => Some(crate::security::audit_chain::migrate_v17),
+        _ => None,
+    }
+}
+
+/// Schema v34: run history detail. What started each sync and backup run
+/// (`run_trigger`: manual, scheduled, watcher, api, automation; existing rows
+/// read as manual), the files each sync run changed (`sync_run_items`, at
+/// most 10 000 per run; `items_truncated` says some were left out), and one
+/// row per replica per replication (`backup_replica_runs`) so a replica's
+/// history is more than its last result.
+const V34_SCHEMA: &str = r#"
+ALTER TABLE sync_runs ADD COLUMN run_trigger TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE sync_runs ADD COLUMN items_truncated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE backup_runs ADD COLUMN run_trigger TEXT NOT NULL DEFAULT 'manual';
+CREATE TABLE IF NOT EXISTS sync_run_items (
+    run_id   TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+    rel_path TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    bytes    INTEGER NOT NULL DEFAULT 0,
+    error    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sync_run_items_run ON sync_run_items(run_id);
+CREATE TABLE IF NOT EXISTS backup_replica_runs (
+    id           TEXT PRIMARY KEY NOT NULL,
+    run_id       TEXT NOT NULL REFERENCES backup_runs(id) ON DELETE CASCADE,
+    job_id       TEXT NOT NULL,
+    replica_id   TEXT NOT NULL,
+    replica_name TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    files        INTEGER NOT NULL DEFAULT 0,
+    bytes        INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    run_trigger  TEXT NOT NULL DEFAULT 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_backup_replica_runs_job ON backup_replica_runs(job_id, replica_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_backup_replica_runs_run ON backup_replica_runs(run_id);
+"#;
+
+/// Schema v33: two-way sync baselines — what both sides of a pair looked
+/// like after its last successful run (`sync_baseline_runs` per pair, one
+/// `sync_baseline` row per file, mtimes in nanoseconds) — and user-saved
+/// filter presets (ordered include/exclude rules as JSON), shared by sync
+/// pairs and backup jobs; and the copy options each sync pair sets itself
+/// over the global sync defaults (`option_overrides_json`, NULL = all).
+const V33_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_baseline_runs (
+    pair_id     TEXT PRIMARY KEY NOT NULL,
+    run_id      TEXT,
+    source_root TEXT NOT NULL,
+    dest_root   TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_baseline (
+    pair_id         TEXT NOT NULL REFERENCES sync_baseline_runs(pair_id) ON DELETE CASCADE,
+    rel_path        TEXT NOT NULL,
+    size            INTEGER NOT NULL,
+    source_mtime_ns INTEGER,
+    dest_mtime_ns   INTEGER,
+    hash            TEXT,
+    PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS user_filter_presets (
+    id         TEXT PRIMARY KEY NOT NULL,
+    name       TEXT NOT NULL,
+    rules_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+ALTER TABLE sync_pairs ADD COLUMN option_overrides_json TEXT;
+"#;
+
+/// Schema v21: profile fields with no column (upload modes, FTP tuning,
+/// symlink policy, connector extras) as JSON; previously never saved.
+/// Schema v22: named `ufop-server` API tokens (SHA-256 hashes) with scopes
+/// (JSON list) and a mandatory expiry.
+/// Schema v26: folder policies of folders ufop-server shares (`server::folders`).
+/// Schema v31: `ufop-server` accounts (Argon2 PHC hashes, role, disabled,
+/// console-managed flag), per-job access rules, and the account that owns
+/// each session and API token (existing ones: `admin`).
+const V31_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_users (
+    username      TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'viewer',
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    managed       INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_acl (
+    id          TEXT PRIMARY KEY NOT NULL,
+    principal   TEXT NOT NULL,
+    job_pattern TEXT NOT NULL,
+    permission  TEXT NOT NULL,
+    managed     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+ALTER TABLE server_tokens ADD COLUMN subject TEXT NOT NULL DEFAULT 'admin';
+ALTER TABLE server_api_tokens ADD COLUMN owner TEXT NOT NULL DEFAULT 'admin';
+"#;
+
+/// Schema v32: `starred` connections (listed first) and the
+/// credentials-rejected flag: set when a service refuses the sign-in, so
+/// background reconnects stop retrying until the user edits the connection
+/// or clicks Retry.
+const V32_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE connections ADD COLUMN credentials_rejected_at TEXT;
+ALTER TABLE connections ADD COLUMN credentials_rejected_reason TEXT;
+"#;
+
+/// Schema v30: `ufop-server` API tokens limited to some jobs (`job_ids`,
+/// a JSON list; NULL = every job, as before).
+const V30_SCHEMA: &str = r#"
+ALTER TABLE server_api_tokens ADD COLUMN job_ids TEXT;
+"#;
+
+/// Schema v29: OAuth 2.1 for `ufop-server`'s `/mcp` (`server::mcp_oauth`):
+/// dynamically registered public clients and rotating refresh tokens
+/// (SHA-256 hashes), each tied to the API token it last issued.
+const V29_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_oauth_clients (
+    client_id     TEXT PRIMARY KEY NOT NULL,
+    client_name   TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_oauth_refresh (
+    token_hash      TEXT PRIMARY KEY NOT NULL,
+    client_id       TEXT NOT NULL REFERENCES server_oauth_clients(client_id) ON DELETE CASCADE,
+    scope           TEXT NOT NULL,
+    access_token_id TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    revoked         INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+/// Schema v28: earlier versions of automation rules, kept when a rule is edited.
+const V28_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS automation_rule_revisions (
+    rule_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    saved_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, revision)
+);
+"#;
+
+/// Schema v27: the schedule library (`schedule_library`): named cron
+/// schedules and holiday calendars (each as JSON).
+const V27_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS named_schedules (
+    id TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS holiday_calendars (
+    id TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+const V26_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_folder_policies (
+    path TEXT PRIMARY KEY NOT NULL,
+    settings TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+/// Schema v25: per-mount options (`mount_engine::MountOptions` as JSON), and
+/// the `error_message` column the mount engine always wrote but v7 never
+/// created (every mount ended in a database error).
+const V25_SCHEMA: &str = r#"
+ALTER TABLE mount_configs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE mount_configs ADD COLUMN error_message TEXT;
+"#;
+
+/// Schema v24: ufop-server share links (`server::shares`). Only a hash of
+/// each link's token is stored.
+const V24_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_shares (
+    id TEXT PRIMARY KEY NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    password_hash TEXT,
+    expires_at TEXT,
+    max_downloads INTEGER,
+    downloads INTEGER NOT NULL DEFAULT 0,
+    max_upload_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_access_at TEXT
+);
+CREATE TABLE IF NOT EXISTS server_share_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_id TEXT NOT NULL REFERENCES server_shares(id) ON DELETE CASCADE,
+    at TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_server_share_events_share ON server_share_events(share_id, id);
+"#;
+
+/// Schema v23: metadata schemas (`metadata_engine::schema`). One per folder;
+/// `recursive` schemas also govern subfolders (the nearest one wins).
+const V23_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS metadata_schemas (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    folder TEXT NOT NULL UNIQUE,
+    fields_json TEXT NOT NULL DEFAULT '[]',
+    strict INTEGER NOT NULL DEFAULT 0,
+    recursive INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+const V22_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_api_tokens (
+    id           TEXT PRIMARY KEY NOT NULL,
+    name         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    scopes       TEXT NOT NULL DEFAULT '[]',
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+const V21_SCHEMA: &str = r#"
+ALTER TABLE connections ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}';
+"#;
+
+/// Schema v20: per-pair run options (`SyncRunOptions`); `{}` = defaults.
+const V20_SCHEMA: &str = r#"
+ALTER TABLE sync_pairs ADD COLUMN run_options_json TEXT NOT NULL DEFAULT '{}';
+"#;
+
+/// Schema v19: automation rule extras (condition tree, steps, options) and
+/// per-step results/attempt counts on runs. Old rows read as `{}`/`[]`,
+/// which deserialize to the previous behaviour.
+const V19_SCHEMA: &str = r#"
+ALTER TABLE automation_rules ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE automation_logs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE automation_logs ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+/// Schema v18: file metadata (previously held in memory and lost on quit).
+/// Rows are keyed by absolute path; see `metadata_engine`.
+const V18_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS file_tag_defs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    color TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_tag_links (
+    path TEXT NOT NULL,
+    tag_id TEXT NOT NULL REFERENCES file_tag_defs(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_file_tag_links_tag ON file_tag_links(tag_id);
+CREATE TABLE IF NOT EXISTS file_labels (
+    path TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (path, label)
+);
+CREATE TABLE IF NOT EXISTS file_metadata (
+    path TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (path, key)
+);
+CREATE INDEX IF NOT EXISTS idx_file_metadata_key_value ON file_metadata(key, value);
+CREATE TABLE IF NOT EXISTS smart_folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    icon TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
+/// Schema v16: every finished sync run, kept across restarts.
+const V16_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id TEXT PRIMARY KEY,
+    pair_id TEXT NOT NULL,
+    pair_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    report_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sync_runs_pair ON sync_runs(pair_id, started_at DESC);
+"#;
+
+/// Schema v15: how a sync pair learns the destination state (scan, trusted
+/// inventory, blind upload) and which hash full verification uses.
+const V15_SCHEMA: &str = r#"
+ALTER TABLE sync_pairs ADD COLUMN dest_state TEXT NOT NULL DEFAULT 'scan';
+ALTER TABLE sync_pairs ADD COLUMN checksum_algorithm TEXT NOT NULL DEFAULT 'xxh3';
+"#;
+
+/// Schema v14: `ufop-server` refresh tokens (stored as SHA-256 hashes) and
+/// redeemed one-time sign-in token ids.
+const V14_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS server_tokens (
+    id          TEXT PRIMARY KEY NOT NULL,
+    kind        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    revoked     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_server_tokens_hash ON server_tokens(token_hash);
+"#;
+
+/// Schema v13: versioned (deduplicated, encrypted) backup jobs. The job
+/// definition is JSON so options can grow without migrations; each job's
+/// block/version index lives in its own SQLite file next to the app DB.
+const V13_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS backup_jobs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS backup_runs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    job_id      TEXT NOT NULL,
+    operation   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    summary     TEXT NOT NULL DEFAULT '',
+    report_json TEXT NOT NULL DEFAULT '{}',
+    log_json    TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_backup_runs_job ON backup_runs(job_id, started_at DESC);
+"#;
 
 /// Schema v12: per-pair Robocopy-equivalent copy options, stored as JSON so
 /// new options never need another column. `{}` deserializes to the defaults.
@@ -595,13 +1071,19 @@ fn current_version(conn: &Connection) -> Result<u32, AppError> {
 
 /// Run all pending migrations. Returns the number of migrations applied.
 pub fn run_migrations(conn: &Connection) -> Result<u32, AppError> {
+    run_migrations_up_to(conn, u32::MAX)
+}
+
+/// Run pending migrations with `version <= target` (tests use this to
+/// build a database at an older schema version).
+pub(crate) fn run_migrations_up_to(conn: &Connection, target: u32) -> Result<u32, AppError> {
     ensure_migrations_table(conn)?;
     let current = current_version(conn)?;
     let migrations = all_migrations();
     let mut applied = 0u32;
 
     for migration in &migrations {
-        if migration.version <= current {
+        if migration.version <= current || migration.version > target {
             continue;
         }
 
@@ -614,6 +1096,9 @@ pub fn run_migrations(conn: &Connection) -> Result<u32, AppError> {
         // Run migration in a transaction
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(migration.sql)?;
+        if let Some(step) = rust_step(migration.version) {
+            step(&tx)?;
+        }
         tx.execute(
             "INSERT INTO _migrations (version, description) VALUES (?1, ?2)",
             rusqlite::params![migration.version, migration.description],
@@ -631,9 +1116,16 @@ pub fn run_migrations(conn: &Connection) -> Result<u32, AppError> {
     Ok(applied)
 }
 
+/// Tables a reset never drops: the security audit log is append-only and
+/// must outlive "reset all data" (#357). The reset itself is audited.
+const RESET_PRESERVED_TABLES: [&str; 2] = ["audit_events", "audit_anchors"];
+
 /// Reset the database by dropping all tables. Used for testing and recovery.
+///
+/// The security audit log (and its fallback signing key in `config`) is
+/// kept, so a reset cannot be used to erase audit history.
 pub fn reset_database(conn: &Connection) -> Result<(), AppError> {
-    tracing::warn!("Resetting database - all data will be lost");
+    tracing::warn!("Resetting database - all data except the security audit log will be lost");
 
     // Get all table names
     let mut stmt = conn.prepare(
@@ -644,13 +1136,31 @@ pub fn reset_database(conn: &Connection) -> Result<(), AppError> {
         .filter_map(|r| r.ok())
         .collect();
 
+    let audit_key: Option<String> = if tables.iter().any(|t| t == "config") {
+        conn.query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            [crate::security::audit::SETTINGS_KEY],
+            |r| r.get(0),
+        )
+        .ok()
+    } else {
+        None
+    };
+
     // Drop all tables
-    for table in &tables {
+    for table in tables.iter().filter(|t| !RESET_PRESERVED_TABLES.contains(&t.as_str())) {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\"")))?;
     }
 
-    // Re-run migrations
+    // Re-run migrations (v1 and v17 are no-ops on the preserved audit tables)
     run_migrations(conn)?;
+
+    if let Some(k) = audit_key {
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            rusqlite::params![crate::security::audit::SETTINGS_KEY, k],
+        )?;
+    }
 
     Ok(())
 }
@@ -669,7 +1179,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = test_conn();
         let applied = run_migrations(&conn).unwrap();
-        assert_eq!(applied, 12);
+        assert_eq!(applied, 34);
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -692,14 +1202,54 @@ mod tests {
         assert!(tables.contains(&"audit_events".to_string()));
         assert!(tables.contains(&"workspace_state".to_string()));
         assert!(tables.contains(&"mount_configs".to_string()));
+        assert!(tables.contains(&"backup_jobs".to_string()));
+        assert!(tables.contains(&"backup_runs".to_string()));
+        for t in ["file_tag_defs", "file_tag_links", "file_labels", "file_metadata", "smart_folders"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
+        for t in ["sync_baseline_runs", "sync_baseline", "user_filter_presets"] {
+            assert!(tables.contains(&t.to_string()), "missing {t}");
+        }
         assert!(tables.contains(&"_migrations".to_string()));
+    }
+
+    #[test]
+    fn v34_adds_run_history_detail_and_old_runs_read_as_manual() {
+        let conn = test_conn();
+        run_migrations_up_to(&conn, 33).unwrap();
+        conn.execute(
+            "INSERT INTO sync_runs (id, pair_id, pair_name, status, started_at, ended_at, report_json) VALUES ('r1', 'p', 'Pair', 'success', '2026-01-01T00:00:00+00:00', '2026-01-01T00:01:00+00:00', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO backup_runs (id, job_id, operation, status, started_at) VALUES ('b1', 'j', 'backup', 'success', '2026-01-01T00:00:00+00:00')", []).unwrap();
+
+        assert_eq!(run_migrations(&conn).unwrap(), 1);
+
+        let trig: String = conn.query_row("SELECT run_trigger FROM sync_runs WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+        let trunc: i64 = conn.query_row("SELECT items_truncated FROM sync_runs WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+        let btrig: String = conn.query_row("SELECT run_trigger FROM backup_runs WHERE id = 'b1'", [], |r| r.get(0)).unwrap();
+        assert_eq!((trig.as_str(), trunc, btrig.as_str()), ("manual", 0, "manual"));
+
+        // Items and replica rows follow their run when it is deleted.
+        conn.execute("INSERT INTO sync_run_items (run_id, rel_path, action, bytes) VALUES ('r1', 'a.txt', 'copied', 3)", []).unwrap();
+        conn.execute(
+            "INSERT INTO backup_replica_runs (id, run_id, job_id, replica_id, replica_name, status, started_at) VALUES ('x', 'b1', 'j', 'rep', 'Replica', 'success', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM sync_runs WHERE id = 'r1'", []).unwrap();
+        conn.execute("DELETE FROM backup_runs WHERE id = 'b1'", []).unwrap();
+        let items: i64 = conn.query_row("SELECT COUNT(*) FROM sync_run_items", [], |r| r.get(0)).unwrap();
+        let reps: i64 = conn.query_row("SELECT COUNT(*) FROM backup_replica_runs", [], |r| r.get(0)).unwrap();
+        assert_eq!((items, reps), (0, 0));
     }
 
     #[test]
     fn test_migrations_idempotent() {
         let conn = test_conn();
         let first = run_migrations(&conn).unwrap();
-        assert_eq!(first, 12);
+        assert_eq!(first, 34);
 
         let second = run_migrations(&conn).unwrap();
         assert_eq!(second, 0);
@@ -712,7 +1262,7 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 12);
+        assert_eq!(current_version(&conn).unwrap(), 34);
     }
 
     #[test]

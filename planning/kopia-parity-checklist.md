@@ -1,0 +1,136 @@
+# Kopia parity — implementation checklist
+
+Source: the Kopia gap analysis (79 rows decided ADD, ENHANCE or DEFER). IDs are `K<row>` from that report.
+Branch: `feat/kopia-parity`. One commit per item (or tight group), message prefixed with the ID.
+
+Ground rules
+- Additive only: existing behaviour, IPC names, CLI flags and v1 repositories keep working.
+- New serde fields use `#[serde(default)]`; TypeScript mirrors use `T | null`.
+- Format-changing features (CDC, zstd, envelope key, dlist compression, sharding) apply to format v2 repositories only.
+- Advanced-only UI goes behind `appMode === "advanced"` (K132). Standard view stays as it is.
+- Every item ships with tests; a box is ticked only when code, wiring (engine → IPC/CLI/API → UI where applicable) and tests are done and passing.
+
+## WP0 — Foundations
+- [x] K132 Backup screens honour Simple/Advanced mode (`AdvancedOnly` gate + store selector)
+- [x] K130 SECURITY.md (disclosure policy, supported versions, response SLA)
+
+## WP1 — Repository format v2 (ufop-core)
+- [x] K72 Format v2, dual-version reader, in-place upgrade with v1 header backup and rollback
+- [x] K83 Envelope key: random master key wrapped by Argon2id KEK; password change rewraps header only
+- [x] K49 Zstd block codec in the native pack format (default for new v2 repos)
+- [x] K52 Compress dlist/dindex metadata before sealing (v2)
+- [x] K3 Content-defined chunking (FastCDC) behind a `Chunker` trait; chunker recorded in repo header
+- [x] K82 ChaCha20-Poly1305 as a registered encryption module (v2 header records cipher)
+- [x] K59 Optional sharded remote layout for v2 repos (+ reshard tool)
+
+## WP2 — Repository safety
+- [x] K115 Remote repository lock lease (`{prefix}-lock`), renew, stale takeover, guarded force-unlock
+- [x] K118 Clock-skew check against backend mtime; warn/abort thresholds
+- [x] K9 Periodic checkpoints (sealed partial dlist every N minutes / bytes)
+- [x] K70 Read-only connections (Backend wrapper refusing writes; job + adopt flag)
+- [x] K81 Encrypted local database for encrypted repositories (key in OS keychain)
+
+## WP3 — Versions, retention, shared repositories
+- [x] K7 Version notes and tags (+ tag filter)
+- [x] K22 Pin versions ("Keep forever"), honoured by retention and delete
+- [x] K113 Storage added per version (bytes_added, new_blocks)
+- [x] K23 Retention preview (dry-run of deletions)
+- [x] K20 Count-based GFS retention (`RetentionPolicy::Counts`)
+- [x] K76 Copy selected versions to another repository
+- [x] K4 Shared multi-client repositories (cross-job/machine dedup, DB sync from remote dindex)
+- [x] K69 Client identity (host/user) recorded per version, override option
+
+## WP4 — Sources and backup runs
+- [x] K26 `.ufopignore` and optional `.gitignore` support
+- [x] K28 Stay on one filesystem
+- [x] K12 Fail-fast error policy
+- [x] K29 Per-type read-error policy (file / directory / unknown entry)
+- [x] K11 Percentage rehash
+- [x] K6 Backup from stdin
+- [x] K10 Per-run upload cap
+- [x] K54 Large-file parallel hashing threshold
+- [x] K31 ZFS and btrfs snapshot providers
+- [x] K14 Pre-backup estimate (new bytes + duration)
+- [x] K5 Run all jobs (CLI, IPC, tray)
+
+## WP5 — Restore and access
+- [x] K41 Restore as of a date/time
+- [x] K42 Restore to ZIP / TAR / TGZ
+- [x] K45 Mirror restore (delete extras, safety-interlocked)
+- [x] K46 Restore ownership (chown when privileged)
+- [x] K47 Restore error policy (shared with K12/K29)
+- [x] K48 Sparse-file restore
+- [x] K38 Read/preview a backed-up file without restoring
+- [x] K77 Bounded local volume cache (size limit, stats, clear)
+- [x] K44 Mount a version as a read-only WebDAV drive
+
+## WP6 — Policy, schedules, maintenance
+- [x] K17 Named policy templates inherited by jobs
+- [x] K18 Effective-settings view (inherited vs overridden)
+- [x] K33 Cron schedules for backup jobs
+- [x] K116 Separate maintenance schedule (compact / verify)
+- [x] K119 Verification scope (version/path), percent sampling, parallelism, max errors
+- [x] K34 Async (fire-and-forget) hook mode
+
+## WP7 — Storage backends
+- [x] K60 S3 credential chain (env, profile, web identity, IMDS) for backup S3 store
+- [x] K61 STS assume-role in native S3 store
+- [x] K62 Azure service principal / federated auth for Azure store
+- [x] K63 GCS read-only scope for read-only connections
+- [x] K64 rclone process control (startup timeout, kill on drop)
+- [x] K66 Storage class per volume type
+- [x] K67 Point-in-time read of a versioned S3 bucket
+- [x] K55 Request-rate limits and listing parallelism
+- [x] K58 Live-provider contract test harness (env-gated) + CI workflow
+
+## WP8 — Server, security, observability
+- [x] K97 Graceful server shutdown (drain, checkpoint)
+- [x] K89 CSRF double-submit token on cookie routes
+- [x] K93 API tokens scoped to job IDs
+- [x] K107 Request tracing with X-Request-Id
+- [x] K108 Prometheus `/metrics`
+- [x] K109 OpenTelemetry trace export + Prometheus pushgateway
+- [x] K92 Multi-user server accounts and per-job ACL
+- [x] K87 Ransomware hardening guide + destination checklist in job editor
+
+## WP9 — Notifications
+- [x] K101 Reusable notification profiles
+- [x] K104 Webhook custom headers + presets (Pushover, ntfy, Discord, PagerDuty)
+- [x] K105 HTML email (multipart)
+
+## WP10 — CLI, tooling, packaging
+- [x] K56 `ufop backup bench` (compression, crypto, chunker)
+- [x] K111 `ufop backup debug` (blocks, volumes, index, filesets)
+- [x] K129 Shell completions
+- [x] K125 Windows release targets
+- [x] K126 Multi-arch Docker image
+- [x] K127 Signed SHA256SUMS on releases
+- [x] K131 Portable mode for the desktop app
+- [x] K124 ufop-server web UI branding
+
+## WP11 — Interface polish
+- [x] K122 Sort and paginate backup version/file tables
+- [x] K121 Text size setting
+- [x] K123 Units (binary/decimal) and schedule timezone
+
+## Follow-ups found during the work
+- [x] Standalone `ufop agent` host honours cron schedules, time zones, maintenance schedules and policy templates of managed jobs (WP6 left it on plain intervals); shared `ufop_core::backup::{schedule, layers}`
+- [x] Fix pre-existing `tests/journey_06_lan_transfer.rs` build break (`PeerManager::create_hello`/`create_ping` became the private handshake of the X-1 rewrite): journey 6J now pairs two real managers over loopback TLS and runs an approved, verified transfer; `cargo test --tests --no-run` builds every integration test and all 8 journey files pass
+- [x] Fix pre-existing orphan `test_automation_rule` IPC call (dump-ipc-commands --verify): the command existed and was registered, but its doc comment sat between `#[tauri::command]` and the fn so the script missed it (same for K122's `backup_list_files`/`backup_run_history`/`backup_remote_list`); doc comments moved above the attribute, the script now tolerates comments, and the editor's dry run of an unsaved folder rule tries the files already in the watched folder; `--verify` and `--check` pass
+- [x] Optional K108 extra: Prometheus `/metrics` in the desktop app (setting, off by default, loopback only) — `backup_engine::metrics_exporter` on 127.0.0.1 with port + optional bearer token, shared `render_backup` with ufop-server, Settings → Advanced
+- [x] Pre-existing: `scripts/check-windows-build.sh` failed on clippy 1.97 lints in ufop-core (`unnecessary_sort_by` in sync/executor.rs, `manual_checked_ops`): fixed in ufop-core (also with all features) and the 40 findings in src-tauri (MSRV-safe `map_or` instead of 1.82's `is_none_or`, `sort_by_key`, `checked_div`, `rfind`, `slice::from_ref`, type aliases, `AdoptOptions` instead of 8 arguments, boxed mock error); justified `allow`s only for `large_enum_variant` on configuration enums and `too_many_arguments` on two IPC commands; the script passes here for both crates (x86_64-pc-windows-gnu, MinGW present)
+- [x] Pre-existing flake: `server::tests::file_gateway_relays_through_an_ha_pool_without_storing` could fail with a broken pipe under load: the server answered a refused upload (403/404) without reading its body and closed the connection while the client was still sending. Fixed in the server (`gateway::after_draining`: discard up to 64 MiB / 30 s of a refused upload's body before answering, else `Connection: close`); regression test `refused_gateway_uploads_are_answered_after_the_body_arrives` failed 5/24 runs before (4 parallel `server::tests` processes, 8 threads each) and 0/32 after
+
+- [x] Portable mode on macOS: Tauri 2.10.3 exposes `WebviewWindowBuilder::data_store_identifier` (macOS 14+; `data_directory` is unsupported on WKWebView). Portable mode now gives the main window a data store whose UUID (v8) is derived from the portable folder path (`paths::webview_store_identifier`), set on the builder because `from_config` ignores the config field; the window is created in `setup` (`"create": false`). The store still lives under `~/Library/WebKit` (Apple decides where), isolated per portable copy; older macOS falls back to the default store. Documented in docs/user-guide.md. Not run on a Mac here (Linux container): compiled for Linux and Windows, identifier unit-tested
+- [ ] Build and smoke-test the multi-arch ufop-server image on a machine with a Docker daemon (`scripts/docker-build.sh --platforms linux/amd64,linux/arm64`); WP10 could only test the dry-run plan and review the Dockerfile — still open: needs a machine with Docker; dry-run tested. This container has the docker/buildx client and a `dockerd` binary but no running daemon (`docker info`: cannot connect to /var/run/docker.sock), no binfmt_misc/QEMU for linux/arm64, and ~3 GB of free disk, too little for two release builds of ufop-server
+- [x] Pre-existing: admin `alerts.test.ts` needed a local SMTP server on 127.0.0.1:2525 (3 tests failed without it): now starts an in-process SMTP server (`smtp-mock.ts`: STARTTLS with the localhost fixture certificate, AUTH PLAIN/LOGIN, MAIL/RCPT/DATA) on an ephemeral port; admin vitest 37 files / 186 tests pass
+- [x] Pre-existing: `scripts/check-connectors.sh` reported RcloneConnector as unregistered — it is registered (`registry.register("rclone", Arc::new(rclone::RcloneConnector::new()))`); the script now accepts module-qualified constructors
+- [x] Pre-existing: `scripts/check-env-example-drift.sh` — `ADMIN_ENCRYPTION_KEY`, `ADMIN_PUBLIC_URL`, `ADMIN_DISABLE_JOBS` added to `admin/.env.example` with comments
+- [x] Pre-existing: `scripts/check-workspace-deps.sh` — admin moved from vitest 3.2.4 to 4.1.0 like the root (installed offline from the pnpm store); admin vitest and tsc pass
+
+## Final verification
+- [x] ufop-core tests (all features) pass (417 passed, 1 ignored: the manual `UFOP_DOCTEXT_SAMPLES` harness)
+- [x] src-tauri `cargo test --lib` passes (1330 passed, 1 ignored: needs LibreOffice) and `cargo test --tests` (all 8 journey files, 78 tests)
+- [x] CLI tests pass (47 + 7 integration) and `cargo clippy --all-targets -D warnings` is clean
+- [x] Web vitest (130 files, 1343 tests), tsc, eslint (0 errors, 89 warnings) pass; admin vitest (37 files, 186 tests) and tsc pass
+- [x] Docs updated (backup docs, cli-reference incl. `ufop agent`, api-reference, CHANGELOG entries for every K item, docs/README.md index links all backup docs and server-operations)

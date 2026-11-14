@@ -8,8 +8,8 @@ export function Footer() {
   const t = useTranslate();
   const year = new Date().getFullYear();
   const items = [
-    { key: 'privacy', href: 'https://filemanager.clappe.com/legal/privacy' },
-    { key: 'terms', href: 'https://filemanager.clappe.com/legal/terms' },
+    // Only pages this console serves; privacy and terms belong to the operator's own site.
+    { key: 'status', href: '/api/health' },
     { key: 'support', href: '/support' },
   ] as const;
   return (

@@ -9,3 +9,4 @@ export { Tabs, TabContent } from './tabs';
 export { StatCard } from './stat-card';
 export { SearchInput } from './search-input';
 export { EmptyState } from './empty-state';
+export { ComingSoon } from './coming-soon';

@@ -1,142 +1,44 @@
-//! OpenStack Swift Object Storage Connector
+//! OpenStack Swift connector (Keystone v3 password or application
+//! credential, or TempAuth / v1).
 //!
-//! Features:
-//! - Keystone v3 authentication (token-based)
-//! - Application credentials authentication
-//! - TempAuth (legacy) support
-//! - Container listing and management
-//! - Object operations: list, upload, download, delete, copy
-//! - Large Object Support (SLO/DLO)
-//! - Object metadata and custom headers
-//! - Temporary URL generation (TempURL middleware)
-//! - Container ACL management
-//! - Pseudo-folder navigation (delimiter-based)
+//! - `/` lists containers; `/container/dir/` lists objects one level deep
+//!   (pseudo-folders from the `/` delimiter), page by page.
+//! - Files up to the segment size go up in one PUT (with an ETag Swift
+//!   verifies); larger ones as a Static Large Object: segments in
+//!   `<container>_segments`, then a manifest. Replacing a large object
+//!   removes its old segments.
+//! - Folders are zero-byte `dir/` objects (`application/directory`);
+//!   `/container` creates the container. Folders and containers are removed
+//!   only when empty; deleting a large object deletes its segments too.
+//! - Share links are TempURLs signed with the container's or account's
+//!   `Temp-URL-Key`.
+//!
+//! Sign-in and requests go through [`SwiftSession`], shared with the Swift
+//! backup destination.
 
+use super::azure_rest as az;
+use crate::backup_engine::stores::http;
+use crate::backup_engine::stores::swift::{object_path, SwiftConfig, SwiftSession, LIST_PAGE};
 use crate::connectors::Connector;
 use crate::core::error::AppError;
-use crate::core::types::{ConnectionProfile, FileEntry};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::core::types::{ConnectionProfile, FileEntry, SwiftAuthKind};
+use bytes::Bytes;
+use reqwest::Method;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::sync::RwLock;
-use zeroize::Zeroize;
 
-// Large object segment size: 5GB (Swift limit per segment)
-#[allow(dead_code)]
-const SEGMENT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
-// Default segment size for uploads: 100MB
-const DEFAULT_SEGMENT_SIZE: u64 = 100 * 1024 * 1024;
+const WHAT: &str = "OpenStack Swift";
 
-// ── Swift Types ──
+/// Objects above this size are uploaded as Static Large Objects.
+const DEFAULT_SEGMENT_SIZE: u64 = 32 * 1024 * 1024;
 
-/// OpenStack authentication method.
-///
-/// Secret fields are zeroized on drop to prevent credential leakage
-/// in memory dumps or core files.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
-#[serde(rename_all = "snake_case")]
-#[zeroize(drop)]
-pub enum SwiftAuthMethod {
-    /// Keystone v3 (username + password + project)
-    KeystoneV3 {
-        auth_url: String,
-        username: String,
-        password: String,
-        project_name: String,
-        domain_name: String,
-        region: Option<String>,
-    },
-    /// Application credentials (Keystone v3)
-    ApplicationCredential {
-        auth_url: String,
-        credential_id: String,
-        credential_secret: String,
-    },
-    /// TempAuth (legacy, for dev/testing)
-    TempAuth {
-        auth_url: String,
-        username: String,
-        password: String,
-    },
-    /// Pre-authenticated token + storage URL
-    Token {
-        storage_url: String,
-        auth_token: String,
-    },
-}
+type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
-/// Swift connector configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwiftConfig {
-    pub auth_method: SwiftAuthMethod,
-    /// Segment size for large object uploads.
-    pub segment_size: u64,
-    /// Whether to use Static Large Objects (SLO) instead of Dynamic (DLO).
-    pub use_slo: bool,
-    /// TempURL key for generating temporary URLs.
-    pub temp_url_key: Option<String>,
-}
-
-impl Default for SwiftConfig {
-    fn default() -> Self {
-        Self {
-            auth_method: SwiftAuthMethod::KeystoneV3 {
-                auth_url: String::new(),
-                username: String::new(),
-                password: String::new(),
-                project_name: String::new(),
-                domain_name: "Default".to_string(),
-                region: None,
-            },
-            segment_size: DEFAULT_SEGMENT_SIZE,
-            use_slo: true,
-            temp_url_key: None,
-        }
-    }
-}
-
-/// Swift container information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwiftContainerInfo {
-    pub name: String,
-    pub object_count: u64,
-    pub bytes_used: u64,
-    pub last_modified: Option<String>,
-    pub read_acl: Option<String>,
-    pub write_acl: Option<String>,
-    pub storage_policy: Option<String>,
-}
-
-/// Swift object metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwiftObjectMeta {
-    pub name: String,
-    pub container: String,
-    pub content_type: Option<String>,
-    pub content_length: u64,
-    pub last_modified: Option<String>,
-    pub etag: Option<String>,
-    pub is_large_object: bool,
-    pub custom_metadata: HashMap<String, String>,
-}
-
-/// Internal Swift connection state.
-///
-/// The auth_token is zeroized on drop to prevent leakage in memory dumps.
-#[allow(dead_code)]
-struct SwiftConnection {
-    config: SwiftConfig,
-    storage_url: String,
-    auth_token: zeroize::Zeroizing<String>,
-    token_expires: Option<DateTime<Utc>>,
-    connected: bool,
-}
-
-/// OpenStack Swift connector.
 pub struct SwiftConnector {
-    state: RwLock<Option<SwiftConnection>>,
+    session: RwLock<Option<Arc<SwiftSession>>>,
+    segment_size: u64,
 }
 
 impl Default for SwiftConnector {
@@ -145,555 +47,383 @@ impl Default for SwiftConnector {
     }
 }
 
-impl SwiftConnector {
-    pub fn new() -> Self {
-        Self {
-            state: RwLock::new(None),
+/// The session settings for a connection profile.
+pub fn config_for_profile(profile: &ConnectionProfile) -> Result<SwiftConfig, AppError> {
+    let s = profile.extras.swift.clone().unwrap_or_default();
+    let text = |o: &Option<String>| o.as_deref().map(str::trim).unwrap_or_default().to_string();
+    let auth_url = match text(&s.auth_url) {
+        u if !u.is_empty() => u,
+        _ if profile.host.trim().is_empty() => return Err(AppError::validation("Enter the Swift auth URL (or the Keystone host)")),
+        _ => {
+            let host = profile.host.trim().trim_end_matches('/');
+            let base = if host.contains("://") { host.to_string() } else { format!("https://{host}") };
+            let base = match profile.port {
+                Some(p) if !base.rsplit("//").next().unwrap_or_default().contains(':') => format!("{base}:{p}"),
+                _ => base,
+            };
+            if s.auth_kind == SwiftAuthKind::TempAuth { format!("{base}/auth/v1.0") } else { format!("{base}/v3") }
         }
-    }
-
-    /// Authenticate and obtain a token via the configured auth method.
-    async fn authenticate(config: &SwiftConfig) -> Result<(String, String, Option<DateTime<Utc>>), AppError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| AppError::connection(format!("HTTP client error: {e}"), "Check TLS configuration."))?;
-
-        match &config.auth_method {
-            SwiftAuthMethod::KeystoneV3 { auth_url, username, password, project_name, domain_name, region } => {
-                tracing::info!(
-                    "Authenticating via Keystone v3: {} user={} project={} domain={}",
-                    auth_url, username, project_name, domain_name
-                );
-
-                let auth_body = serde_json::json!({
-                    "auth": {
-                        "identity": {
-                            "methods": ["password"],
-                            "password": {
-                                "user": {
-                                    "name": username,
-                                    "password": password,
-                                    "domain": { "name": domain_name }
-                                }
-                            }
-                        },
-                        "scope": {
-                            "project": {
-                                "name": project_name,
-                                "domain": { "name": domain_name }
-                            }
-                        }
-                    }
-                });
-
-                let token_url = format!("{}/auth/tokens", auth_url.trim_end_matches('/'));
-                let resp = client
-                    .post(&token_url)
-                    .json(&auth_body)
-                    .send()
-                    .await
-                    .map_err(|e| AppError::connection(
-                        format!("Keystone v3 auth failed: {e}"),
-                        "Check auth URL, credentials, and network connectivity.",
-                    ))?;
-
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(AppError::connection(
-                        format!("Keystone v3 auth returned {status}: {body}"),
-                        "Check username, password, project, and domain.",
-                    ));
-                }
-
-                let auth_token = resp
-                    .headers()
-                    .get("x-subject-token")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-                    .ok_or_else(|| AppError::connection(
-                        "Keystone v3 response missing X-Subject-Token header",
-                        "The identity service may be misconfigured.",
-                    ))?;
-
-                let catalog: serde_json::Value = resp.json().await.map_err(|e| {
-                    AppError::connection(format!("Failed to parse Keystone response: {e}"), "")
-                })?;
-
-                // Extract storage URL from service catalog
-                let storage_url = Self::extract_swift_endpoint(&catalog, region.as_deref())?;
-
-                // Parse token expiry
-                let token_expires = catalog
-                    .pointer("/token/expires_at")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-
-                Ok((storage_url, auth_token, token_expires))
-            }
-
-            SwiftAuthMethod::ApplicationCredential { auth_url, credential_id, credential_secret } => {
-                tracing::info!("Authenticating via application credential: {}", credential_id);
-
-                let auth_body = serde_json::json!({
-                    "auth": {
-                        "identity": {
-                            "methods": ["application_credential"],
-                            "application_credential": {
-                                "id": credential_id,
-                                "secret": credential_secret
-                            }
-                        }
-                    }
-                });
-
-                let token_url = format!("{}/auth/tokens", auth_url.trim_end_matches('/'));
-                let resp = client
-                    .post(&token_url)
-                    .json(&auth_body)
-                    .send()
-                    .await
-                    .map_err(|e| AppError::connection(
-                        format!("Application credential auth failed: {e}"),
-                        "Check credential ID, secret, and auth URL.",
-                    ))?;
-
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(AppError::connection(
-                        format!("Application credential auth returned {status}: {body}"),
-                        "Verify the credential has not expired or been revoked.",
-                    ));
-                }
-
-                let auth_token = resp
-                    .headers()
-                    .get("x-subject-token")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-                    .ok_or_else(|| AppError::connection(
-                        "Keystone response missing X-Subject-Token header",
-                        "The identity service may be misconfigured.",
-                    ))?;
-
-                let catalog: serde_json::Value = resp.json().await.map_err(|e| {
-                    AppError::connection(format!("Failed to parse Keystone response: {e}"), "")
-                })?;
-
-                let storage_url = Self::extract_swift_endpoint(&catalog, None)?;
-                let token_expires = catalog
-                    .pointer("/token/expires_at")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-
-                Ok((storage_url, auth_token, token_expires))
-            }
-
-            SwiftAuthMethod::TempAuth { auth_url, username, password } => {
-                tracing::info!("Authenticating via TempAuth: {} user={}", auth_url, username);
-
-                let resp = client
-                    .get(auth_url)
-                    .header("X-Auth-User", username.as_str())
-                    .header("X-Auth-Key", password.as_str())
-                    .send()
-                    .await
-                    .map_err(|e| AppError::connection(
-                        format!("TempAuth request failed: {e}"),
-                        "Check auth URL and credentials.",
-                    ))?;
-
-                if !resp.status().is_success() {
-                    return Err(AppError::connection(
-                        format!("TempAuth returned {}", resp.status()),
-                        "Check username and key.",
-                    ));
-                }
-
-                let storage_url = resp
-                    .headers()
-                    .get("x-storage-url")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-                    .ok_or_else(|| AppError::connection(
-                        "TempAuth response missing X-Storage-Url",
-                        "The Swift proxy may not support TempAuth.",
-                    ))?;
-
-                let auth_token = resp
-                    .headers()
-                    .get("x-auth-token")
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from)
-                    .ok_or_else(|| AppError::connection(
-                        "TempAuth response missing X-Auth-Token",
-                        "The Swift proxy may not support TempAuth.",
-                    ))?;
-
-                Ok((storage_url, auth_token, None))
-            }
-
-            SwiftAuthMethod::Token { storage_url, auth_token } => {
-                Ok((storage_url.clone(), auth_token.clone(), None))
-            }
-        }
-    }
-
-    /// Extract the object-store endpoint from a Keystone v3 service catalog.
-    fn extract_swift_endpoint(
-        catalog: &serde_json::Value,
-        region: Option<&str>,
-    ) -> Result<String, AppError> {
-        let services = catalog
-            .pointer("/token/catalog")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| AppError::connection(
-                "Keystone catalog not found in token response",
-                "The identity service may not have a service catalog configured.",
-            ))?;
-
-        for svc in services {
-            let svc_type = svc.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if svc_type != "object-store" {
-                continue;
-            }
-            if let Some(endpoints) = svc.get("endpoints").and_then(|e| e.as_array()) {
-                // Prefer public interface, optionally filter by region
-                for ep in endpoints {
-                    let interface = ep.get("interface").and_then(|i| i.as_str()).unwrap_or("");
-                    let ep_region = ep.get("region_id").and_then(|r| r.as_str());
-                    if interface == "public" {
-                        if let Some(wanted) = region {
-                            if ep_region == Some(wanted) {
-                                if let Some(url) = ep.get("url").and_then(|u| u.as_str()) {
-                                    return Ok(url.trim_end_matches('/').to_string());
-                                }
-                            }
-                        } else if let Some(url) = ep.get("url").and_then(|u| u.as_str()) {
-                            return Ok(url.trim_end_matches('/').to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(AppError::connection(
-            "No object-store endpoint found in Keystone catalog",
-            "Ensure the Swift service is registered in the catalog for this project.",
-        ))
-    }
-
-    /// List containers in the account.
-    pub async fn list_containers(&self) -> Result<Vec<SwiftContainerInfo>, AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected to Swift", "Connect first.")
-        })?;
-
-        tracing::info!("Listing containers at: {}", _conn.storage_url);
-        // Real implementation: GET storage_url?format=json
-        Ok(vec![])
-    }
-
-    /// List objects in a container with optional prefix/delimiter.
-    pub async fn list_objects(
-        &self,
-        container: &str,
-        prefix: Option<&str>,
-        delimiter: Option<&str>,
-    ) -> Result<Vec<FileEntry>, AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected to Swift", "Connect first.")
-        })?;
-
-        tracing::info!(
-            "Listing objects in {}/{} (delimiter={:?})",
-            container,
-            prefix.unwrap_or(""),
-            delimiter
-        );
-        // Real implementation: GET storage_url/container?prefix=X&delimiter=/&format=json
-        Ok(vec![])
-    }
-
-    /// Get object metadata.
-    pub async fn get_object_meta(
-        &self,
-        container: &str,
-        object_name: &str,
-    ) -> Result<SwiftObjectMeta, AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Getting metadata for {}/{}", container, object_name);
-        Ok(SwiftObjectMeta {
-            name: object_name.to_string(),
-            container: container.to_string(),
-            content_type: None,
-            content_length: 0,
-            last_modified: None,
-            etag: None,
-            is_large_object: false,
-            custom_metadata: HashMap::new(),
-        })
-    }
-
-    /// Set custom metadata on an object.
-    pub async fn set_object_metadata(
-        &self,
-        container: &str,
-        object_name: &str,
-        metadata: HashMap<String, String>,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Setting metadata for {}/{}: {:?}", container, object_name, metadata);
-        // Real implementation: POST storage_url/container/object with X-Object-Meta-* headers
-        Ok(())
-    }
-
-    /// Copy an object within Swift.
-    pub async fn copy_object(
-        &self,
-        src_container: &str,
-        src_object: &str,
-        dst_container: &str,
-        dst_object: &str,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!(
-            "Copying {}/{} -> {}/{}",
-            src_container, src_object, dst_container, dst_object
-        );
-        // Real implementation: COPY or PUT with X-Copy-From header
-        Ok(())
-    }
-
-    /// Delete an object.
-    pub async fn delete_object(
-        &self,
-        container: &str,
-        object_name: &str,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Deleting {}/{}", container, object_name);
-        // Real implementation: DELETE storage_url/container/object
-        Ok(())
-    }
-
-    /// Generate a temporary URL for an object using HMAC-SHA256 signing.
-    pub async fn generate_temp_url(
-        &self,
-        container: &str,
-        object_name: &str,
-        expires_secs: u64,
-        method: &str,
-    ) -> Result<String, AppError> {
-        let state = self.state.read().await;
-        let conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        let key = conn.config.temp_url_key.as_ref().ok_or_else(|| {
-            AppError::file_op(
-                "TempURL key not configured",
-                "Set a TempURL key in the Swift connection settings.",
-            )
-        })?;
-
-        // Extract the path portion from storage_url
-        let storage_path = url::Url::parse(&conn.storage_url)
-            .map(|u| u.path().to_string())
-            .unwrap_or_else(|_| "/v1/AUTH_account".to_string());
-
-        let path = format!("{}/{}/{}", storage_path.trim_end_matches('/'), container, object_name);
-        let expires = chrono::Utc::now().timestamp() as u64 + expires_secs;
-
-        // HMAC-SHA256 of "METHOD\nexpires\npath"
-        let string_to_sign = format!("{}\n{}\n{}", method.to_uppercase(), expires, path);
-
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
-
-        let mut mac = HmacSha256::new_from_slice(key.as_bytes())
-            .map_err(|e| AppError::Internal { message: format!("HMAC init failed: {e}") })?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
-
-        let url = format!(
-            "{}{}?temp_url_sig={}&temp_url_expires={}",
-            conn.storage_url, path, signature, expires
-        );
-
-        tracing::info!("Generated TempURL for {}/{} (expires in {}s)", container, object_name, expires_secs);
-        Ok(url)
-    }
-
-    /// Create a container.
-    pub async fn create_container(
-        &self,
-        name: &str,
-        storage_policy: Option<&str>,
-    ) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Creating container: {} (policy={:?})", name, storage_policy);
-        // Real implementation: PUT storage_url/container
-        Ok(())
-    }
-
-    /// Delete a container (must be empty).
-    pub async fn delete_container(&self, name: &str) -> Result<(), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Deleting container: {}", name);
-        // Real implementation: DELETE storage_url/container
-        Ok(())
-    }
-
-    /// Get container ACL.
-    pub async fn get_container_acl(
-        &self,
-        container: &str,
-    ) -> Result<(Option<String>, Option<String>), AppError> {
-        let state = self.state.read().await;
-        let _conn = state.as_ref().ok_or_else(|| {
-            AppError::connection("Not connected", "Connect first.")
-        })?;
-
-        tracing::info!("Getting ACL for container: {}", container);
-        // Real implementation: HEAD storage_url/container -> X-Container-Read/Write
-        Ok((None, None))
+    };
+    let domain = match text(&s.domain_name) {
+        d if d.is_empty() => "Default".to_string(),
+        d => d,
+    };
+    let cfg = SwiftConfig {
+        auth_url,
+        auth_version: if s.auth_kind == SwiftAuthKind::TempAuth { "1".into() } else { "3".into() },
+        username: text(&profile.username),
+        user_domain: domain.clone(),
+        project: text(&s.project_name),
+        project_domain: domain,
+        region: text(&s.region),
+        application_credential_id: if s.auth_kind == SwiftAuthKind::ApplicationCredential { text(&s.application_credential_id) } else { String::new() },
+        ..Default::default()
+    };
+    match s.auth_kind {
+        SwiftAuthKind::Password if cfg.username.is_empty() || cfg.project.is_empty() => Err(AppError::validation("Enter the user name and project for Keystone sign-in")),
+        SwiftAuthKind::ApplicationCredential if cfg.application_credential_id.is_empty() => Err(AppError::validation("Enter the application credential ID")),
+        SwiftAuthKind::TempAuth if cfg.username.is_empty() => Err(AppError::validation("Enter the TempAuth user (account:user)")),
+        _ => Ok(cfg),
     }
 }
 
+/// Swift's `last_modified` (`2024-01-02T03:04:05.123456`, UTC without a zone).
+fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok().map(|t| t.and_utc())
+}
+
+fn md5_hex(b: &[u8]) -> String {
+    use md5::Digest;
+    hex::encode(md5::Md5::digest(b))
+}
+
+fn header(r: &reqwest::Response, name: &str) -> Option<String> {
+    r.headers().get(name).and_then(|v| v.to_str().ok()).map(String::from)
+}
+
+/// `/container/object` (unencoded, as a manifest lists it) → encoded request path.
+fn encoded_segment_path(p: &str) -> String {
+    let (c, k) = p.trim_start_matches('/').split_once('/').unwrap_or((p, ""));
+    object_path(&percent_decode(c), Some(&percent_decode(k)))
+}
+
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
+impl SwiftConnector {
+    pub fn new() -> Self {
+        Self { session: RwLock::new(None), segment_size: DEFAULT_SEGMENT_SIZE }
+    }
+
+    /// A connector that uploads files above `bytes` as large objects.
+    pub fn with_segment_size(bytes: u64) -> Self {
+        Self { session: RwLock::new(None), segment_size: bytes.max(1) }
+    }
+
+    async fn s(&self) -> Result<Arc<SwiftSession>, AppError> {
+        self.session.read().await.clone().ok_or_else(|| az::not_connected(WHAT))
+    }
+
+    async fn list_containers(&self) -> Result<Vec<FileEntry>, AppError> {
+        let s = self.s().await?;
+        let mut out = Vec::new();
+        let mut marker = String::new();
+        loop {
+            let page = s.list_page("Swift container listing", "", &[], &marker, LIST_PAGE).await?;
+            let Some(last) = page.last().and_then(|o| o["name"].as_str()) else { return Ok(out) };
+            marker = last.to_string();
+            for c in &page {
+                let name = c["name"].as_str().unwrap_or_default();
+                out.push(az::entry("", name, true, c["bytes"].as_u64().unwrap_or(0), c["last_modified"].as_str().and_then(parse_time)));
+            }
+        }
+    }
+
+    /// Objects and pseudo-folders directly under `prefix` (no trailing `/`).
+    async fn list_level(&self, container: &str, prefix: &str) -> Result<Vec<FileEntry>, AppError> {
+        let s = self.s().await?;
+        let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+        let parent = format!("/{container}{}", if prefix.is_empty() { String::new() } else { format!("/{prefix}") });
+        let path = object_path(container, None);
+        let q = [("prefix", pfx.clone()), ("delimiter", "/".to_string())];
+        let mut out: Vec<FileEntry> = Vec::new();
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut marker = String::new();
+        loop {
+            let page = s.list_page("Swift listing", &path, &q, &marker, LIST_PAGE).await?;
+            let Some(last) = page.last().and_then(|o| o["name"].as_str().or(o["subdir"].as_str())) else { return Ok(out) };
+            marker = last.to_string();
+            for o in &page {
+                if let Some(sub) = o["subdir"].as_str() {
+                    let n = sub.strip_prefix(&pfx).unwrap_or(sub).trim_end_matches('/');
+                    if !n.is_empty() && seen_dirs.insert(n.to_string()) {
+                        out.push(az::entry(&parent, n, true, 0, None));
+                    }
+                    continue;
+                }
+                let name = o["name"].as_str().unwrap_or_default();
+                let n = name.strip_prefix(&pfx).unwrap_or(name);
+                if n.is_empty() {
+                    continue; // this folder's own marker
+                }
+                if let Some(d) = n.strip_suffix('/') {
+                    // A folder marker listed as an object (servers without delimiter support).
+                    if !d.contains('/') && seen_dirs.insert(d.to_string()) {
+                        out.push(az::entry(&parent, d, true, 0, None));
+                    }
+                    continue;
+                }
+                out.push(az::entry(&parent, n, false, o["bytes"].as_u64().unwrap_or(0), o["last_modified"].as_str().and_then(parse_time)));
+            }
+        }
+    }
+
+    /// `true` for a Static Large Object manifest (`false` when missing).
+    async fn is_large(&self, path: &str) -> Result<bool, AppError> {
+        let r = self.s().await?.send(Method::HEAD, path, &[], &[], Bytes::new()).await?;
+        Ok(r.status().is_success() && header(&r, "x-static-large-object").is_some_and(|v| v.eq_ignore_ascii_case("true")))
+    }
+
+    /// Segment paths (`/container/object`) of a large object, or none for a plain one.
+    async fn segments_of(&self, path: &str) -> Result<Vec<String>, AppError> {
+        if !self.is_large(path).await? {
+            return Ok(Vec::new());
+        }
+        let r = self.s().await?.call("Swift manifest read", Method::GET, path, &[("multipart-manifest", "get".into())], &[], Bytes::new()).await?;
+        let v: Vec<serde_json::Value> = r.json().await.map_err(|e| http::net("Swift manifest read", e))?;
+        Ok(v.iter().filter_map(|seg| seg["name"].as_str().map(String::from)).collect())
+    }
+
+    async fn delete_segments(&self, segments: &[String]) {
+        if let Ok(s) = self.s().await {
+            for seg in segments {
+                let _ = s.send(Method::DELETE, &encoded_segment_path(seg), &[], &[], Bytes::new()).await;
+            }
+        }
+    }
+
+    async fn upload_object(&self, local: &str, remote: &str) -> Result<u64, AppError> {
+        let (container, key) = az::split_root(remote);
+        if container.is_empty() || key.is_empty() {
+            return Err(AppError::validation("Upload into a container: /container/path/file"));
+        }
+        let s = self.s().await?;
+        let path = object_path(&container, Some(&key));
+        let len = tokio::fs::metadata(local).await?.len();
+        let detect = ("X-Detect-Content-Type", "true".to_string());
+        let old_segments = self.segments_of(&path).await?;
+        if len <= self.segment_size {
+            let data = Bytes::from(tokio::fs::read(local).await?);
+            s.call("Swift upload", Method::PUT, &path, &[], &[("ETag", md5_hex(&data)), detect], data).await?;
+            self.delete_segments(&old_segments).await;
+            return Ok(len);
+        }
+
+        // Static Large Object: segments, then the manifest that joins them.
+        let seg_container = format!("{container}_segments");
+        s.call("Swift segment container creation", Method::PUT, &object_path(&seg_container, None), &[], &[], Bytes::new()).await?;
+        let base = format!("{key}/slo/{}/{len}/{}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ"), self.segment_size);
+        let mut manifest = Vec::new();
+        let mut uploaded = Vec::new();
+        let result: Result<(), AppError> = async {
+            use tokio::io::AsyncReadExt;
+            let mut file = tokio::fs::File::open(local).await?;
+            for i in 0u64.. {
+                let mut buf = Vec::with_capacity(self.segment_size as usize);
+                (&mut file).take(self.segment_size).read_to_end(&mut buf).await?;
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                let name = format!("{base}/{i:08}");
+                let etag = md5_hex(&buf);
+                let size = buf.len();
+                uploaded.push(format!("/{seg_container}/{name}"));
+                s.call("Swift segment upload", Method::PUT, &object_path(&seg_container, Some(&name)), &[], &[("ETag", etag.clone())], Bytes::from(buf)).await?;
+                manifest.push(serde_json::json!({ "path": format!("/{seg_container}/{name}"), "etag": etag, "size_bytes": size }));
+            }
+            Ok(())
+        }
+        .await;
+        let result = match result {
+            Ok(()) => {
+                let body = Bytes::from(serde_json::to_vec(&manifest).unwrap_or_default());
+                s.call("Swift large object manifest", Method::PUT, &path, &[("multipart-manifest", "put".into())], &[detect], body).await.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            self.delete_segments(&uploaded).await;
+            return Err(e);
+        }
+        self.delete_segments(&old_segments).await;
+        Ok(len)
+    }
+
+    /// `true` when `container/prefix/` holds anything besides its own marker.
+    async fn has_children(&self, container: &str, prefix: &str) -> Result<bool, AppError> {
+        let s = self.s().await?;
+        let pfx = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+        let page = s.list_page("Swift listing", &object_path(container, None), &[("prefix", pfx.clone())], "", 2).await?;
+        Ok(page.iter().any(|o| o["name"].as_str().is_some_and(|n| n != pfx)))
+    }
+
+    /// The TempURL key of the container, else of the account.
+    async fn temp_url_key(&self, container: &str) -> Result<String, AppError> {
+        let s = self.s().await?;
+        for (path, prefix) in [(object_path(container, None), "x-container-meta-temp-url-key"), (String::new(), "x-account-meta-temp-url-key")] {
+            let r = s.call("Swift metadata read", Method::HEAD, &path, &[], &[], Bytes::new()).await?;
+            if let Some(k) = [prefix.to_string(), format!("{prefix}-2")].iter().find_map(|h| header(&r, h)).filter(|k| !k.is_empty()) {
+                return Ok(k);
+            }
+        }
+        Err(AppError::connection(
+            "This Swift account has no TempURL key, so share links cannot be signed",
+            "Set one on the account or container (for example `swift post -m Temp-URL-Key:<secret>`), then try again.",
+        ))
+    }
+
+    async fn share_link(&self, remote: &str, o: &super::ShareOptions) -> Result<super::ShareLink, AppError> {
+        let hours = az::sas_hours(o)?;
+        let (container, key) = az::split_root(remote);
+        if container.is_empty() || key.is_empty() {
+            return Err(AppError::validation("Choose a file to share"));
+        }
+        let secret = self.temp_url_key(&container).await?;
+        let storage = self.s().await?.storage_url().await;
+        let url = reqwest::Url::parse(&storage).map_err(|e| AppError::internal(format!("Swift storage URL: {e}")))?;
+        let expires = chrono::Utc::now() + chrono::Duration::hours(hours as i64);
+        // The signature covers the decoded request path.
+        let signed_path = format!("{}/{container}/{key}", percent_decode(url.path()).trim_end_matches('/'));
+        Ok(super::ShareLink {
+            url: format!("{storage}{}?temp_url_sig={}&temp_url_expires={}", object_path(&container, Some(&key)), temp_url_signature(&secret, expires.timestamp(), &signed_path), expires.timestamp()),
+            expires_at: Some(expires),
+            scope: super::ShareScope::Anyone,
+            provider: "swift".into(),
+            note: Some("Read-only TempURL: anyone holding it can download until it expires, or until the TempURL key changes.".into()),
+        })
+    }
+}
+
+/// HMAC-SHA256 TempURL signature for a GET of `path` until `expires`.
+pub fn temp_url_signature(key: &str, expires: i64, path: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut m = Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()).expect("HMAC takes any key length");
+    m.update(format!("GET\n{expires}\n{path}").as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
 impl Connector for SwiftConnector {
-    fn connect(
-        &self,
-        profile: &ConnectionProfile,
-    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+    fn connect(&self, profile: &ConnectionProfile) -> Fut<'_, ()> {
+        self.connect_with_secret(profile, None)
+    }
+
+    fn connect_with_secret(&self, profile: &ConnectionProfile, secret: Option<String>) -> Fut<'_, ()> {
         let profile = profile.clone();
         Box::pin(async move {
-            let config = SwiftConfig {
-                auth_method: SwiftAuthMethod::KeystoneV3 {
-                    auth_url: format!("https://{}:{}/identity/v3", profile.host, profile.port.unwrap_or(5000)),
-                    username: profile.username.clone().unwrap_or_default(),
-                    password: String::new(), // Loaded from credential store
-                    project_name: profile.remote_path.trim_start_matches('/').to_string(),
-                    domain_name: "Default".to_string(),
-                    region: None,
-                },
-                segment_size: DEFAULT_SEGMENT_SIZE,
-                use_slo: true,
-                temp_url_key: None,
-            };
-
-            let (storage_url, auth_token, token_expires) = Self::authenticate(&config).await?;
-
-            *self.state.write().await = Some(SwiftConnection {
-                config,
-                storage_url,
-                auth_token: zeroize::Zeroizing::new(auth_token),
-                token_expires,
-                connected: true,
-            });
-
-            tracing::info!("Connected to OpenStack Swift");
+            let cfg = config_for_profile(&profile)?;
+            let secret = secret.filter(|s| !s.is_empty()).ok_or_else(|| AppError::validation("Enter the password (or application credential secret)"))?;
+            let session = Arc::new(SwiftSession::connect(cfg, secret).await?);
+            // The sign-in only proves the credentials; reading the account proves the storage URL works.
+            session.call("Swift account read", Method::HEAD, "", &[], &[], Bytes::new()).await?;
+            *self.session.write().await = Some(session);
             Ok(())
         })
     }
 
-    fn disconnect(&self) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+    fn disconnect(&self) -> Fut<'_, ()> {
         Box::pin(async move {
-            *self.state.write().await = None;
-            tracing::info!("Disconnected from OpenStack Swift");
+            *self.session.write().await = None;
             Ok(())
         })
     }
 
-    fn list_remote(
-        &self,
-        path: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>> {
-        let path = path.to_string();
+    fn list_remote(&self, path: &str) -> Fut<'_, Vec<FileEntry>> {
+        let (container, prefix) = az::split_root(path);
         Box::pin(async move {
-            let state = self.state.read().await;
-            let _conn = state.as_ref().ok_or_else(|| {
-                AppError::connection("Not connected to OpenStack Swift", "Connect first.")
-            })?;
-
-            if path == "/" || path.is_empty() {
-                let containers = self.list_containers().await?;
-                Ok(containers
-                    .into_iter()
-                    .map(|c| FileEntry {
-                        name: c.name.clone(),
-                        path: format!("/{}", c.name),
-                        is_dir: true,
-                        is_symlink: false,
-                        size: c.bytes_used,
-                        modified: None,
-                        created: None,
-                        is_hidden: false,
-                        extension: None,
-                        permissions: None,
-                    })
-                    .collect())
+            if container.is_empty() {
+                self.list_containers().await
             } else {
-                let parts: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
-                let container = parts[0];
-                let prefix = parts.get(1).copied();
-                self.list_objects(container, prefix, Some("/")).await
+                self.list_level(&container, &prefix).await
             }
         })
     }
 
     fn is_connected(&self) -> bool {
-        self.state
-            .try_read()
-            .map(|s| s.as_ref().map(|c| c.connected).unwrap_or(false))
-            .unwrap_or(false)
+        self.session.try_read().map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    fn upload(&self, local_path: &str, remote_path: &str) -> Fut<'_, u64> {
+        let (l, r) = (local_path.to_string(), remote_path.to_string());
+        Box::pin(async move { self.upload_object(&l, &r).await })
+    }
+
+    fn download(&self, remote_path: &str, local_path: &str) -> Fut<'_, u64> {
+        let (container, key) = az::split_root(remote_path);
+        let l = local_path.to_string();
+        Box::pin(async move {
+            if key.is_empty() {
+                return Err(AppError::validation("Choose a file to download"));
+            }
+            let r = self.s().await?.call("Swift download", Method::GET, &object_path(&container, Some(&key)), &[], &[], Bytes::new()).await?;
+            az::save_body_as(r, &l, "Swift download").await
+        })
+    }
+
+    fn make_directory(&self, remote_path: &str) -> Fut<'_, ()> {
+        let (container, dir) = az::split_root(remote_path);
+        Box::pin(async move {
+            let s = self.s().await?;
+            if container.is_empty() {
+                return Err(AppError::validation("Give the folder or container name"));
+            }
+            if dir.is_empty() {
+                s.call("Swift container creation", Method::PUT, &object_path(&container, None), &[], &[], Bytes::new()).await?;
+                return Ok(());
+            }
+            let ct = ("Content-Type", "application/directory".to_string());
+            s.call("Swift folder creation", Method::PUT, &object_path(&container, Some(&format!("{dir}/"))), &[], &[ct], Bytes::new()).await?;
+            Ok(())
+        })
+    }
+
+    fn remove(&self, remote_path: &str, is_dir: bool) -> Fut<'_, ()> {
+        let (container, key) = az::split_root(remote_path);
+        let remote_path = remote_path.to_string();
+        Box::pin(async move {
+            let s = self.s().await?;
+            if container.is_empty() {
+                return Err(AppError::validation("Choose what to delete"));
+            }
+            if is_dir || key.is_empty() {
+                if self.has_children(&container, &key).await? {
+                    return Err(AppError::validation(format!("{remote_path} is not empty")));
+                }
+                if key.is_empty() {
+                    s.call("Swift container delete", Method::DELETE, &object_path(&container, None), &[], &[], Bytes::new()).await?;
+                    return Ok(());
+                }
+                // Pseudo-folders may have no marker; deleting a missing one is fine.
+                let r = s.send(Method::DELETE, &object_path(&container, Some(&format!("{key}/"))), &[], &[], Bytes::new()).await?;
+                if !(r.status().is_success() || r.status().as_u16() == 404) {
+                    http::check(r, "Swift folder delete").await?;
+                }
+                return Ok(());
+            }
+            let path = object_path(&container, Some(&key));
+            // A large object's manifest delete removes its segments too.
+            let q: &[(&str, String)] = if self.is_large(&path).await? { &[("multipart-manifest", "delete".to_string())] } else { &[] };
+            s.call("Swift delete", Method::DELETE, &path, q, &[], Bytes::new()).await?;
+            Ok(())
+        })
+    }
+
+    fn create_share_link(&self, remote_path: &str, options: &super::ShareOptions) -> Fut<'_, super::ShareLink> {
+        let (r, o) = (remote_path.to_string(), options.clone());
+        Box::pin(async move { self.share_link(&r, &o).await })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_access_tier_default() {
-        let config = SwiftConfig::default();
-        assert!(config.use_slo);
-        assert_eq!(config.segment_size, DEFAULT_SEGMENT_SIZE);
-    }
-
-    #[tokio::test]
-    async fn test_connector_lifecycle() {
-        let connector = SwiftConnector::new();
-        assert!(!connector.is_connected());
-    }
-}
+#[path = "swift_tests.rs"]
+mod tests;

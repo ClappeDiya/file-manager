@@ -17,31 +17,52 @@
 //! - Backblaze B2 (T-030): Native API, large file uploads, S3 compatibility
 //! - Peer (T-031): mDNS/Bonjour peer discovery, TLS encrypted peer-to-peer transfer
 //! - Server-to-Server (T-033): Direct transfer between remote endpoints
-//! - Azure Blob Storage: SAS/AD auth, container/blob ops, access tiers, SAS URLs
+//! - Azure Blob Storage, Data Lake Storage Gen2 and Files: Shared Key, SAS or
+//!   connection string (`azure_rest`), file ops, read-only SAS links
 //! - OpenStack Swift: Keystone v3/TempAuth, container/object ops, SLO/DLO, TempURL
 
+pub mod folder_size;
+pub mod walk;
+pub mod presets;
+pub mod rclone;
 pub mod connection_manager;
+pub mod known_hosts;
 pub mod ftp;
 pub mod import_profiles;
 pub mod local_drive;
 pub mod nfs;
 pub mod peer;
+pub mod peer_wire;
 pub mod server_to_server;
 pub mod sftp;
 pub mod smb;
+pub mod smb_native;
 pub mod webdav;
 // T-026..T-030: Cloud connectors
 pub mod b2;
 pub mod dropbox;
 pub mod google_drive;
+pub mod google_errors;
 pub mod oauth;
+pub mod oauth_flow;
 pub mod onedrive;
 pub mod s3;
 // AWS credential chain, SSO, and STS federation
+pub mod aws_chain;
 pub mod aws_credentials;
 // Azure Blob Storage and OpenStack Swift connectors
 pub mod azure_blob;
 pub mod openstack_swift;
+pub mod azure_rest;
+pub mod azure_ad;
+pub mod azure_adls;
+pub mod azure_files;
+#[cfg(test)]
+pub(crate) mod azure_tests;
+#[cfg(test)]
+pub(crate) mod mock_http;
+#[cfg(test)]
+mod oauth_tests;
 
 use crate::core::error::AppError;
 use crate::core::types::{ConnectionProfile, ConnectionProtocol, FileEntry};
@@ -65,10 +86,106 @@ pub use onedrive::OneDriveConnector;
 pub use s3::S3Connector;
 // Azure Blob Storage and OpenStack Swift
 pub use azure_blob::AzureBlobConnector;
+pub use azure_adls::AdlsGen2Connector;
+pub use azure_files::AzureFilesConnector;
 pub use openstack_swift::SwiftConnector;
 // T-031, T-033: Peer and server-to-server
 pub use peer::PeerManager;
 pub use server_to_server::ServerTransferManager;
+
+/// Who a share link opens to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareScope {
+    /// Anyone with the link.
+    #[default]
+    Anyone,
+    /// Only people in the account's organization (OneDrive / Dropbox teams).
+    Organization,
+}
+
+/// What a share link should allow.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ShareOptions {
+    /// Link lifetime; `None` = the provider's default (or no expiry).
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+    /// Password the recipient must enter (where the provider supports it).
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub scope: ShareScope,
+    /// Recipients may edit, not only view.
+    #[serde(default)]
+    pub allow_edit: bool,
+}
+
+/// A created share link.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ShareLink {
+    pub url: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub scope: ShareScope,
+    pub provider: String,
+    /// Caveats worth showing (e.g. "an existing link was reused").
+    pub note: Option<String>,
+}
+
+/// Everything secret a saved connection keeps in the credential store.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConnectionSecrets {
+    /// Password, access secret, private-key path, bearer token or OAuth
+    /// grant, depending on the protocol.
+    pub secret: Option<String>,
+    /// SFTP: passphrase of the private key.
+    pub key_passphrase: Option<String>,
+}
+
+impl ConnectionSecrets {
+    pub fn new(secret: Option<String>) -> Self {
+        Self { secret, key_passphrase: None }
+    }
+}
+
+impl std::fmt::Debug for ConnectionSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionSecrets")
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("key_passphrase", &self.key_passphrase.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A byte count that providers send as a number or a decimal string.
+pub(crate) fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+pub(crate) fn share_unsupported(what: &str) -> AppError {
+    AppError::validation(format!("This provider can't {what} on share links"))
+}
+
+/// Storage space of a remote account. Every figure is optional: providers
+/// report different subsets (an unlimited plan has no total).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteQuota {
+    pub total: Option<u64>,
+    pub used: Option<u64>,
+    pub free: Option<u64>,
+    /// In the provider's trash / recycle bin.
+    pub trashed: Option<u64>,
+}
+
+/// Size of a remote folder and everything below it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FolderSize {
+    pub bytes: u64,
+    pub files: u64,
+    /// `None` when the server-side figure does not count folders (rclone).
+    pub folders: Option<u64>,
+    /// `false` when the walk was cancelled (the figures are partial).
+    pub complete: bool,
+}
 
 /// Trait for remote filesystem connectors.
 pub trait Connector: Send + Sync {
@@ -80,6 +197,24 @@ pub trait Connector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<FileEntry>, AppError>> + Send + '_>>;
     fn is_connected(&self) -> bool;
 
+    /// The saved connection this instance is signed in as, for connectors
+    /// whose one shared instance can serve several accounts (Google Drive,
+    /// Dropbox, OneDrive, B2). `None`: not tracked (the default) or not
+    /// connected.
+    fn connected_profile_id(&self) -> Option<uuid::Uuid> {
+        None
+    }
+
+    /// A new, disconnected instance configured like this one (endpoints,
+    /// credential store), for connectors that track
+    /// [`Connector::connected_profile_id`]. An action for an account other
+    /// than the one this shared instance is signed in as runs on it, so the
+    /// instance the user is browsing is never re-signed behind their back.
+    /// `None` (the default): not tracked.
+    fn detached(&self) -> Option<Arc<dyn Connector>> {
+        None
+    }
+
     /// Connect using a secret held in the credential store (password, access
     /// secret, or private-key path, depending on the protocol). Connectors
     /// that need no secret fall back to [`Connector::connect`].
@@ -89,6 +224,16 @@ pub trait Connector: Send + Sync {
         _secret: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         self.connect(profile)
+    }
+
+    /// Connect with every stored secret of the connection. Only connectors
+    /// with more than one secret (SFTP key + passphrase) override this.
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        secrets: ConnectionSecrets,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        self.connect_with_secret(profile, secrets.secret)
     }
 
     /// Upload a local file to `remote_path`; returns bytes written.
@@ -117,6 +262,18 @@ pub trait Connector: Send + Sync {
         Box::pin(async { Err(unsupported_op("create folder")) })
     }
 
+    /// Create a remote directory and return its path as this connector
+    /// lists it, which is where its contents go. Path-based connectors
+    /// return `remote_path` (the default); Google Drive addresses folders
+    /// by id, so it returns the parent's path plus the new folder's id.
+    fn make_directory_path(&self, remote_path: &str) -> Pin<Box<dyn Future<Output = Result<String, AppError>> + Send + '_>> {
+        let path = remote_path.to_string();
+        Box::pin(async move {
+            self.make_directory(&path).await?;
+            Ok(path)
+        })
+    }
+
     /// Delete a remote file or (empty) directory.
     fn remove(
         &self,
@@ -125,6 +282,168 @@ pub trait Connector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
         Box::pin(async { Err(unsupported_op("delete")) })
     }
+
+    /// Rename or move `from` to `to` on the server (both remote paths of
+    /// this connection). Connectors without a server-side rename keep the
+    /// default, which refuses; callers then copy and delete instead.
+    fn rename_entry(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+        Box::pin(async {
+            Err(AppError::Connection {
+                message: "Renaming is not supported for this connection type.".to_string(),
+                advice: "Copy the item under the new name, then delete the original.".to_string(),
+            })
+        })
+    }
+
+    /// Where the item at `from` is listed after `rename_entry(from, to)`:
+    /// `to` for path-based connectors (the default). Google Drive keeps the
+    /// item's id, so it is the new parent's path plus that id.
+    fn renamed_path(&self, _from: &str, to: &str) -> String {
+        to.to_string()
+    }
+
+    /// Copy the file `from` to `to` on the server without the bytes passing
+    /// through this machine. `Ok(false)` (the default): not supported here,
+    /// relay it (download + upload) instead.
+    fn server_copy(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// The local file name `entry` is saved as when downloaded (Google Drive
+    /// exports native documents and adds the format's extension).
+    fn download_name(&self, entry: &FileEntry) -> String {
+        entry.name.clone()
+    }
+
+    /// Whether downloading `entry` converts it (Google Drive exports native
+    /// documents) rather than copying its bytes. A pane move of such a file
+    /// out of its connection keeps the original.
+    fn converts_on_download(&self, _entry: &FileEntry) -> bool {
+        false
+    }
+
+    /// Storage quota of the connected account; `None` when the protocol
+    /// has no notion of it (the default).
+    fn quota(&self) -> Pin<Box<dyn Future<Output = Result<Option<RemoteQuota>, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// A server-side size of `remote_path` (rclone `size`), when the
+    /// protocol has one; `None` (the default) = walk the listing instead.
+    fn folder_size_fast(&self, _remote_path: &str) -> Pin<Box<dyn Future<Output = Result<Option<FolderSize>, AppError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Create a link others can open `remote_path` with.
+    fn create_share_link(
+        &self,
+        _remote_path: &str,
+        _options: &ShareOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<ShareLink, AppError>> + Send + '_>> {
+        Box::pin(async {
+            Err(AppError::Connection {
+                message: "Share links are not available for this connection type.".to_string(),
+                advice: "Share links work with S3, Azure Blob, OneDrive, Dropbox and Google Drive.".to_string(),
+            })
+        })
+    }
+}
+
+/// Whether `connector` can serve saved connection `id` as it is: connected
+/// and, when it tracks who it is signed in as, signed in as that one (so an
+/// action for one account never runs against another of the same
+/// provider).
+pub fn connected_as<C: Connector + ?Sized>(connector: &C, id: Option<uuid::Uuid>) -> bool {
+    connector.is_connected()
+        && match (id, connector.connected_profile_id()) {
+            (Some(want), Some(have)) => want == have,
+            _ => true,
+        }
+}
+
+/// Suffix of a file still being uploaded (`.<name>.ufop-part`).
+pub const STAGING_SUFFIX: &str = ".ufop-part";
+
+/// The longest file name most file systems take (bytes on ext4/APFS, UTF-16
+/// units on NTFS, which is never fewer).
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// The hidden staging name `.{name}{tail}` of a file, kept within
+/// [`MAX_NAME_BYTES`]: a name too long for it is cut (at a character) and a
+/// hash of the whole name added, so two long names never share one.
+pub fn staging_name(name: &str, tail: &str) -> String {
+    let full = format!(".{name}{tail}");
+    if full.len() <= MAX_NAME_BYTES {
+        return full;
+    }
+    let hash = format!("~{:016x}", xxhash_rust::xxh3::xxh3_64(name.as_bytes()));
+    let mut keep = MAX_NAME_BYTES.saturating_sub(1 + hash.len() + tail.len());
+    while !name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!(".{}{hash}{tail}", &name[..keep])
+}
+
+/// Where an upload to `remote` is written before it is renamed into place:
+/// a hidden sibling, so watchers and readers never see a half-written file.
+pub fn staging_path(remote: &str) -> String {
+    match remote.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/{}", staging_name(name, STAGING_SUFFIX)),
+        None => staging_name(remote, STAGING_SUFFIX),
+    }
+}
+
+/// [`staging_path`] of a local file (with the platform's separator).
+pub fn staging_path_local(local: &str) -> String {
+    let p = std::path::Path::new(local);
+    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    p.with_file_name(staging_name(&name, STAGING_SUFFIX)).to_string_lossy().to_string()
+}
+
+/// Upload via a temporary name, then rename into place. If the rename
+/// fails (some servers won't rename over an existing file), the old file
+/// is removed and the rename retried. A failed upload leaves no partial
+/// file behind.
+pub(crate) async fn staged_upload<U, UF, R, RF, D, DF>(remote: &str, upload: U, rename: R, delete: D) -> Result<u64, AppError>
+where
+    U: FnOnce(String) -> UF,
+    UF: Future<Output = Result<u64, AppError>>,
+    R: Fn(String, String) -> RF,
+    RF: Future<Output = Result<(), AppError>>,
+    D: Fn(String) -> DF,
+    DF: Future<Output = Result<(), AppError>>,
+{
+    let temp = staging_path(remote);
+    let bytes = match upload(temp.clone()).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = delete(temp).await;
+            return Err(e);
+        }
+    };
+    if rename(temp.clone(), remote.to_string()).await.is_ok() {
+        return Ok(bytes);
+    }
+    let retried = match delete(remote.to_string()).await {
+        Ok(()) => rename(temp.clone(), remote.to_string()).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = retried {
+        let _ = delete(temp).await;
+        return Err(AppError::Connection {
+            message: format!("Uploaded, but could not move it into place as {remote}: {e}"),
+            advice: "Check you may rename and replace files in that folder.".into(),
+        });
+    }
+    Ok(bytes)
 }
 
 fn unsupported_op(what: &str) -> AppError {
@@ -146,7 +465,9 @@ pub(crate) fn split_bucket_key(path: &str) -> Result<(String, String), AppError>
     }
 }
 
-/// Registry that maps protocols to connector implementations.
+/// Registry that maps protocols to connector implementations. Clones share
+/// the same connector instances.
+#[derive(Clone)]
 pub struct ConnectorRegistry {
     connectors: HashMap<String, Arc<dyn Connector>>,
 }
@@ -173,8 +494,22 @@ impl ConnectorRegistry {
         registry.register("b2", Arc::new(B2Connector::new()));
         // Azure Blob Storage and OpenStack Swift
         registry.register("azure_blob", Arc::new(AzureBlobConnector::new()));
+        registry.register("adls_gen2", Arc::new(AdlsGen2Connector::new()));
+        registry.register("azure_files", Arc::new(AzureFilesConnector::new()));
         registry.register("swift", Arc::new(SwiftConnector::new()));
+        registry.register("rclone", Arc::new(rclone::RcloneConnector::new()));
 
+        registry
+    }
+
+    /// The built-in connectors, with these OAuth connector instances (built
+    /// with the app's credential store, so rotated tokens are saved, and
+    /// shared with the commands that need their typed APIs).
+    pub fn with_cloud(gdrive: Arc<GoogleDriveConnector>, dropbox: Arc<DropboxConnector>, onedrive: Arc<OneDriveConnector>) -> Self {
+        let mut registry = Self::new();
+        registry.register("google_drive", gdrive);
+        registry.register("dropbox", dropbox);
+        registry.register("onedrive", onedrive);
         registry
     }
 
@@ -208,6 +543,85 @@ impl Default for ConnectorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_names() {
+        assert_eq!(staging_path("/in/report.pdf"), "/in/.report.pdf.ufop-part");
+        assert_eq!(staging_path("report.pdf"), ".report.pdf.ufop-part");
+    }
+
+    // Regression (WS-Z2): a name near the 255-byte limit got a staging name
+    // past it, so the upload (or download) failed with "name too long".
+    #[test]
+    fn staging_names_of_long_names_fit_and_stay_apart() {
+        let long = |c: char| format!("{}{c}.txt", "é".repeat(124));
+        let (a, b) = (long('a'), long('b'));
+        assert!(a.len() > 250);
+        let (sa, sb) = (staging_path(&format!("/in/{a}")), staging_path(&format!("/in/{b}")));
+        let name = |s: &str| s.rsplit('/').next().unwrap().to_string();
+        assert!(name(&sa).len() <= MAX_NAME_BYTES, "{}", name(&sa).len());
+        assert!(name(&sa).starts_with(".é") && name(&sa).ends_with(STAGING_SUFFIX));
+        assert_ne!(sa, sb, "two long names that differ at the end get their own staging file");
+        assert_eq!(staging_name("a.txt", ".x"), ".a.txt.x");
+    }
+
+    #[tokio::test]
+    async fn staged_upload_renames_replaces_and_cleans_up() {
+        use std::sync::Mutex;
+        let fs: Arc<Mutex<std::collections::HashMap<String, &'static str>>> = Default::default();
+        let log: Arc<Mutex<Vec<String>>> = Default::default();
+        // A server whose rename refuses to overwrite (like SFTP v3).
+        let server = |fail_upload: bool| {
+            let (fs, log) = (fs.clone(), log.clone());
+            let (fs2, log2, fs3, log3) = (fs.clone(), log.clone(), fs.clone(), log.clone());
+            (
+                move |p: String| {
+                    let (fs, log) = (fs.clone(), log.clone());
+                    async move {
+                        log.lock().unwrap().push(format!("up {p}"));
+                        fs.lock().unwrap().insert(p, "new");
+                        if fail_upload { Err(AppError::validation("network")) } else { Ok(3) }
+                    }
+                },
+                move |from: String, to: String| {
+                    let (fs, log) = (fs2.clone(), log2.clone());
+                    async move {
+                        log.lock().unwrap().push(format!("mv {from} {to}"));
+                        let mut m = fs.lock().unwrap();
+                        if m.contains_key(&to) {
+                            return Err(AppError::validation("exists"));
+                        }
+                        let v = m.remove(&from).unwrap();
+                        m.insert(to, v);
+                        Ok(())
+                    }
+                },
+                move |p: String| {
+                    let (fs, log) = (fs3.clone(), log3.clone());
+                    async move {
+                        log.lock().unwrap().push(format!("rm {p}"));
+                        fs.lock().unwrap().remove(&p);
+                        Ok(())
+                    }
+                },
+            )
+        };
+        let (u, r, d) = server(false);
+        assert_eq!(staged_upload("/d/a.txt", u, &r, &d).await.unwrap(), 3);
+        assert_eq!(fs.lock().unwrap().get("/d/a.txt"), Some(&"new"));
+        // Replacing an existing file: delete then rename.
+        fs.lock().unwrap().insert("/d/a.txt".into(), "old");
+        let (u, r, d) = server(false);
+        staged_upload("/d/a.txt", u, &r, &d).await.unwrap();
+        assert_eq!(fs.lock().unwrap().get("/d/a.txt"), Some(&"new"));
+        assert_eq!(fs.lock().unwrap().len(), 1, "no temp file left");
+        // Failed upload: the partial temp file is removed, the target untouched.
+        fs.lock().unwrap().insert("/d/a.txt".into(), "old");
+        let (u, r, d) = server(true);
+        assert!(staged_upload("/d/a.txt", u, &r, &d).await.is_err());
+        assert_eq!(fs.lock().unwrap().get("/d/a.txt"), Some(&"old"));
+        assert_eq!(fs.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn test_registry_creation() {
@@ -270,7 +684,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod live_tests {
+pub(crate) mod live_tests {
     //! Live round-trip tests against real servers. They are skipped unless
     //! `UFOP_LIVE=1`, so `cargo test` stays hermetic. Servers (see docs): SFTP on
     //! :2222, FTP on :2121, WebDAV on :8080, S3 (adobe/s3mock) on :9090.
@@ -281,7 +695,7 @@ mod live_tests {
         std::env::var("UFOP_LIVE").map(|v| v == "1").unwrap_or(false)
     }
 
-    fn profile(protocol: ConnectionProtocol, host: &str, port: Option<u16>, user: &str, remote_path: &str) -> ConnectionProfile {
+    pub(crate) fn profile(protocol: ConnectionProtocol, host: &str, port: Option<u16>, user: &str, remote_path: &str) -> ConnectionProfile {
         ConnectionProfile {
             id: uuid::Uuid::new_v4(),
             name: "live".into(),
@@ -313,11 +727,12 @@ mod live_tests {
             ftp_force_passive_ip: None,
             ftp_post_login_commands: None,
             symlink_policy: None,
+            extras: Default::default(),
         }
     }
 
     /// connect → mkdir → upload (multi-MB, patterned) → list → download → byte-compare → delete.
-    async fn round_trip(protocol: &str, p: ConnectionProfile, secret: Option<&str>, dir: &str) {
+    pub(crate) async fn round_trip(protocol: &str, p: ConnectionProfile, secret: Option<&str>, dir: &str) {
         let registry = ConnectorRegistry::new();
         let c = registry.get(protocol).unwrap();
         c.connect_with_secret(&p, secret.map(String::from)).await.unwrap_or_else(|e| panic!("{protocol} connect: {e}"));

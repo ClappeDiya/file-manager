@@ -2,6 +2,8 @@
 //!
 //! Provides `AuditLogger` implementing `AuditOperations`.
 
+pub mod ediscovery;
+
 use crate::core::error::AppError;
 use crate::core::traits::{AuditOperations, BoxFuture};
 use crate::core::types::AuditEvent;

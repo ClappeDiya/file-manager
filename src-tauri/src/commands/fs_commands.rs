@@ -19,6 +19,7 @@ pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, AppError> {
 pub async fn pick_folder(
     window: tauri::Window,
     title: Option<String>,
+    default_path: Option<String>,
 ) -> Result<Option<String>, AppError> {
     use tauri_plugin_dialog::DialogExt;
     use tauri::Manager;
@@ -34,6 +35,11 @@ pub async fn pick_folder(
         dialog.set_title(t)
     } else {
         dialog
+    };
+    // Open in the user's default folder (Settings › General) when given.
+    let dialog = match default_path.filter(|p| std::path::Path::new(p).is_dir()) {
+        Some(p) => dialog.set_directory(p),
+        None => dialog,
     };
 
     // Use async pick_folder with a oneshot channel so we don't block
@@ -55,6 +61,7 @@ pub async fn pick_folder(
 pub async fn pick_files(
     window: tauri::Window,
     title: Option<String>,
+    default_path: Option<String>,
 ) -> Result<Vec<String>, AppError> {
     use tauri::Manager;
     use tauri_plugin_dialog::DialogExt;
@@ -63,6 +70,10 @@ pub async fn pick_files(
     #[cfg(any(windows, target_os = "macos"))]
     let dialog = dialog.set_parent(&window);
     let dialog = if let Some(t) = title { dialog.set_title(t) } else { dialog };
+    let dialog = match default_path.filter(|p| std::path::Path::new(p).is_dir()) {
+        Some(p) => dialog.set_directory(p),
+        None => dialog,
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     dialog.pick_files(move |files| {
@@ -71,6 +82,37 @@ pub async fn pick_files(
     rx.await.map_err(|_| AppError::Internal {
         message: "File picker was cancelled or failed to respond".to_string(),
     })
+}
+
+/// Native "save as" dialog; `None` when cancelled. `default_name` pre-fills
+/// the file name; `extensions` limits the file types offered.
+#[tauri::command]
+pub async fn pick_save_file(
+    window: tauri::Window,
+    title: Option<String>,
+    default_name: Option<String>,
+    extensions: Option<Vec<String>>,
+) -> Result<Option<String>, AppError> {
+    use tauri::Manager;
+    use tauri_plugin_dialog::DialogExt;
+
+    let dialog = window.app_handle().dialog().file();
+    #[cfg(any(windows, target_os = "macos"))]
+    let dialog = dialog.set_parent(&window);
+    let dialog = if let Some(t) = title { dialog.set_title(t) } else { dialog };
+    let dialog = if let Some(n) = default_name.filter(|n| !n.is_empty()) { dialog.set_file_name(n) } else { dialog };
+    let exts: Vec<String> = extensions.unwrap_or_default();
+    let dialog = if exts.is_empty() {
+        dialog
+    } else {
+        let refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        dialog.add_filter("Archive", &refs)
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.save_file(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+    rx.await.map_err(|_| AppError::Internal { message: "Save dialog was cancelled or failed to respond".to_string() })
 }
 
 /// Maximum byte size for full-content text read/write. Matches the

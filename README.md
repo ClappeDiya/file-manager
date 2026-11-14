@@ -11,7 +11,7 @@
 A unified replacement for ForkLift, Transmit, Cyberduck, Rclone-GUI, and the file manager built into your OS — one app that does:
 
 - **Dual-pane browsing** — local + remote side-by-side
-- **17 protocols** — SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB/CIFS, NFS, FTP/FTPS, Backblaze B2, Azure Blob, OpenStack Swift, mDNS peer-to-peer, server-to-server relay, and more
+- **17 protocols** — SFTP, S3, Google Drive, Dropbox, OneDrive, WebDAV, SMB/CIFS, NFS, FTP/FTPS, Backblaze B2, Azure Blob, Azure Data Lake Gen2, Azure Files, OpenStack Swift, mDNS peer-to-peer, server-to-server relay, and more
 - **Crash-safe transfers** — resume from anywhere, integrity-verified with xxHash3 + SHA-256, atomic rename, journal-backed
 - **Real-time bidirectional sync** — conflict resolution, redaction rules, scheduled or continuous
 - **Local AI assistant** — runs against your own Ollama; no API keys, no cloud calls, no data leaving your box
@@ -32,6 +32,18 @@ winget install UFOP.UnifiedFileOps
 ```
 
 All installers are code-signed and auto-update.
+
+Command-line tools (`ufop`, `ufop-server`) with shell completions and man pages: `ufop-<version>-<target>.tar.gz`/`.zip` or `ufop_<version>_amd64.deb` on the [releases page](https://github.com/ClappeDiya/file-manager/releases); `ufop completions bash|zsh|fish|powershell|elvish` prints a completion script for manual installs.
+
+### Verify a download
+
+Every release has `SHA256SUMS`, signed with the same minisign key the app uses for updates (`SHA256SUMS.minisig`) and optionally GPG (`SHA256SUMS.asc`). Put them next to your downloads and run:
+
+```bash
+./scripts/verify-release.sh --dir ~/Downloads        # minisign, the ufop CLI or OpenSSL 3; then SHA-256 of each file
+ufop verify-release ~/Downloads/SHA256SUMS            # the same check with the CLI
+minisign -Vm SHA256SUMS -P RWQOqigyl5kY9Vj4LeRcZ2DMlAEY85jWjDqOZ94gBgYhSd1TOsJ0nxzZ && sha256sum -c --ignore-missing SHA256SUMS
+```
 
 ## Pricing
 
@@ -57,3 +69,5 @@ Source-available under [PolyForm Shield 1.0.0](LICENSE). Free for any use except
 ## Contributing & Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, architecture overview, and the AI-agent governance setup used by this repo.
+
+To report a security vulnerability privately, see [SECURITY.md](SECURITY.md).

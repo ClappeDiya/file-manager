@@ -69,7 +69,6 @@ function CreateVaultForm({ onCreated, onCancel }: {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [encryptPatterns, setEncryptPatterns] = useState("");
   const [excludePatterns, setExcludePatterns] = useState("");
-  const [cryptomatorCompat, setCryptomatorCompat] = useState(false);
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
 
@@ -98,7 +97,6 @@ function CreateVaultForm({ onCreated, onCancel }: {
         excludePatterns: excludePatterns
           ? excludePatterns.split(",").map((s) => s.trim())
           : undefined,
-        cryptomatorCompat: cryptomatorCompat || undefined,
       });
       onCreated();
     } catch (err) {
@@ -181,15 +179,7 @@ function CreateVaultForm({ onCreated, onCancel }: {
           className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
         />
       </div>
-      <label className="flex items-center gap-2 text-sm cursor-pointer">
-        <input
-          type="checkbox"
-          checked={cryptomatorCompat}
-          onChange={(e) => setCryptomatorCompat(e.target.checked)}
-          className="rounded"
-        />
-        Cryptomator compatible
-      </label>
+      {/* No Cryptomator option: vaults use UFOP's own format only (see security/vault.rs). */}
       {error && (
         <p className="text-xs text-red-500">{error}</p>
       )}
@@ -247,9 +237,6 @@ function VaultItem({
             title={isUnlocked(vault) ? "Unlocked" : "Locked"}
           />
           <span className="text-sm font-medium truncate">{vault.name}</span>
-          {vault.cryptomator_compat && (
-            <span className="text-xs text-gray-400 dark:text-gray-500">CM</span>
-          )}
         </div>
         <div className="text-xs text-gray-500 dark:text-gray-400 truncate ml-4">
           {vault.path}

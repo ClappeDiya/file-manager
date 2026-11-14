@@ -6,7 +6,6 @@
 use crate::core::error::AppError;
 use crate::core::traits::StorageOperations;
 use crate::storage::Repository;
-use serde::{Deserialize, Serialize};
 use tauri::State;
 use tauri_plugin_notification::NotificationExt;
 
@@ -14,32 +13,10 @@ use tauri_plugin_notification::NotificationExt;
 // Types
 // ──────────────────────────────────────────────
 
-/// Config key used to persist notification preferences.
-const NOTIFICATION_PREFS_KEY: &str = "notification_prefs";
-
-/// Notification preference configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationPrefs {
-    pub transfer_complete: bool,
-    pub transfer_failed: bool,
-    pub sync_complete: bool,
-    pub sync_failed: bool,
-    pub connection_lost: bool,
-    pub only_when_backgrounded: bool,
-}
-
-impl Default for NotificationPrefs {
-    fn default() -> Self {
-        Self {
-            transfer_complete: true,
-            transfer_failed: true,
-            sync_complete: false,
-            sync_failed: true,
-            connection_lost: false,
-            only_when_backgrounded: true,
-        }
-    }
-}
+/// The preferences are shared with the code that acts on them
+/// (`notify_hub::desktop`), so what Settings saves is what raises toasts.
+pub use crate::notify_hub::desktop::NotificationPrefs;
+use crate::notify_hub::desktop::{parse_prefs, NOTIFICATION_PREFS_KEY};
 
 // ──────────────────────────────────────────────
 // Commands
@@ -52,19 +29,13 @@ pub async fn get_notification_prefs(
     repo: State<'_, Repository>,
 ) -> Result<NotificationPrefs, AppError> {
     let value = StorageOperations::get_config(repo.inner(), NOTIFICATION_PREFS_KEY).await?;
-    match value {
-        Some(json_str) => {
-            let prefs: NotificationPrefs = serde_json::from_str(&json_str).map_err(|e| {
-                tracing::warn!("Invalid notification prefs in config, using defaults: {e}");
-                AppError::state(
-                    "Notification preferences were corrupted",
-                    "Defaults have been restored. You can reconfigure in Settings.",
-                )
-            })?;
-            Ok(prefs)
-        }
-        None => Ok(NotificationPrefs::default()),
-    }
+    parse_prefs(value.as_deref()).map_err(|e| {
+        tracing::warn!("Invalid notification prefs in config, using defaults: {e}");
+        AppError::state(
+            "Notification preferences were corrupted",
+            "Defaults have been restored. You can reconfigure in Settings.",
+        )
+    })
 }
 
 /// Save notification preferences to the config table as JSON.

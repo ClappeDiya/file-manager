@@ -26,6 +26,32 @@ pub async fn ai_explain_error(
     Ok(explanation)
 }
 
+// ── Help and reports ──
+
+/// Answer a question from the bundled documentation (grounded by the local model when available).
+#[tauri::command]
+pub async fn ai_help(question: String, assistant: State<'_, AiAssistant>) -> Result<crate::ai_engine::HelpAnswer, AppError> {
+    if question.trim().is_empty() {
+        return Err(AppError::validation("Ask a question"));
+    }
+    Ok(assistant.help(&question).await)
+}
+
+/// What automation rules and file operations did over the last `days` (1–90).
+#[tauri::command]
+pub async fn ai_activity_report(
+    days: u32,
+    assistant: State<'_, AiAssistant>,
+    automation: State<'_, AutomationManager>,
+    ledger: State<'_, crate::ledger::OperationLedger>,
+    repo: State<'_, Repository>,
+) -> Result<crate::ai_engine::report::ActivityReport, AppError> {
+    let days = days.clamp(1, 90);
+    let logs = automation.list_logs(&repo, None, 10_000).await?;
+    let events = ledger.recent(20_000).await?;
+    Ok(assistant.activity_report(days, &logs, &events).await)
+}
+
 // ── T-043: Chat ──
 
 /// Send a chat message to the AI assistant.

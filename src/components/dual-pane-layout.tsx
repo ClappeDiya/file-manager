@@ -1,7 +1,8 @@
 import { useCallback, useRef, useState, useEffect } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { cn } from "@ufop/ui-components";
-import { PanelLeftClose, PanelRightClose, Columns2, Rows2 } from "lucide-react";
+import { PanelLeftClose, PanelRightClose, Columns2, Rows2, GitCompareArrows } from "lucide-react";
+import { useCompareStore } from "@/stores/compare-store";
 import { Button } from "@ufop/ui-components";
 
 const MIN_PANE_PERCENT = 20;
@@ -287,6 +288,17 @@ function PaneToolbar() {
           >
             {isVertical ? "Bottom" : "Right"}
             <PanelRightClose className="h-3 w-3 ml-1" aria-hidden="true" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => useCompareStore.getState().openPanes()}
+            aria-label="Compare panes"
+            title="Compare the two folders, then copy or delete the differences"
+            data-testid="compare-panes"
+          >
+            <GitCompareArrows className="h-3 w-3 mr-1" aria-hidden="true" />
+            Compare
           </Button>
         </>
       )}

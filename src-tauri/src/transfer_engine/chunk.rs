@@ -150,14 +150,15 @@ fn detect_local_media_type(_path: &str) -> MediaType {
 }
 
 /// Generate the temporary file path for atomic writes.
-/// Pattern: {dest_dir}/.{filename}.ufop-partial
+/// Pattern: {dest_dir}/.{filename}.ufop-partial (a long name is shortened,
+/// see [`crate::connectors::staging_name`]).
 pub fn temp_path_for(dest_path: &str) -> String {
     use std::path::Path;
     let p = Path::new(dest_path);
     let parent = p.parent().unwrap_or(Path::new(""));
     let filename = p.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
     parent
-        .join(format!(".{filename}.ufop-partial"))
+        .join(crate::connectors::staging_name(&filename, ".ufop-partial"))
         .to_string_lossy()
         .to_string()
 }
@@ -289,6 +290,15 @@ mod tests {
             temp_path_for("/data/report.pdf"),
             expect("/data", ".report.pdf.ufop-partial")
         );
+    }
+
+    // Regression (WS-Z2): see `connectors::staging_name`.
+    #[test]
+    fn temp_path_of_a_long_name_fits() {
+        let name = format!("{}.bin", "n".repeat(250));
+        let temp = temp_path_for(&format!("/data/{name}"));
+        let file = std::path::Path::new(&temp).file_name().unwrap().to_string_lossy().to_string();
+        assert!(file.len() <= 255 && file.ends_with(".ufop-partial"), "{file}");
     }
 
     #[test]

@@ -115,7 +115,15 @@
     "diskFull": "Espace disque insuffisant",
     "copyingFiles": "Copie de {{count}} fichiers...",
     "movingFiles": "D\u00e9placement de {{count}} fichiers...",
-    "deletingFiles": "Suppression de {{count}} fichiers..."
+    "deletingFiles": "Suppression de {{count}} fichiers...",
+    "folders": "Dossiers",
+    "smart": "Intelligents",
+    "copyPath": "Copier le chemin",
+    "deletePermanently": "Supprimer d\u00e9finitivement",
+    "openWith": "Ouvrir avec...",
+    "extractHere": "Extraire ici",
+    "openInNewWindow": "Ouvrir dans une nouvelle fen\u00eatre",
+    "cloudFolders": "Dossiers cloud"
   },
   "transfer": {
     "title": "Transfert",
@@ -268,7 +276,17 @@
     "rollback": "Revenir \u00e0 la Version Pr\u00e9c\u00e9dente",
     "rollbackConfirm": "\u00cates-vous s\u00fbr de vouloir revenir \u00e0 la version pr\u00e9c\u00e9dente ?",
     "rollbackSuccess": "Retour r\u00e9ussi. Red\u00e9marrez pour appliquer.",
-    "rollbackFailed": "Retour \u00e9chou\u00e9 : {{error}}"
+    "rollbackFailed": "Retour \u00e9chou\u00e9 : {{error}}",
+    "languageSystem": "Par d\u00e9faut du syst\u00e8me ({{name}})",
+    "languageHint": "Les menus, la barre lat\u00e9rale, les titres des r\u00e9glages et le menu de la barre d'\u00e9tat utilisent cette langue ; le reste du texte est encore en anglais.",
+    "notifications": "Notifications",
+    "privacy": "Confidentialit\u00e9",
+    "network": "R\u00e9seau",
+    "logging": "Journalisation",
+    "startupTray": "D\u00e9marrage et barre d'\u00e9tat",
+    "appLock": "Verrouillage de l'application",
+    "reset": "R\u00e9initialiser",
+    "accentColor": "Couleur d'accentuation"
   },
   "onboarding": {
     "welcome": "Bienvenue sur la Plateforme Unifi\u00e9e d'Op\u00e9rations de Fichiers",
@@ -361,5 +379,11 @@
     "rollbackDescription": "Si la version actuelle pose des probl\u00e8mes, vous pouvez revenir \u00e0 la version pr\u00e9c\u00e9dente.",
     "differentialUpdate": "T\u00e9l\u00e9chargement de la mise \u00e0 jour diff\u00e9rentielle...",
     "fullUpdate": "T\u00e9l\u00e9chargement de la mise \u00e0 jour compl\u00e8te..."
+  },
+  "nav": {
+    "back": "Pr\u00e9c\u00e9dent",
+    "forward": "Suivant",
+    "up": "Aller au dossier parent",
+    "root": "Aller \u00e0 la racine"
   }
 }

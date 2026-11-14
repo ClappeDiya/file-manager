@@ -63,8 +63,8 @@ extract_commands() {
     fi
     if [[ $want_fn -eq 1 ]]; then
       trimmed="${line#"${line%%[![:space:]]*}"}"
-      # Blank line or another attribute (e.g. #[allow(...)]) → keep waiting.
-      if [[ -z "$trimmed" || "$trimmed" == "#["* ]]; then
+      # Blank line, another attribute (e.g. #[allow(...)]) or a doc comment → keep waiting.
+      if [[ -z "$trimmed" || "$trimmed" == "#["* || "$trimmed" == "//"* ]]; then
         continue
       fi
       if [[ "$trimmed" == "pub async fn "* || "$trimmed" == "pub fn "* ]]; then
@@ -94,7 +94,7 @@ extract_commands_with_line() {
     fi
     if [[ $want_fn -eq 1 ]]; then
       trimmed="${line#"${line%%[![:space:]]*}"}"
-      if [[ -z "$trimmed" || "$trimmed" == "#["* ]]; then
+      if [[ -z "$trimmed" || "$trimmed" == "#["* || "$trimmed" == "//"* ]]; then
         continue
       fi
       if [[ "$trimmed" == "pub async fn "* || "$trimmed" == "pub fn "* ]]; then
@@ -120,7 +120,8 @@ extract_handler_names() {
   local in_block=0 line trimmed name
   while IFS= read -r line; do
     if [[ $in_block -eq 0 ]]; then
-      [[ "$line" == *".invoke_handler(tauri::generate_handler!["* ]] && in_block=1
+      # Also when wrapped: `.invoke_handler(app_lock::gate(lock, tauri::generate_handler![`.
+      [[ "$line" == *".invoke_handler("*"tauri::generate_handler!["* ]] && in_block=1
       continue
     fi
     trimmed="${line#"${line%%[![:space:]]*}"}"

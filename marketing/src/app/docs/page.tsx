@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { BookOpen, Github, Terminal } from 'lucide-react';
 import { listDocs } from '@/lib/docs';
+import { DocsSearch } from '@/components/docs-search';
 
 export const metadata: Metadata = {
   title: 'Documentation',
@@ -19,6 +20,8 @@ export default async function DocsIndexPage() {
           Guides, references, and how-tos for getting the most out of FileManager.
         </p>
       </header>
+
+      {docs.length > 0 && <DocsSearch />}
 
       {docs.length === 0 ? (
         <div className="marketing-card max-w-3xl">

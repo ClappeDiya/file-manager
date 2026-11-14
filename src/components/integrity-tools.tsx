@@ -14,6 +14,11 @@ import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { errorText } from "@/lib/error-text";
+import { MetadataEditor, MetadataSearch, type FileLabel } from "@/components/metadata-editor";
+import { MetadataSchemaPanel } from "@/components/metadata-schema";
+
+/** Mirrors `HASH_ALGORITHMS` in integrity_commands.rs. */
+const HASH_ALGORITHMS = ["md5", "sha1", "sha256", "crc32", "xxh3"] as const;
 
 // ── Types ──
 
@@ -62,11 +67,6 @@ interface FileTag {
   file_count: number;
 }
 
-interface FileLabel {
-  path: string;
-  tags: string[];
-  labels: string[];
-}
 
 interface SmartFolder {
   id: string;
@@ -90,7 +90,7 @@ interface SmartFolderQuery {
   include_subdirs: boolean;
 }
 
-type IntegrityTab = "checksum" | "duplicates" | "tags" | "smart-folders";
+type IntegrityTab = "checksum" | "duplicates" | "tags" | "smart-folders" | "schemas";
 
 interface IntegrityToolsProps {
   selectedFiles?: string[];
@@ -137,6 +137,7 @@ export function IntegrityTools({
           ["duplicates", "Duplicates"],
           ["tags", "Tags & Labels"],
           ["smart-folders", "Smart Folders"],
+          ["schemas", "Metadata Schemas"],
         ] as [IntegrityTab, string][]).map(([tab, label]) => (
           <button
             key={tab}
@@ -166,6 +167,7 @@ export function IntegrityTools({
         {activeTab === "smart-folders" && (
           <SmartFolderPanel currentDirectory={currentDirectory} />
         )}
+        {activeTab === "schemas" && <MetadataSchemaPanel folder={currentDirectory} />}
       </div>
     </div>
   );
@@ -224,7 +226,7 @@ function ChecksumPanel({ selectedFiles }: { selectedFiles: string[] }) {
       <div>
         <label className="block text-sm font-medium mb-2">Algorithm</label>
         <div className="flex gap-2">
-          {["md5", "sha1", "sha256"].map((algo) => (
+          {HASH_ALGORITHMS.map((algo) => (
             <button
               key={algo}
               onClick={() => setAlgorithm(algo)}
@@ -361,7 +363,7 @@ function QuickChecksumTool() {
       />
       <div className="flex gap-2 items-center">
         <div className="flex gap-1">
-          {["md5", "sha1", "sha256"].map((algo) => (
+          {HASH_ALGORITHMS.map((algo) => (
             <button
               key={algo}
               onClick={() => setAlgorithm(algo)}
@@ -860,8 +862,13 @@ function TagPanel({ selectedFiles }: { selectedFiles: string[] }) {
               </span>
             ))}
           </div>
+          <MetadataEditor path={selectedFiles[0]} />
         </div>
       )}
+
+      <div className="border-t border-border-primary pt-4">
+        <MetadataSearch />
+      </div>
 
       {error && <div className="text-sm text-red-600 dark:text-red-400">{error}</div>}
     </div>

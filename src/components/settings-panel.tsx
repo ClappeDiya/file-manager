@@ -9,10 +9,38 @@
  * Accessible from toolbar/menu. Uses progressive disclosure with
  * collapsible sections to avoid cognitive overload.
  */
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
+import { SecurityAuditSection } from "@/components/security-audit-section";
+import { TrustedSshHostsSection } from "@/components/trusted-ssh-hosts-section";
+import { FilenamePoliciesSection } from "@/components/filename-policies-section";
+import { SearchIndexFolders } from "@/components/search-index-folders";
+import { GpgKeysSection } from "@/components/gpg-keys-section";
+import { SharingPolicySection } from "@/components/sharing-policy-section";
+import { ProxySection } from "@/components/proxy-section";
+import { RcloneSettingsSection } from "@/components/rclone/rclone-settings-section";
+import { FleetAgentSection } from "@/components/fleet-agent-section";
+import { DiagnosticsSection } from "@/components/diagnostics-section";
+import { useLogViewer } from "@/stores/log-viewer-store";
+import { useUIStore } from "@/stores/ui-store";
+import { AppearanceSettings } from "@/components/appearance-settings";
+import { ManagedSettingsNotice } from "@/components/managed-settings-notice";
+import { FleetAgentLimits } from "@/components/fleet-agent-limits";
+import { PortableModeBadge, PortableModeDetails } from "@/components/portable-mode-status";
+import { usePortableStatus } from "@/hooks/use-portable-status";
+import { MetricsExporterSection } from "@/components/metrics-exporter-section";
+import { ChatControlSection } from "@/components/chat-control-section";
+import { SyncDefaultsSection } from "@/components/sync-defaults-section";
+import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-section";
+import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { LocalServerSection } from "@/components/local-server-section";
+import { FolderField } from "@/components/remote-folder-picker";
+import { useT } from "@/lib/i18n";
+import { StartupTraySection } from "@/components/startup-tray-section";
+import { ResetSettingsSection } from "@/components/reset-settings-section";
+import { AppLockSection } from "@/components/app-lock-section";
 
 // ── Types ──
 
@@ -51,15 +79,27 @@ interface NotificationPrefs {
 function Section({
   title,
   defaultOpen = false,
+  id,
+  focus = false,
   children,
 }: {
   title: string;
   defaultOpen?: boolean;
+  /** Names the section for `SettingsPanel`'s `focusSection`. */
+  id?: string;
+  /** Open this section and scroll it into view (e.g. from the palette). */
+  focus?: boolean;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = useState(defaultOpen || focus);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!focus) return;
+    setOpen(true);
+    ref.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+  }, [focus]);
   return (
-    <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+    <div ref={ref} className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden" data-testid={id ? `settings-section-${id}` : undefined}>
       <button
         type="button"
         onClick={() => setOpen(!open)}
@@ -73,6 +113,53 @@ function Section({
           {children}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── General ──
+
+/** Drag-and-drop confirmation and the default download / upload folders. */
+export function GeneralSection() {
+  const confirmDragDrop = useUIStore((s) => s.confirmDragDrop);
+  const setConfirmDragDrop = useUIStore((s) => s.setConfirmDragDrop);
+  const downloadDir = useUIStore((s) => s.defaultDownloadDir);
+  const setDownloadDir = useUIStore((s) => s.setDefaultDownloadDir);
+  const uploadDir = useUIStore((s) => s.defaultUploadDir);
+  const setUploadDir = useUIStore((s) => s.setDefaultUploadDir);
+  return (
+    <div className="pt-3 space-y-3 text-xs">
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input type="checkbox" checked={confirmDragDrop} onChange={(e) => setConfirmDragDrop(e.target.checked)} data-testid="setting-confirm-drag-drop" />
+        <span>
+          Ask before drag-and-drop copies or moves
+          <span className="block text-gray-500">Shows what will happen (and any Safety Interlock warning) before a drop runs. Off: drops act at once.</span>
+        </span>
+      </label>
+      <div>
+        <div className="font-medium mb-1">Default download folder</div>
+        <FolderField
+          value={downloadDir ?? ""}
+          onChange={(v) => setDownloadDir(v)}
+          placeholder="Ask each time"
+          testId="setting-download-dir"
+          pickerTitle="Default download folder"
+          allowConnections={false}
+        />
+        <p className="text-gray-500 mt-1">Where downloads from the Connections panel start, and where F5 / F6 from a connection folder go when the other pane cannot take them.</p>
+      </div>
+      <div>
+        <div className="font-medium mb-1">Default upload source folder</div>
+        <FolderField
+          value={uploadDir ?? ""}
+          onChange={(v) => setUploadDir(v)}
+          placeholder="The system default"
+          testId="setting-upload-dir"
+          pickerTitle="Default upload source folder"
+          allowConnections={false}
+        />
+        <p className="text-gray-500 mt-1">Where the file picker opens when you upload to a connection.</p>
+      </div>
     </div>
   );
 }
@@ -869,6 +956,7 @@ function EditorMappingsSection() {
 type LogLevel = "error" | "warn" | "info" | "debug" | "trace";
 
 function LogControlsSection() {
+  const advanced = useUIStore((st) => st.appMode === "advanced");
   const [logLevel, setLogLevel] = useState<LogLevel>("info");
   const [logDir, setLogDir] = useState("");
   const [exporting, setExporting] = useState(false);
@@ -945,6 +1033,18 @@ function LogControlsSection() {
       {logDir && (
         <div className="text-xs text-gray-500 dark:text-gray-400">
           Log directory: <span className="font-mono">{logDir}</span>
+        </div>
+      )}
+
+      {advanced && (
+        <div>
+          <button
+            type="button"
+            onClick={() => useLogViewer.getState().setOpen(true)}
+            className="text-sm px-3 py-1.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800"
+          >
+            Open log viewer
+          </button>
         </div>
       )}
 
@@ -1253,10 +1353,17 @@ function OllamaSection() {
 
 export default function SettingsPanel({
   onOpenNetworkWizard,
+  focusSection = null,
 }: {
   onOpenNetworkWizard?: () => void;
+  /** Open with this section expanded and scrolled to (`"rclone"`). */
+  focusSection?: string | null;
 }) {
+  const t = useT();
+  // Bumped by a reset: the sections remount and read their settings again.
+  const [resetEpoch, setResetEpoch] = useState(0);
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
+  const portable = usePortableStatus();
 
   const loadSummary = useCallback(async () => {
     const s = await tauriInvokeSafe<SettingsSummary | null>(
@@ -1275,11 +1382,28 @@ export default function SettingsPanel({
     <div className="h-full flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-        <h2 className="text-sm font-semibold">Settings</h2>
+        <h2 className="text-sm font-semibold">{t("settings.title")}</h2>
+        <PortableModeBadge status={portable} />
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div key={resetEpoch} className="flex-1 overflow-y-auto p-4 space-y-3">
+        <Section title={t("settings.appearance")} defaultOpen>
+          <AppearanceSettings />
+        </Section>
+
+        <Section title={t("settings.general")} id="general" focus={focusSection === "general"}>
+          <GeneralSection />
+        </Section>
+
+        <Section title={t("settings.startupTray")} id="startup" focus={focusSection === "startup"}>
+          <StartupTraySection />
+        </Section>
+
+        <Section title={t("settings.appLock")} id="app-lock" focus={focusSection === "app-lock"}>
+          <AppLockSection />
+        </Section>
+
         {/* Export */}
         <Section title="Export Settings" defaultOpen>
           <ExportSection summary={summary} />
@@ -1306,18 +1430,73 @@ export default function SettingsPanel({
         </Section>
 
         {/* Notifications */}
-        <Section title="Notifications">
+        <Section title={t("settings.notifications")}>
           <NotificationSection />
         </Section>
 
         {/* Privacy */}
-        <Section title="Privacy">
+        <Section title={t("settings.privacy")}>
           <PrivacySection />
         </Section>
 
+        {/* Where this installation keeps its data (portable mode) */}
+        <Section title="Storage &amp; Portable Mode">
+          <PortableModeDetails status={portable} />
+        </Section>
+
         {/* Log Controls */}
-        <Section title="Logging">
+        <Section title={t("settings.logging")}>
           <LogControlsSection />
+          <DiagnosticsSection />
+        </Section>
+
+        {/* Management console agent */}
+        <Section title="Managed by Console">
+          <FleetAgentSection />
+          <ManagedSettingsNotice />
+          <FleetAgentLimits />
+        </Section>
+
+        {/* Tamper-evident security audit log */}
+        <Section title="Security Audit Log">
+          <SecurityAuditSection />
+        </Section>
+
+        {/* Folders indexed for subfolder and content search */}
+        <Section title="Search Index">
+          <div className="pt-3">
+            <SearchIndexFolders />
+          </div>
+        </Section>
+
+        {/* Which names may be written where (enforced by the engines) */}
+        <Section title="Filename Policies">
+          <FilenamePoliciesSection />
+        </Section>
+
+        {/* Proxy for every outbound connection */}
+        <Section title="Network Proxy">
+          <ProxySection />
+        </Section>
+
+        {/* Which rclone binary and rclone.conf every rclone feature uses */}
+        <Section title="rclone" id="rclone" focus={focusSection === "rclone"}>
+          <RcloneSettingsSection />
+        </Section>
+
+        {/* Which share links may be created from cloud connections */}
+        <Section title="Sharing">
+          <SharingPolicySection />
+        </Section>
+
+        {/* GnuPG keyring for file encryption and signatures */}
+        <Section title="OpenPGP Keys">
+          <GpgKeysSection />
+        </Section>
+
+        {/* Persisted host keys (trust on first use) */}
+        <Section title="Trusted SSH Hosts">
+          <TrustedSshHostsSection />
         </Section>
 
         {/* Trusted SSH Host CAs */}
@@ -1330,8 +1509,25 @@ export default function SettingsPanel({
           <GssapiSection />
         </Section>
 
+        {/* Advanced: local monitoring (Prometheus exporter, off by default) */}
+        <Section title={t("settings.advanced")}>
+          <div className="pt-3" />
+          <AdvancedOnly hint>
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
+            <MetricsExporterSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Remote control from chat</h3>
+            <ChatControlSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Local web server</h3>
+            <LocalServerSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Sync defaults</h3>
+            <SyncDefaultsSection />
+            <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Bandwidth timetable</h3>
+            <BandwidthTimetableSection />
+          </AdvancedOnly>
+        </Section>
+
         {/* Network Diagnostics */}
-        <Section title="Network">
+        <Section title={t("settings.network")}>
           <div className="pt-3">
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
               Run network diagnostics to troubleshoot connection issues.
@@ -1344,6 +1540,10 @@ export default function SettingsPanel({
               Run Diagnostics
             </button>
           </div>
+        </Section>
+
+        <Section title={t("settings.reset")} id="reset" focus={focusSection === "reset"} defaultOpen={resetEpoch > 0}>
+          <ResetSettingsSection onReset={() => setResetEpoch((n) => n + 1)} justReset={resetEpoch > 0} />
         </Section>
       </div>
     </div>

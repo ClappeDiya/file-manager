@@ -1,132 +1,50 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { dataStore } from '@/lib/data-store';
-import type { ApprovalRequest, ApprovalState, ApprovalTrigger } from '@/lib/types/approvals';
-import { requireRole, isAuthorized } from '@/lib/utils/require-role';
+import { APPROVAL_EXPIRY_HOURS, type ApprovalRequest, type ApprovalState, type ApprovalTrigger } from '@/lib/types/approvals';
+import { audit, badRequest, isContext, readJson, requirePermission } from '@/lib/session';
+import { createApproval, getApproval, listApprovals, reviewApproval } from '@/lib/db/repos/governance';
 
-/** GET /api/approvals - List approval requests */
+/** GET /api/approvals - List approval requests of the current organization */
 export async function GET(request: NextRequest) {
-  const authResult = await requireRole(request, 'viewer');
-  if (!isAuthorized(authResult)) return authResult;
-
+  const ctx = await requirePermission(request, 'approvals.read');
+  if (!isContext(ctx)) return ctx;
   const { searchParams } = new URL(request.url);
   const state = searchParams.get('state') as ApprovalState | null;
   const trigger = searchParams.get('trigger') as ApprovalTrigger | null;
-
-  let result = [...dataStore.approvals];
-
-  // Auto-expire stale approvals
-  const now = new Date();
-  result = result.map(a => {
-    if (a.state === 'pending' && new Date(a.expiresAt) <= now) {
-      return { ...a, state: 'expired' as ApprovalState };
-    }
-    return a;
-  });
-
-  if (state) result = result.filter(a => a.state === state);
-  if (trigger) result = result.filter(a => a.trigger === trigger);
-
-  const stats = {
-    pending: result.filter(a => a.state === 'pending').length,
-    approved: result.filter(a => a.state === 'approved').length,
-    denied: result.filter(a => a.state === 'denied').length,
-    expired: result.filter(a => a.state === 'expired').length,
-  };
-
-  return NextResponse.json({ approvals: result, stats, total: result.length });
+  let result = listApprovals(ctx.orgId);
+  if (state) result = result.filter((a) => a.state === state);
+  if (trigger) result = result.filter((a) => a.trigger === trigger);
+  const count = (s: ApprovalState) => result.filter((a) => a.state === s).length;
+  return NextResponse.json({ approvals: result, stats: { pending: count('pending'), approved: count('approved'), denied: count('denied'), expired: count('expired') }, total: result.length });
 }
 
-/** POST /api/approvals - Create a new approval request */
+/** POST /api/approvals - Request an approval (the requester is the signed-in user) */
 export async function POST(request: NextRequest) {
-  const authResult = await requireRole(request, 'manager');
-  if (!isAuthorized(authResult)) return authResult;
-
-  try {
-    const body = await request.json();
-    const {
-      operation, trigger, source, destination,
-      fileCount, totalSize, reason, triggeringPolicy,
-      requestedBy, requestedByName,
-    } = body;
-
-    if (!operation || !trigger || !source || !destination) {
-      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
-    }
-
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + 48 * 60 * 60 * 1000); // 48 hours
-
-    const { v4: uuidv4 } = await import('uuid');
-    const newApproval: ApprovalRequest = {
-      id: `apr_${uuidv4().slice(0, 12)}`,
-      operation,
-      trigger,
-      source,
-      destination,
-      fileCount: fileCount || 0,
-      totalSize: totalSize || 0,
-      reason: reason || '',
-      triggeringPolicy: triggeringPolicy || '',
-      state: 'pending',
-      requestedBy: requestedBy || 'unknown',
-      requestedByName: requestedByName || 'Unknown User',
-      requestedAt: now.toISOString(),
-      expiresAt: expiresAt.toISOString(),
-      organizationId: 'org_001',
-    };
-
-    dataStore.approvals.push(newApproval);
-    return NextResponse.json({ approval: newApproval }, { status: 201 });
-  } catch {
-    return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
-  }
+  const ctx = await requirePermission(request, 'admin.access');
+  if (!isContext(ctx)) return ctx;
+  const b = await readJson<Partial<ApprovalRequest>>(request);
+  if (!b?.operation || !b.trigger || !b.source || !b.destination) return badRequest('Missing required fields');
+  const approval = createApproval(
+    ctx.orgId,
+    { operation: b.operation, trigger: b.trigger, source: b.source, destination: b.destination, fileCount: b.fileCount ?? 0, totalSize: b.totalSize ?? 0, reason: b.reason ?? '', triggeringPolicy: b.triggeringPolicy ?? '', requestedBy: ctx.user.email, requestedByName: ctx.user.name },
+    APPROVAL_EXPIRY_HOURS,
+  );
+  audit(ctx, { eventType: 'approval.request', description: `Requested approval for ${approval.operation}`, resourceType: 'approval', resourceId: approval.id });
+  return NextResponse.json({ approval }, { status: 201 });
 }
 
-/** PATCH /api/approvals - Review (approve/deny) a request */
+/** PATCH /api/approvals - Approve or deny a pending request */
 export async function PATCH(request: NextRequest) {
-  const authResult = await requireRole(request, 'manager');
-  if (!isAuthorized(authResult)) return authResult;
-
-  try {
-    const body = await request.json();
-    const { id, action, reviewedBy, reviewedByName, reviewComment } = body;
-
-    if (!id || !action || !['approve', 'deny'].includes(action)) {
-      return NextResponse.json({ error: 'ID and action (approve/deny) required' }, { status: 400 });
-    }
-
-    const index = dataStore.approvals.findIndex(a => a.id === id);
-    if (index === -1) {
-      return NextResponse.json({ error: 'Approval not found' }, { status: 404 });
-    }
-
-    if (dataStore.approvals[index].state !== 'pending') {
-      return NextResponse.json({ error: 'Can only review pending approvals' }, { status: 400 });
-    }
-
-    // Check expiry
-    if (new Date(dataStore.approvals[index].expiresAt) <= new Date()) {
-      dataStore.approvals[index].state = 'expired';
-      return NextResponse.json({ error: 'Approval has expired' }, { status: 400 });
-    }
-
-    // Prevent self-approval: reviewer must not be the requester
-    const reviewerEmail = authResult.user.email;
-    if (dataStore.approvals[index].requestedBy === reviewerEmail) {
-      return NextResponse.json({ error: 'Cannot review your own approval request' }, { status: 403 });
-    }
-
-    dataStore.approvals[index] = {
-      ...dataStore.approvals[index],
-      state: action === 'approve' ? 'approved' : 'denied',
-      reviewedBy: reviewerEmail,
-      reviewedByName: authResult.user.name,
-      reviewedAt: new Date().toISOString(),
-      reviewComment: reviewComment || '',
-    };
-
-    return NextResponse.json({ approval: dataStore.approvals[index] });
-  } catch {
-    return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
-  }
+  const b = await readJson<{ id?: string; action?: string; reviewComment?: string }>(request);
+  const ctx = await requirePermission(request, b?.action === 'deny' ? 'approvals.deny' : 'approvals.approve');
+  if (!isContext(ctx)) return ctx;
+  if (!b?.id || !b.action || !['approve', 'deny'].includes(b.action)) return badRequest('ID and action (approve/deny) required');
+  const cur = getApproval(ctx.orgId, b.id);
+  if (!cur) return badRequest('Approval not found', 404);
+  if (cur.state === 'expired') return badRequest('Approval has expired');
+  if (cur.state !== 'pending') return badRequest('Can only review pending approvals');
+  if (cur.requestedBy === ctx.user.email) return badRequest('Cannot review your own approval request', 403);
+  const approval = reviewApproval(ctx.orgId, b.id, b.action === 'approve', { email: ctx.user.email, name: ctx.user.name }, b.reviewComment ?? '');
+  if (!approval) return badRequest('Approval is no longer pending', 409);
+  audit(ctx, { eventType: b.action === 'approve' ? 'approval.approve' : 'approval.deny', description: `${b.action === 'approve' ? 'Approved' : 'Denied'} ${approval.operation}`, resourceType: 'approval', resourceId: approval.id });
+  return NextResponse.json({ approval });
 }

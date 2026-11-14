@@ -4,19 +4,22 @@
  * Right-side panel for creating and managing automation rules.
  * Features: NL rule creation, rule list with toggles, rule editor, execution logs.
  */
+import { WorkflowBuilder } from "@/components/workflow-builder";
+import { runStatus } from "@/lib/workflow-model";
+import { formatNextRun } from "@/lib/upcoming-runs";
 import { useCallback, useEffect, useState } from "react";
 import {
   useAutomationStore,
   type AutomationRule,
   type RuleTrigger,
   type RuleAction,
-  type RuleCondition,
   type AutomationLog,
   type QuickflowSuggestion,
 } from "@/stores/automation-store";
-import { formatBytes } from "@/lib/format-bytes";
+import { conditionsSummary } from "@/lib/automation-rule-model";
 import { cn } from "@ufop/ui-components";
 import { Button, Badge, ScrollArea } from "@ufop/ui-components";
+import { automationTrigger } from "@/lib/run-trigger";
 import { FeaturePeek } from "@/components/feature-peek";
 import {
   X,
@@ -38,6 +41,9 @@ import {
   ToggleLeft,
   ToggleRight,
   Sparkles,
+  Copy,
+  Webhook,
+  Building2,
 } from "lucide-react";
 
 // ── NL Input Bar ──
@@ -103,6 +109,8 @@ function triggerLabel(trigger: RuleTrigger): string {
       return trigger.cron_human || `Schedule: ${trigger.cron_expr}`;
     case "manual":
       return "Manual trigger";
+    case "webhook":
+      return "Webhook call";
   }
 }
 
@@ -126,6 +134,34 @@ function actionLabel(action: RuleAction): string {
       return "Run custom command";
     case "notify":
       return `Notify: ${action.title}`;
+    case "extract_archive":
+      return `Extract to ${shortenPath(action.dest_path)}`;
+    case "run_command":
+      return `Run ${action.program}`;
+    case "send_message":
+      return `Message: ${action.title}`;
+    case "create_folder":
+      return `Create folder ${shortenPath(action.path)}`;
+    case "download_url":
+      return action.destination_connection_id ? `Download to ${action.destination_protocol ?? "remote"} ${shortenPath(action.remote_path ?? "")}`.trim() : `Download to ${shortenPath(action.dest_path)}`;
+    case "verify_pair":
+      return `Verify sync pair${action.full ? " (contents)" : ""}`;
+    case "remove_empty_dirs":
+      return `Remove empty folders${action.path ? ` in ${shortenPath(action.path)}` : ""}`;
+    case "list_files":
+      return `List files to ${shortenPath(action.output)}`;
+    case "purge":
+      return `Purge ${shortenPath(action.path)}`;
+    case "convert_image":
+      return [action.format ? `Convert to ${action.format.toUpperCase()}` : "Resize", action.max_width || action.max_height ? `≤ ${action.max_width ?? "∞"}×${action.max_height ?? "∞"}` : ""].filter(Boolean).join(" ");
+    case "convert_document":
+      return `Convert to ${action.to.toUpperCase()}`;
+    case "scan_for_malware":
+      return `Scan for malware → ${shortenPath(action.quarantine_path)}`;
+    case "ai_task":
+      return `AI: ${action.instruction.length > 40 ? `${action.instruction.slice(0, 40)}…` : action.instruction}`;
+    case "validate_batch":
+      return `Validate batch (${action.rules.members.length + action.rules.content.length} rules)`;
     case "replay_op": {
       // Operation Pin: a captured copy/move replayed verbatim. The
       // source list and destination both travel with the rule, so the
@@ -148,6 +184,8 @@ function triggerIcon(trigger: RuleTrigger) {
       return <Clock className="h-3.5 w-3.5" aria-hidden="true" />;
     case "manual":
       return <Hand className="h-3.5 w-3.5" aria-hidden="true" />;
+    case "webhook":
+      return <Webhook className="h-3.5 w-3.5" aria-hidden="true" />;
   }
 }
 
@@ -162,13 +200,16 @@ function shortenPath(path: string): string {
 
 interface RuleCardProps {
   rule: AutomationRule;
+  /** Next scheduled run (RFC 3339), when the rule is armed with a schedule. */
+  nextRun?: string;
 }
 
-function RuleCard({ rule }: RuleCardProps) {
+function RuleCard({ rule, nextRun }: RuleCardProps) {
   const toggleRule = useAutomationStore((s) => s.toggleRule);
   const runRule = useAutomationStore((s) => s.runRule);
   const deleteRule = useAutomationStore((s) => s.deleteRule);
   const openEditor = useAutomationStore((s) => s.openEditor);
+  const cloneRule = useAutomationStore((s) => s.cloneRule);
   const selectRule = useAutomationStore((s) => s.selectRule);
   const selectedRuleId = useAutomationStore((s) => s.selectedRuleId);
   const [expanded, setExpanded] = useState(false);
@@ -222,6 +263,12 @@ function RuleCard({ rule }: RuleCardProps) {
             <span className="text-xs font-medium text-[color:var(--color-text)] truncate">
               {rule.name}
             </span>
+            {rule.managed_by && (
+              <Badge variant="secondary" className="text-[10px] px-1 py-0" title={`Managed by ${rule.managed_by}`}>
+                <Building2 className="h-2.5 w-2.5 mr-0.5" aria-hidden="true" />
+                Org
+              </Badge>
+            )}
             {rule.error_count > 0 && (
               <Badge variant="error" className="text-[10px] px-1 py-0">
                 {rule.error_count} err
@@ -232,8 +279,14 @@ function RuleCard({ rule }: RuleCardProps) {
             {triggerIcon(rule.trigger)}
             <span>{triggerLabel(rule.trigger)}</span>
             <span className="text-[var(--color-text-muted)]">→</span>
-            <span>{actionLabel(rule.action)}</span>
+            <span>{rule.workflow ? `Workflow (${rule.workflow.nodes.length} steps)` : actionLabel(rule.action)}</span>
           </div>
+          {nextRun && rule.enabled && (
+            <div className="mt-0.5 flex items-center gap-1 text-[10px] text-[var(--color-text-muted)]" data-testid={`next-run-${rule.id}`} title={new Date(nextRun).toLocaleString()}>
+              <Clock className="h-3 w-3" aria-hidden="true" />
+              Next run: {formatNextRun(nextRun)}
+            </div>
+          )}
         </div>
 
         {/* Enabled toggle — `role="switch"` so screen readers announce state. */}
@@ -241,6 +294,7 @@ function RuleCard({ rule }: RuleCardProps) {
           type="button"
           role="switch"
           aria-checked={rule.enabled}
+          disabled={!!rule.managed_by}
           onClick={(e) => {
             e.stopPropagation();
             toggleRule(rule.id, !rule.enabled);
@@ -249,7 +303,7 @@ function RuleCard({ rule }: RuleCardProps) {
             "inline-flex items-center justify-center h-6 w-6 rounded transition-theme focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
             rule.enabled ? "text-[color:var(--color-success)]" : "text-[var(--color-text-muted)] hover:text-[color:var(--color-text)]",
           )}
-          title={rule.enabled ? "Disable rule" : "Enable rule"}
+          title={rule.managed_by ? `Managed by ${rule.managed_by}` : rule.enabled ? "Disable rule" : "Enable rule"}
           aria-label={`Rule ${rule.name}: ${rule.enabled ? "enabled" : "disabled"}`}
         >
           {rule.enabled ? (
@@ -272,15 +326,16 @@ function RuleCard({ rule }: RuleCardProps) {
           </div>
 
           {/* Conditions */}
-          {rule.conditions.length > 0 && (
+          {(rule.conditions.length > 0 || rule.condition_tree) && (
             <div className="text-[10px] text-[var(--color-text-muted)] mb-2">
               <span className="font-medium">Conditions: </span>
-              {rule.conditions.map((c, i) => (
-                <span key={i}>
-                  {i > 0 && " AND "}
-                  {conditionLabel(c)}
-                </span>
-              ))}
+              {conditionsSummary(rule)}
+            </div>
+          )}
+          {!rule.workflow && (rule.steps?.length ?? 0) > 0 && (
+            <div className="text-[10px] text-[var(--color-text-muted)] mb-2">
+              <span className="font-medium">Then: </span>
+              {rule.steps!.map((s) => actionLabel(s.action)).join(" → ")}
             </div>
           )}
 
@@ -317,22 +372,36 @@ function RuleCard({ rule }: RuleCardProps) {
               className="h-6 text-[10px]"
             >
               <Pencil className="h-3 w-3 mr-1" />
-              Edit
+              {rule.managed_by ? "View" : "Edit"}
             </Button>
             <Button
               variant="ghost"
               size="sm"
               onClick={(e) => {
                 e.stopPropagation();
-                if (confirm(`Delete rule "${rule.name}"?`)) {
-                  deleteRule(rule.id);
-                }
+                void cloneRule(rule.id);
               }}
-              className="h-6 text-[10px] text-red-400 hover:text-red-500"
+              className="h-6 text-[10px]"
             >
-              <Trash2 className="h-3 w-3 mr-1" />
-              Delete
+              <Copy className="h-3 w-3 mr-1" />
+              Clone
             </Button>
+            {!rule.managed_by && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (confirm(`Delete rule "${rule.name}"?`)) {
+                    deleteRule(rule.id);
+                  }
+                }}
+                className="h-6 text-[10px] text-red-400 hover:text-red-500"
+              >
+                <Trash2 className="h-3 w-3 mr-1" />
+                Delete
+              </Button>
+            )}
           </div>
         </div>
       )}
@@ -340,26 +409,34 @@ function RuleCard({ rule }: RuleCardProps) {
   );
 }
 
-function conditionLabel(condition: RuleCondition): string {
-  switch (condition.type) {
-    case "extension_is":
-      return `ext = ${condition.extensions.join(", ")}`;
-    case "name_matches":
-      return `name ~ ${condition.pattern}`;
-    case "size_greater_than":
-      return `size > ${formatBytes(condition.bytes)}`;
-    case "size_less_than":
-      return `size < ${formatBytes(condition.bytes)}`;
-    case "created_within":
-      return `age < ${condition.seconds}s`;
-    case "path_contains":
-      return `path contains "${condition.substring}"`;
-  }
-}
-
 // ── Log Entry ──
 
+/** A workflow run drawn on its graph: each step coloured by how it ended. */
+function RunGraph({ log, onClose }: { log: AutomationLog; onClose: () => void }) {
+  const rule = useAutomationStore((s) => s.rules.find((r) => r.id === log.rule_id));
+  if (!rule?.workflow) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" role="dialog" aria-modal="true" aria-label="Run graph" onClick={onClose}>
+      <div className="w-[min(900px,95vw)] rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)] p-3 space-y-2" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2 text-xs">
+          <b>{log.rule_name}</b>
+          <span>{new Date(log.triggered_at).toLocaleString()}</span>
+          <span>{log.status}</span>
+          <button className="ml-auto underline" onClick={onClose}>
+            Close
+          </button>
+        </div>
+        <WorkflowBuilder workflow={rule.workflow} status={runStatus(log)} actionLabel={actionLabel} />
+      </div>
+    </div>
+  );
+}
+
 function LogEntry({ log }: { log: AutomationLog }) {
+  const [graph, setGraph] = useState(false);
+  // What started the run: manual, schedule, a watched file, a webhook.
+  const trigger = automationTrigger(log.trigger_event);
+  const hasGraph = (log.steps ?? []).some((s) => s.node);
   const statusIcon = {
     success: <CheckCircle2 className="h-3 w-3 text-green-500" />,
     failed: <XCircle className="h-3 w-3 text-red-500" />,
@@ -376,7 +453,15 @@ function LogEntry({ log }: { log: AutomationLog }) {
           <span className="text-[var(--color-text-muted)]">
             {new Date(log.triggered_at).toLocaleTimeString()}
           </span>
+          <span className="text-[var(--color-text-muted)]" data-testid="log-trigger" title={trigger.detail ?? undefined}>
+            · {trigger.label}
+          </span>
         </div>
+        {trigger.detail && (
+          <div className="text-[10px] text-[var(--color-text-muted)] truncate" title={trigger.detail}>
+            {trigger.detail}
+          </div>
+        )}
         {log.error_message && (
           <div className="text-[10px] text-red-400 truncate">{log.error_message}</div>
         )}
@@ -385,6 +470,12 @@ function LogEntry({ log }: { log: AutomationLog }) {
             {log.files_affected.length} file(s) affected
           </div>
         )}
+        {hasGraph && (
+          <button className="text-[10px] underline text-[var(--color-text-muted)]" onClick={() => setGraph(true)}>
+            Run graph
+          </button>
+        )}
+        {graph && <RunGraph log={log} onClose={() => setGraph(false)} />}
       </div>
     </div>
   );
@@ -501,6 +592,8 @@ export function AutomationPanel() {
   const logs = useAutomationStore((s) => s.logs);
   const loading = useAutomationStore((s) => s.loading);
   const loadRules = useAutomationStore((s) => s.loadRules);
+  const nextRuns = useAutomationStore((s) => s.nextRuns);
+  const loadNextRuns = useAutomationStore((s) => s.loadNextRuns);
   const loadLogs = useAutomationStore((s) => s.loadLogs);
   const loadSuggestions = useAutomationStore((s) => s.loadSuggestions);
   const openEditor = useAutomationStore((s) => s.openEditor);
@@ -513,8 +606,16 @@ export function AutomationPanel() {
       loadRules();
       loadLogs();
       loadSuggestions();
+      // A schedule moves on after each run; keep "Next run" current while the panel is open.
+      const t = setInterval(() => void loadNextRuns(), 60_000);
+      return () => clearInterval(t);
     }
-  }, [panelOpen, loadRules, loadLogs, loadSuggestions]);
+  }, [panelOpen, loadRules, loadLogs, loadSuggestions, loadNextRuns]);
+
+  // Enabling, editing or running a rule changes when it runs next.
+  useEffect(() => {
+    if (panelOpen) void loadNextRuns();
+  }, [panelOpen, rules, loadNextRuns]);
 
   if (!panelOpen) return null;
 
@@ -622,7 +723,7 @@ export function AutomationPanel() {
                 </div>
               )}
               {!loading &&
-                rules.map((rule) => <RuleCard key={rule.id} rule={rule} />)}
+                rules.map((rule) => <RuleCard key={rule.id} rule={rule} nextRun={nextRuns[rule.id]} />)}
             </>
           )}
 

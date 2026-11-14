@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { useState } from "react";
 import { render, screen, fireEvent } from "@testing-library/react";

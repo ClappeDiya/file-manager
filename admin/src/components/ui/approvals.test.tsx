@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -8,7 +9,7 @@ import {
   within,
 } from "@testing-library/react";
 import ApprovalsPage from "../../app/approvals/page";
-import { useAuthStore } from "../../lib/stores/auth-store";
+vi.mock("@/lib/stores/auth-store", () => ({ useAuthStore: () => ({ user: { id: "reviewer", role: "org_owner" } }) }));
 vi.mock("next/navigation", () => ({ usePathname: () => "/approvals" }));
 afterEach(() => {
   cleanup();
@@ -17,9 +18,6 @@ afterEach(() => {
 it.each(["Approve", "Deny"])(
   "retains a pending request and its comment when %s fails",
   async (action) => {
-    useAuthStore.setState({
-      user: { id: "reviewer", role: "org_owner" } as never,
-    });
     const approval = {
       id: "request",
       operation: "Copy reviewed files",

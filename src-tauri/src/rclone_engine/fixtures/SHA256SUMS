@@ -1,0 +1,12 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+8e2e1b5a7a4b9a1d6c4f0e3b2a1c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c  rclone-v1.69.1-linux-amd64.zip
+0bd93ba997043ad480a694d0b2e983d8511334df88d22f44bd532b28fe1aa9bb  rclone-v1.69.1-osx-arm64.zip
+b5c168db719e3a66397ce14e1907340ebdb78b910c98df897c665a1a74804190  rclone-v1.69.1-windows-amd64.zip
+17d46d4991b2edd5e445342a72ba0cb7cf09e4849b5e98c16408ce11e05c7388  rclone-v1.69.1-linux-arm64.zip
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCAAdFiEEfixtureSignatureNotRealxxxxxxxxxxxxxxxxxxxxxxxx
+=abcd
+-----END PGP SIGNATURE-----

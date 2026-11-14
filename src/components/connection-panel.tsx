@@ -10,12 +10,37 @@
  * - Live connection status polling
  * - Dynamic protocol list from backend
  * - Delete connection groups
+ * - Starred connections first; show/hide on password fields
+ * - Google Drive / Dropbox / OneDrive sign-in and where they open
+ * - "Credentials rejected" flag with Retry; remote quota; folder size
+ * - rclone remote manager (create/edit/test/delete, "Add as connection");
+ *   crypt banner with "Open underlying remote" and name decoding (Advanced)
  */
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { ShareLinkDialog } from "@/components/share-link-dialog";
+import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatBytes } from "@/lib/format-bytes";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
 import { promptText, confirmText } from "@/lib/prompt-dialog";
 import { errorText } from "@/lib/error-text";
+import { isMountable } from "@/lib/mount-options";
+import { useMountsUi } from "@/stores/mounts-ui-store";
+import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/provider-presets";
+import { PasswordInput } from "@/components/password-input";
+import { OAuthSignIn } from "@/components/oauth-sign-in";
+import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
+import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName, isSignedIn, signOut } from "@/lib/oauth";
+import { useUIStore } from "@/stores/ui-store";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { remoteLocation } from "@/lib/location";
+import { useRcloneUi } from "@/stores/rclone-ui-store";
+import { useCompareStore } from "@/stores/compare-store";
+import { useFileManagerStore } from "@/stores/file-manager-store";
+import { useConnectionBrowse } from "@/stores/connection-browse-store";
+import { RcloneRemoteManager } from "@/components/rclone/rclone-remote-manager";
+import { CryptBanner, CryptNamesDialog } from "@/components/rclone/rclone-crypt";
+import { RCLONE_REMOTES_CHANGED_EVENT, rcloneCryptInfo, type RcloneCryptInfo } from "@/lib/rclone";
 
 // ── Types (mirrors Rust types) ──
 
@@ -47,7 +72,77 @@ interface ConnectionProfile {
   // Upload-time permission defaults
   default_file_mode: string | null;
   default_dir_mode: string | null;
+  /** Mirrors `ConnectionExtras` (core/types.rs). */
+  extras?: ConnectionExtras;
 }
+
+interface AssumeRoleConfig {
+  role_arn: string;
+  external_id: string | null;
+  session_name: string | null;
+  duration_secs: number | null;
+}
+
+type SwiftAuthKind = "password" | "application_credential" | "temp_auth";
+
+/** Mirrors `SwiftSettings` (core/types.rs). */
+interface SwiftSettings {
+  auth_kind: SwiftAuthKind;
+  auth_url: string | null;
+  project_name: string | null;
+  domain_name: string | null;
+  region: string | null;
+  application_credential_id: string | null;
+}
+
+type WebDavAuthMode = "basic" | "bearer" | "none";
+type WebDavVendor = "generic" | "nextcloud" | "owncloud";
+
+/** Mirrors `WebDavSettings`. */
+interface WebDavSettings {
+  auth: WebDavAuthMode;
+  vendor: WebDavVendor;
+}
+
+/** Mirrors `SmbSettings`. */
+interface SmbSettings {
+  domain: string | null;
+}
+
+interface ConnectionExtras extends CloudExtras {
+  assume_role: AssumeRoleConfig | null;
+  rclone_remote: string | null;
+  preset: string | null;
+  swift: SwiftSettings | null;
+  webdav?: WebDavSettings | null;
+  smb?: SmbSettings | null;
+}
+
+/** Mirrors `ConnectionStatus` (core/types.rs). */
+interface ConnectionStatus {
+  id: string;
+  starred: boolean;
+  credentials_rejected_at: string | null;
+  credentials_rejected_reason: string | null;
+}
+
+/** Mirrors `RemoteQuota`. */
+interface RemoteQuota {
+  total: number | null;
+  used: number | null;
+  free: number | null;
+  trashed: number | null;
+}
+
+/** Mirrors `FolderSize`. */
+interface FolderSize {
+  bytes: number;
+  files: number;
+  folders: number | null;
+  complete: boolean;
+}
+
+type SizeState = { jobId: string; running: true } | { running: false; result?: FolderSize; error?: string };
 
 interface ConnectionGroup {
   id: string;
@@ -69,6 +164,7 @@ interface RemoteFileEntry {
   is_dir: boolean;
   size: number;
   modified: string | null;
+  extension?: string | null;
 }
 
 interface ProtocolOption {
@@ -92,6 +188,14 @@ interface AwsProfile {
 
 type ThirdPartySource = "filezilla" | "cyberduck" | "winscp" | "transmit";
 
+/** Azure storage services: account + key/SAS/connection string + optional endpoint. */
+const AZURE_PROTOCOLS = new Set(["azure_blob", "adls_gen2", "azure_files"]);
+const AZURE_ENDPOINT_HINT: Record<string, string> = {
+  azure_blob: "myaccount.blob.core.usgovcloudapi.net or http://127.0.0.1:10000/devstoreaccount1",
+  adls_gen2: "myaccount.dfs.core.chinacloudapi.cn",
+  azure_files: "myaccount.file.core.usgovcloudapi.net",
+};
+
 const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "sftp", label: "SFTP", port: 22 },
   { value: "ftp", label: "FTP", port: 21 },
@@ -101,10 +205,14 @@ const FALLBACK_PROTOCOLS: ProtocolOption[] = [
   { value: "nfs", label: "NFS", port: 2049 },
   { value: "s3", label: "S3", port: 443 },
   { value: "azure_blob", label: "Azure Blob Storage", port: 443 },
+  { value: "adls_gen2", label: "Azure Data Lake Storage Gen2", port: 443 },
+  { value: "azure_files", label: "Azure Files", port: 443 },
   { value: "swift", label: "OpenStack Swift", port: 5000 },
   { value: "google_drive", label: "Google Drive", port: 443 },
   { value: "dropbox", label: "Dropbox", port: 443 },
   { value: "onedrive", label: "OneDrive", port: 443 },
+  { value: "b2", label: "Backblaze B2", port: 443 },
+  { value: "rclone", label: "rclone (GCS, Box, Mega, 70+ more)", port: 0 },
 ];
 
 // Default port mapping for dynamically fetched protocols
@@ -117,36 +225,34 @@ const DEFAULT_PORTS: Record<string, number> = {
   nfs: 2049,
   s3: 443,
   azure_blob: 443,
+  adls_gen2: 443,
+  azure_files: 443,
   swift: 5000,
   google_drive: 443,
   dropbox: 443,
   onedrive: 443,
+  b2: 443,
   https: 443,
   http: 80,
 };
 
-// S3-compatible provider presets
-const S3_PRESETS = [
-  { id: "aws", label: "Amazon S3", endpoint: "", region: "us-east-1", helpText: "" },
-  { id: "wasabi", label: "Wasabi", endpoint: "s3.wasabisys.com", region: "us-east-1", helpText: "" },
-  { id: "minio", label: "MinIO", endpoint: "localhost:9000", region: "us-east-1", helpText: "Self-hosted MinIO instance" },
-  {
-    id: "gcs",
-    label: "Google Cloud Storage (S3 Compatible)",
-    endpoint: "storage.googleapis.com",
-    region: "auto",
-    helpText: "Create HMAC keys in GCP Console > Cloud Storage > Settings > Interoperability",
-  },
-] as const;
 
 // ── Helpers ──
 
-function formatFileSize(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  const size = bytes / Math.pow(1024, i);
-  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+/** Browser key of an ad-hoc rclone remote (not a saved connection). */
+const ADHOC_PREFIX = "adhoc:";
+
+/** Sizes follow Settings → Appearance → Size units. */
+const formatFileSize = (bytes: number): string => formatBytes(bytes);
+
+/** "4 GB of 15 GB used · 11 GB free" from whatever the provider reports. */
+function formatQuota(q: RemoteQuota): string {
+  const parts: string[] = [];
+  if (q.used != null) parts.push(q.total != null ? `${formatFileSize(q.used)} of ${formatFileSize(q.total)} used` : `${formatFileSize(q.used)} used`);
+  else if (q.total != null) parts.push(`${formatFileSize(q.total)} total`);
+  if (q.free != null) parts.push(`${formatFileSize(q.free)} free`);
+  if (q.trashed) parts.push(`${formatFileSize(q.trashed)} in trash`);
+  return parts.join(" · ");
 }
 
 function formatModified(dateStr: string): string {
@@ -254,7 +360,7 @@ const CHARSET_OPTIONS = [
 function SshKeyGenSection({
   onKeyGenerated,
 }: {
-  onKeyGenerated: (keyPath: string) => void;
+  onKeyGenerated: (keyPath: string, passphrase: string | null) => void;
 }) {
   const [showModal, setShowModal] = useState(false);
   const [algorithm, setAlgorithm] = useState("ed25519");
@@ -285,7 +391,7 @@ function SshKeyGenSection({
         comment: null,
       });
       setResult(res);
-      onKeyGenerated(res.private_key_path);
+      onKeyGenerated(res.private_key_path, showPassphrase && passphrase ? passphrase : null);
     } catch (e: any) {
       setGenError(e?.message || "Key generation failed");
     } finally {
@@ -344,8 +450,7 @@ function SshKeyGenSection({
               Add Passphrase
             </label>
             {showPassphrase && (
-              <input
-                type="password"
+              <PasswordInput
                 value={passphrase}
                 onChange={(e) => setPassphrase(e.target.value)}
                 placeholder="Optional passphrase"
@@ -407,22 +512,34 @@ function SshKeyGenSection({
   );
 }
 
+/** A new connection pre-filled from elsewhere (an rclone remote's "Add as connection"). */
+export interface ConnectionPrefill {
+  protocol: string;
+  host: string;
+  name: string;
+}
+
 function ConnectionForm({
   initialData,
+  prefill,
   onSave,
   onCancel,
+  onManageRclone,
   groups,
   protocols,
 }: {
   initialData?: ConnectionProfile | null;
+  prefill?: ConnectionPrefill | null;
   onSave: (data: Record<string, unknown>) => void;
   onCancel: () => void;
+  /** Open the rclone remote manager. */
+  onManageRclone?: () => void;
   groups: ConnectionGroup[];
   protocols: ProtocolOption[];
 }) {
-  const [name, setName] = useState(initialData?.name || "");
-  const [protocol, setProtocol] = useState(initialData?.protocol || "sftp");
-  const [host, setHost] = useState(initialData?.host || "");
+  const [name, setName] = useState(initialData?.name || prefill?.name || "");
+  const [protocol, setProtocol] = useState(initialData?.protocol || prefill?.protocol || "sftp");
+  const [host, setHost] = useState(initialData?.host || prefill?.host || "");
   const [port, setPort] = useState<string>(
     initialData?.port?.toString() || ""
   );
@@ -482,21 +599,73 @@ function ConnectionForm({
   const [awsProfilesLoaded, setAwsProfilesLoaded] = useState(false);
 
   // S3-compatible preset selector
-  const [selectedS3Preset, setSelectedS3Preset] = useState("");
+  const [selectedPreset, setSelectedPreset] = useState(initialData?.extras?.preset ?? "");
+  const [presets, setPresets] = useState<ProviderPreset[]>([]);
+  const [presetValues, setPresetValues] = useState<Record<string, string>>({});
+  useEffect(() => {
+    tauriInvoke<ProviderPreset[]>("connection_presets", undefined, []).then((p) => setPresets(p ?? []), () => setPresets([]));
+  }, []);
 
-  // Azure Blob Storage fields
-  const [azureAccountName, setAzureAccountName] = useState("");
-  const [azureAuthMethod, setAzureAuthMethod] = useState<
-    "account_key" | "sas_token" | "connection_string" | "azure_ad"
-  >("account_key");
-  const [azureSecret, setAzureSecret] = useState("");
-  const [azureCustomEndpoint, setAzureCustomEndpoint] = useState("");
+  // rclone remotes from the user's rclone config
+  const [rcloneRemotes, setRcloneRemotes] = useState<{ name: string; backend: string }[] | null>(null);
+  const [rcloneError, setRcloneError] = useState<string | null>(null);
+  useEffect(() => {
+    if (protocol !== "rclone" || rcloneRemotes !== null) return;
+    tauriInvoke<{ name: string; backend: string }[]>("rclone_list_remotes")
+      .then((r) => setRcloneRemotes(r ?? []))
+      .catch((e) => {
+        setRcloneRemotes([]);
+        setRcloneError(errorText(e));
+      });
+  }, [protocol, rcloneRemotes]);
+  // A remote was created or deleted in the rclone manager: list again.
+  useEffect(() => {
+    const reload = () => {
+      setRcloneError(null);
+      setRcloneRemotes(null);
+    };
+    window.addEventListener(RCLONE_REMOTES_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(RCLONE_REMOTES_CHANGED_EVENT, reload);
+  }, []);
+
+  // STS AssumeRole (S3): temporary credentials from the keys above
+  const [roleArn, setRoleArn] = useState(initialData?.extras?.assume_role?.role_arn ?? "");
+  const [externalId, setExternalId] = useState(initialData?.extras?.assume_role?.external_id ?? "");
+  const [roleDuration, setRoleDuration] = useState(String(initialData?.extras?.assume_role?.duration_secs ?? ""));
+
+  // Azure (Blob, Data Lake, Files): the account is the user name, the
+  // endpoint the host and the key / SAS / connection string the password.
+  const [azureAuthMethod, setAzureAuthMethod] = useState<"account_key" | "sas_token" | "connection_string">("account_key");
 
   // OpenStack Swift fields
-  const [swiftAuthUrl, setSwiftAuthUrl] = useState("");
-  const [swiftProjectName, setSwiftProjectName] = useState("");
-  const [swiftDomainName, setSwiftDomainName] = useState("Default");
-  const [swiftRegion, setSwiftRegion] = useState("");
+  const initialSwift = initialData?.extras?.swift;
+  const [swiftAuthKind, setSwiftAuthKind] = useState<SwiftAuthKind>(initialSwift?.auth_kind ?? "password");
+  const [swiftAuthUrl, setSwiftAuthUrl] = useState(initialSwift?.auth_url ?? "");
+  const [swiftProjectName, setSwiftProjectName] = useState(initialSwift?.project_name ?? "");
+  const [swiftDomainName, setSwiftDomainName] = useState(initialSwift?.domain_name ?? "Default");
+  const [swiftRegion, setSwiftRegion] = useState(initialSwift?.region ?? "");
+  const [swiftCredentialId, setSwiftCredentialId] = useState(initialSwift?.application_credential_id ?? "");
+
+  // SFTP private-key passphrase (stored in the credential store; blank = unchanged)
+  const [keyPassphrase, setKeyPassphrase] = useState("");
+  // Editing: forget the stored passphrase (sends "" — the backend deletes it)
+  const [removeKeyPassphrase, setRemoveKeyPassphrase] = useState(false);
+
+  // WebDAV sign-in mode and server vendor
+  const [webdavAuth, setWebdavAuth] = useState<WebDavAuthMode>(initialData?.extras?.webdav?.auth ?? "basic");
+  const [webdavVendor, setWebdavVendor] = useState<WebDavVendor>(initialData?.extras?.webdav?.vendor ?? "generic");
+
+  // SMB Windows domain
+  const [smbDomain, setSmbDomain] = useState(initialData?.extras?.smb?.domain ?? "");
+
+  // Google Drive / OneDrive / Dropbox: app, account kind and where it opens
+  const [cloud, setCloud] = useState<CloudExtras>({
+    oauth: initialData?.extras?.oauth ?? null,
+    google_drive: initialData?.extras?.google_drive ?? null,
+    onedrive: initialData?.extras?.onedrive ?? null,
+    dropbox: initialData?.extras?.dropbox ?? null,
+  });
+  const advancedView = useUIStore((st) => st.appMode === "advanced");
 
   // Auto-expand Advanced section when editing a connection that has advanced fields set
   useEffect(() => {
@@ -563,22 +732,27 @@ function ConnectionForm({
   );
 
   // Handle S3 preset selection
-  const handleS3PresetSelect = useCallback(
-    (presetId: string) => {
-      setSelectedS3Preset(presetId);
-      const preset = S3_PRESETS.find((p) => p.id === presetId);
-      if (preset && preset.endpoint) {
-        setHost(preset.endpoint);
-      }
+  // Apply a provider preset: host (and port) from its template.
+  const applyPreset = useCallback(
+    (presetId: string, values: Record<string, string>) => {
+      const preset = presets.find((p) => p.id === presetId);
+      if (!preset) return;
+      const vals = { region: preset.default_region ?? "", ...values };
+      setHost(fillPreset(preset.host, vals));
+      if (preset.port) setPort(String(preset.port));
     },
-    []
+    [presets],
   );
-
   const isFtpProtocol = protocol === "ftp" || protocol === "ftps";
   const isSshProtocol = protocol === "sftp";
-  const isAzureBlob = protocol === "azure_blob";
+  const isAzure = AZURE_PROTOCOLS.has(protocol);
+  const isRclone = protocol === "rclone";
   const isSwift = protocol === "swift";
   const isS3 = protocol === "s3";
+  const isWebDav = protocol === "webdav";
+  const isSmb = protocol === "smb";
+  const isB2 = protocol === "b2";
+  const isOAuth = OAUTH_PROTOCOLS.has(protocol);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -608,6 +782,39 @@ function ConnectionForm({
       // Upload-time permission defaults (SFTP/FTP only)
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
+      // SFTP key passphrase: sent when typed, "" removes the stored one,
+      // null keeps it
+      keyPassphrase: !isSshProtocol ? null : removeKeyPassphrase ? "" : keyPassphrase || null,
+      extras: {
+        // Keep settings this form does not show (other protocols, pickers).
+        ...(initialData?.extras ?? {}),
+        rclone_remote: protocol === "rclone" ? host.trim() || null : initialData?.extras?.rclone_remote ?? null,
+        preset: selectedPreset || null,
+        assume_role:
+          isS3 && roleArn.trim()
+            ? { role_arn: roleArn.trim(), external_id: externalId.trim() || null, session_name: null, duration_secs: roleDuration ? Number(roleDuration) : null }
+            : null,
+        swift: isSwift
+          ? {
+              auth_kind: swiftAuthKind,
+              auth_url: swiftAuthUrl.trim() || null,
+              project_name: swiftAuthKind === "password" ? swiftProjectName.trim() || null : null,
+              domain_name: swiftAuthKind === "password" ? swiftDomainName.trim() || null : null,
+              region: swiftAuthKind === "temp_auth" ? null : swiftRegion.trim() || null,
+              application_credential_id: swiftAuthKind === "application_credential" ? swiftCredentialId.trim() || null : null,
+            }
+          : null,
+        ...(isWebDav ? { webdav: { auth: webdavAuth, vendor: webdavVendor } } : {}),
+        ...(isSmb ? { smb: { domain: smbDomain.trim() || null } } : {}),
+        ...(isOAuth
+          ? {
+              oauth: cloud.oauth ? { ...cloud.oauth, client_id: cloud.oauth.client_id?.trim() || null } : null,
+              google_drive: protocol === "google_drive" ? cloud.google_drive ?? null : initialData?.extras?.google_drive,
+              onedrive: protocol === "onedrive" ? cloud.onedrive ?? null : initialData?.extras?.onedrive,
+              dropbox: protocol === "dropbox" ? cloud.dropbox ?? null : initialData?.extras?.dropbox,
+            }
+          : {}),
+      } satisfies ConnectionExtras,
     });
   };
 
@@ -642,6 +849,7 @@ function ConnectionForm({
             ))}
           </select>
         </div>
+        {!isOAuth && !isB2 && (
         <div>
           <label className="block text-xs font-medium mb-1">Port</label>
           <input
@@ -652,7 +860,16 @@ function ConnectionForm({
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           />
         </div>
+        )}
       </div>
+      {isOAuth && (
+        <p className="text-xs text-gray-500 dark:text-gray-400" data-testid="oauth-form-hint">
+          {initialData ? "Use Sign in on the connection to change the account." : "After saving, sign in with your browser; no password is stored."}
+        </p>
+      )}
+      {!isAzure && !isOAuth && (
+      <>
+      {!isB2 && (
       <div>
         <div className="flex items-center gap-1 mb-1">
           <label className="block text-xs font-medium">Host</label>
@@ -670,25 +887,51 @@ function ConnectionForm({
             setSshConfigHint(null);
           }}
           onBlur={handleHostBlur}
-          required
+          required={!(isSwift && swiftAuthUrl.trim())}
           placeholder="example.com"
           className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
         />
       </div>
+      )}
+      {isWebDav && (
+        <div className="grid grid-cols-2 gap-2" data-testid="webdav-fields">
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="webdav-auth">Sign in with</label>
+            <select id="webdav-auth" value={webdavAuth} onChange={(e) => setWebdavAuth(e.target.value as WebDavAuthMode)} className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900">
+              <option value="basic">User name and password</option>
+              <option value="bearer">Bearer token</option>
+              <option value="none">No sign-in</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="webdav-vendor">Server</label>
+            <select id="webdav-vendor" value={webdavVendor} onChange={(e) => setWebdavVendor(e.target.value as WebDavVendor)} className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900">
+              <option value="generic">Generic WebDAV</option>
+              <option value="nextcloud">Nextcloud</option>
+              <option value="owncloud">ownCloud</option>
+            </select>
+          </div>
+        </div>
+      )}
+      {!(isWebDav && webdavAuth === "none") && (
       <div className="grid grid-cols-2 gap-2">
+        {!(isWebDav && webdavAuth === "bearer") && (
         <div>
-          <label className="block text-xs font-medium mb-1">Username</label>
+          <label className="block text-xs font-medium mb-1" htmlFor="conn-username">{isB2 ? "Application key ID" : "Username"}</label>
           <input
+            id="conn-username"
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
+            required={isB2}
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           />
         </div>
+        )}
         <div>
-          <label className="block text-xs font-medium mb-1">Password</label>
-          <input
-            type="password"
+          <label className="block text-xs font-medium mb-1" htmlFor="conn-password">{isB2 ? "Application key" : isWebDav && webdavAuth === "bearer" ? "Bearer token" : "Password"}</label>
+          <PasswordInput
+            id="conn-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder={initialData ? "(unchanged)" : ""}
@@ -696,14 +939,69 @@ function ConnectionForm({
           />
         </div>
       </div>
+      )}
+      {isSmb && (
+        <div>
+          <label className="block text-xs font-medium mb-1" htmlFor="smb-domain">
+            Domain
+            <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
+          </label>
+          <input id="smb-domain" type="text" value={smbDomain} onChange={(e) => setSmbDomain(e.target.value)} placeholder="CORP" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+        </div>
+      )}
+      </>
+      )}
+      {isOAuth && (
+        <>
+          <CloudScopeFields protocol={protocol} connectionId={initialData?.id ?? null} value={cloud} onChange={setCloud} />
+          {advancedView && (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="oauth-app-client-id">
+                OAuth client ID
+                <span className="text-gray-400 dark:text-gray-500 font-normal"> (your own app; blank = built-in)</span>
+              </label>
+              <input
+                id="oauth-app-client-id"
+                value={cloud.oauth?.client_id ?? ""}
+                onChange={(e) => setCloud((c) => ({ ...c, oauth: { ...(c.oauth ?? ({ account_kind: "personal" } as OAuthSettings)), client_id: e.target.value } }))}
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono"
+              />
+            </div>
+          )}
+        </>
+      )}
       {/* SSH Key Generation (SFTP only) */}
       {isSshProtocol && (
         <SshKeyGenSection
-          onKeyGenerated={(keyPath) => {
+          onKeyGenerated={(keyPath, keyPass) => {
             setPassword(keyPath);
+            // The new key's passphrase unlocks it when connecting.
+            if (keyPass) setKeyPassphrase(keyPass);
             setSshConfigHint("key generated");
           }}
         />
+      )}
+      {isSshProtocol && (
+        <div>
+          <label className="block text-xs font-medium mb-1" htmlFor="sftp-key-passphrase">
+            Key passphrase
+            <span className="text-gray-400 dark:text-gray-500 font-normal"> (if the private key has one)</span>
+          </label>
+          <PasswordInput
+            id="sftp-key-passphrase"
+            value={removeKeyPassphrase ? "" : keyPassphrase}
+            onChange={(e) => setKeyPassphrase(e.target.value)}
+            placeholder={initialData ? (removeKeyPassphrase ? "(will be removed)" : "(unchanged)") : ""}
+            disabled={removeKeyPassphrase}
+            className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 disabled:opacity-50"
+          />
+          {initialData && (
+            <label className="mt-1 flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-400">
+              <input type="checkbox" checked={removeKeyPassphrase} onChange={(e) => setRemoveKeyPassphrase(e.target.checked)} />
+              Remove saved passphrase
+            </label>
+          )}
+        </div>
       )}
       {/* AWS Profile selector (S3 only) */}
       {protocol === "s3" && awsProfiles.length > 0 && (
@@ -727,144 +1025,249 @@ function ConnectionForm({
           </p>
         </div>
       )}
-      {/* S3-compatible provider presets (S3 only) */}
-      {isS3 && (
+      {/* Provider presets (S3-compatible stores, hosted SFTP) */}
+      {presets.some((p) => p.protocol === protocol) && (() => {
+        const preset = presets.find((p) => p.id === selectedPreset && p.protocol === protocol);
+        return (
+          <div className="space-y-1">
+            <label className="block text-xs font-medium mb-1" htmlFor="provider-preset">Provider</label>
+            <select
+              id="provider-preset"
+              value={preset ? selectedPreset : ""}
+              onChange={(e) => {
+                setSelectedPreset(e.target.value);
+                setPresetValues({});
+                applyPreset(e.target.value, {});
+              }}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            >
+              <option value="">{isS3 ? "Custom / Amazon S3" : "Custom server"}</option>
+              {presets.filter((p) => p.protocol === protocol).map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+            {preset?.fields.map((f) => (
+              <div key={f}>
+                <label className="block text-xs font-medium mb-1" htmlFor={`preset-${f}`}>{PRESET_FIELD_LABELS[f] ?? f}</label>
+                <input
+                  id={`preset-${f}`}
+                  value={presetValues[f] ?? (f === "region" ? preset.default_region ?? "" : "")}
+                  onChange={(e) => {
+                    const next = { ...presetValues, [f]: e.target.value };
+                    setPresetValues(next);
+                    applyPreset(preset.id, next);
+                  }}
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+            ))}
+            {preset?.username && (
+              <p className="text-[10px] text-blue-500 dark:text-blue-400" data-testid="preset-username">
+                Username format: {fillPreset(preset.username, { ...presetValues, user: "your-username" })}
+              </p>
+            )}
+            {preset?.help && <p className="text-[10px] text-blue-500 dark:text-blue-400">{preset.help}</p>}
+          </div>
+        );
+      })()}
+      {/* rclone remote picker */}
+      {isRclone && (
         <div>
-          <label className="block text-xs font-medium mb-1">S3 Provider Preset</label>
+          <label className="block text-xs font-medium mb-1" htmlFor="rclone-remote">rclone remote</label>
           <select
-            value={selectedS3Preset}
-            onChange={(e) => handleS3PresetSelect(e.target.value)}
+            id="rclone-remote"
+            value={rcloneRemotes?.some((r) => r.name === host) ? host : ""}
+            onChange={(e) => {
+              setHost(e.target.value);
+              if (!name) setName(e.target.value.replace(/:$/, ""));
+            }}
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           >
-            <option value="">Custom / Amazon S3</option>
-            {S3_PRESETS.filter((p) => p.id !== "aws").map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.label}
-              </option>
+            <option value="">{rcloneRemotes === null ? "Loading…" : rcloneRemotes.length ? "Choose a remote…" : "No remotes configured"}</option>
+            {rcloneRemotes?.map((r) => (
+              <option key={r.name} value={r.name}>{r.name} ({r.backend})</option>
             ))}
           </select>
-          {selectedS3Preset && (() => {
-            const preset = S3_PRESETS.find((p) => p.id === selectedS3Preset);
-            return preset?.helpText ? (
-              <p className="text-[10px] text-blue-500 dark:text-blue-400 mt-0.5">
-                {preset.helpText}
-              </p>
-            ) : null;
-          })()}
+          <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
+            {rcloneError ?? "Remotes come from `rclone config`. You can also type one in Host, e.g. gcs:my-bucket or :s3,provider=AWS:."}
+          </p>
+          {onManageRclone && (
+            <button type="button" onClick={onManageRclone} className="mt-1 text-[11px] text-blue-600 dark:text-blue-400 hover:underline" data-testid="rclone-manage-remotes">
+              New or edit rclone remotes…
+            </button>
+          )}
         </div>
       )}
-      {/* Azure Blob Storage fields */}
-      {isAzureBlob && (
-        <div className="space-y-2">
+      {/* STS AssumeRole (S3 only) */}
+      {isS3 && (
+        <details className="rounded border border-gray-200 dark:border-gray-700 p-2" open={!!roleArn}>
+          <summary className="text-xs font-medium cursor-pointer">Assume an IAM role</summary>
+          <div className="space-y-2 mt-2">
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="role-arn">Role ARN</label>
+              <input id="role-arn" value={roleArn} onChange={(e) => setRoleArn(e.target.value)} placeholder="arn:aws:iam::123456789012:role/Reader" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono" />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="role-external-id">External ID</label>
+                <input id="role-external-id" value={externalId} onChange={(e) => setExternalId(e.target.value)} placeholder="optional" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="role-duration">Session length (s)</label>
+                <input id="role-duration" type="number" min={900} max={43200} value={roleDuration} onChange={(e) => setRoleDuration(e.target.value)} placeholder="3600" className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900" />
+              </div>
+            </div>
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">
+              The access key and secret above sign the AssumeRole call; the app uses the temporary credentials and renews them before they expire.
+            </p>
+          </div>
+        </details>
+      )}
+      {/* Azure Blob / Data Lake / Files fields */}
+      {isAzure && (
+        <div className="space-y-2" data-testid="azure-fields">
           <div>
-            <label className="block text-xs font-medium mb-1">Account Name</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-account">Storage account</label>
             <input
+              id="azure-account"
               type="text"
-              value={azureAccountName}
-              onChange={(e) => setAzureAccountName(e.target.value)}
-              placeholder="mystorageaccount"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder={azureAuthMethod === "connection_string" ? "(from the connection string)" : "mystorageaccount"}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
           </div>
           <div>
-            <label className="block text-xs font-medium mb-1">Auth Method</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-auth">Sign in with</label>
             <select
+              id="azure-auth"
               value={azureAuthMethod}
               onChange={(e) => setAzureAuthMethod(e.target.value as typeof azureAuthMethod)}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             >
-              <option value="account_key">Account Key</option>
-              <option value="sas_token">SAS Token</option>
-              <option value="connection_string">Connection String</option>
-              <option value="azure_ad">Azure AD</option>
+              <option value="account_key">Account key</option>
+              <option value="sas_token">SAS token</option>
+              <option value="connection_string">Connection string</option>
             </select>
           </div>
-          {azureAuthMethod !== "azure_ad" && (
-            <div>
-              <label className="block text-xs font-medium mb-1">
-                {azureAuthMethod === "account_key"
-                  ? "Account Key"
-                  : azureAuthMethod === "sas_token"
-                    ? "SAS Token"
-                    : "Connection String"}
-              </label>
-              <input
-                type="password"
-                value={azureSecret}
-                onChange={(e) => setAzureSecret(e.target.value)}
-                placeholder={
-                  azureAuthMethod === "connection_string"
-                    ? "DefaultEndpointsProtocol=https;AccountName=..."
-                    : ""
-                }
-                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-              />
-            </div>
-          )}
           <div>
-            <label className="block text-xs font-medium mb-1">
-              Custom Endpoint URL
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-secret">
+              {azureAuthMethod === "account_key" ? "Account key" : azureAuthMethod === "sas_token" ? "SAS token" : "Connection string"}
+            </label>
+            <PasswordInput
+              id="azure-secret"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={initialData ? "(unchanged)" : azureAuthMethod === "connection_string" ? "DefaultEndpointsProtocol=https;AccountName=…" : azureAuthMethod === "sas_token" ? "sv=…&sig=…" : ""}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="azure-endpoint">
+              Endpoint
               <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
             </label>
             <input
+              id="azure-endpoint"
               type="text"
-              value={azureCustomEndpoint}
-              onChange={(e) => setAzureCustomEndpoint(e.target.value)}
-              placeholder="For Azure Gov, China, or Azurite"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder={AZURE_ENDPOINT_HINT[protocol]}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
             <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
-              Leave blank for standard Azure public cloud
+              Leave blank for the public Azure cloud. For Azure Government, Azure China or the Azurite emulator, enter the host or URL.
             </p>
           </div>
         </div>
       )}
       {/* OpenStack Swift fields */}
       {isSwift && (
-        <div className="space-y-2">
+        <div className="space-y-2" data-testid="swift-fields">
           <div>
-            <label className="block text-xs font-medium mb-1">Auth URL</label>
+            <label className="block text-xs font-medium mb-1" htmlFor="swift-auth-kind">Sign in with</label>
+            <select
+              id="swift-auth-kind"
+              value={swiftAuthKind}
+              onChange={(e) => setSwiftAuthKind(e.target.value as SwiftAuthKind)}
+              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+            >
+              <option value="password">Keystone user name and password</option>
+              <option value="application_credential">Keystone application credential</option>
+              <option value="temp_auth">TempAuth (v1)</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" htmlFor="swift-auth-url">Auth URL</label>
             <input
+              id="swift-auth-url"
               type="text"
               value={swiftAuthUrl}
               onChange={(e) => setSwiftAuthUrl(e.target.value)}
-              placeholder="https://keystone.example.com:5000/v3"
+              placeholder={swiftAuthKind === "temp_auth" ? "https://swift.example.com/auth/v1.0" : "https://keystone.example.com:5000/v3"}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
             />
+            <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">
+              Leave blank to use the host and port above{swiftAuthKind === "temp_auth" ? " with /auth/v1.0" : " with /v3"}.
+            </p>
           </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">Project Name</label>
-            <input
-              type="text"
-              value={swiftProjectName}
-              onChange={(e) => setSwiftProjectName(e.target.value)}
-              placeholder="my-project"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">Domain Name</label>
-            <input
-              type="text"
-              value={swiftDomainName}
-              onChange={(e) => setSwiftDomainName(e.target.value)}
-              placeholder="Default"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium mb-1">
-              Region
-              <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
-            </label>
-            <input
-              type="text"
-              value={swiftRegion}
-              onChange={(e) => setSwiftRegion(e.target.value)}
-              placeholder="RegionOne"
-              className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-            />
-          </div>
+          {swiftAuthKind === "application_credential" && (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="swift-credential-id">Application credential ID</label>
+              <input
+                id="swift-credential-id"
+                type="text"
+                value={swiftCredentialId}
+                onChange={(e) => setSwiftCredentialId(e.target.value)}
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+              />
+              <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">Enter the credential secret as the password; the credential's own project applies.</p>
+            </div>
+          )}
+          {swiftAuthKind === "password" && (
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="swift-project">Project name</label>
+                <input
+                  id="swift-project"
+                  type="text"
+                  value={swiftProjectName}
+                  onChange={(e) => setSwiftProjectName(e.target.value)}
+                  placeholder="my-project"
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium mb-1" htmlFor="swift-domain">Domain</label>
+                <input
+                  id="swift-domain"
+                  type="text"
+                  value={swiftDomainName}
+                  onChange={(e) => setSwiftDomainName(e.target.value)}
+                  placeholder="Default"
+                  className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+                />
+              </div>
+            </div>
+          )}
+          {swiftAuthKind === "temp_auth" ? (
+            <p className="text-[10px] text-gray-400 dark:text-gray-500">Enter the user as account:user and the key as the password.</p>
+          ) : (
+            <div>
+              <label className="block text-xs font-medium mb-1" htmlFor="swift-region">
+                Region
+                <span className="text-gray-400 dark:text-gray-500 font-normal"> (optional)</span>
+              </label>
+              <input
+                id="swift-region"
+                type="text"
+                value={swiftRegion}
+                onChange={(e) => setSwiftRegion(e.target.value)}
+                placeholder="RegionOne"
+                className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
+              />
+            </div>
+          )}
         </div>
       )}
       <div>
@@ -975,8 +1378,7 @@ function ConnectionForm({
                       <label className="block text-xs font-medium mb-1">
                         Proxy Password
                       </label>
-                      <input
-                        type="password"
+                      <PasswordInput
                         value={proxyPassword}
                         onChange={(e) => setProxyPassword(e.target.value)}
                         placeholder="(optional)"
@@ -1134,24 +1536,58 @@ function ConnectionForm({
 function ConnectionItem({
   connection,
   onConnect,
+  onMount,
   onTest,
   onEdit,
   onDelete,
   testResult,
   testing,
   isConnected,
+  status,
+  onToggleStar,
+  onRetry,
+  onSignIn,
+  signedIn,
+  onSignOut,
+  onOpenInPane,
 }: {
   connection: ConnectionProfile;
+  /** Open this connection in the active file pane. */
+  onOpenInPane?: (conn: ConnectionProfile) => void;
   onConnect: (id: string) => void;
+  onMount: (conn: ConnectionProfile) => void;
   onTest: (id: string) => void;
   onEdit: (conn: ConnectionProfile) => void;
   onDelete: (id: string) => void;
   testResult: ConnectionTestResult | null;
   testing: boolean;
   isConnected: boolean;
+  status?: ConnectionStatus;
+  onToggleStar?: (id: string, starred: boolean) => void;
+  onRetry?: (id: string) => void;
+  onSignIn?: (conn: ConnectionProfile) => void;
+  /** Google Drive / Dropbox / OneDrive: whether a sign-in is stored (null: unknown). */
+  signedIn?: boolean | null;
+  onSignOut?: (conn: ConnectionProfile) => void;
 }) {
+  const starred = !!status?.starred;
+  const isOAuth = OAUTH_PROTOCOLS.has(connection.protocol);
+  const rejected = !!status?.credentials_rejected_at;
   return (
     <div className="flex items-center justify-between px-3 py-2 border-b border-gray-200 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/50">
+      {onToggleStar && (
+        <button
+          onClick={() => onToggleStar(connection.id, !starred)}
+          className={`mr-1 text-sm leading-none ${starred ? "text-amber-500" : "text-gray-300 dark:text-gray-600 hover:text-amber-400"}`}
+          type="button"
+          aria-label={starred ? `Unstar ${connection.name}` : `Star ${connection.name}`}
+          aria-pressed={starred}
+          title={starred ? "Unstar" : "Star (list first)"}
+          data-testid={`star-${connection.id}`}
+        >
+          {starred ? "\u2605" : "\u2606"}
+        </button>
+      )}
       <button
         onClick={() => onConnect(connection.id)}
         className="flex-1 min-w-0 text-left"
@@ -1161,9 +1597,9 @@ function ConnectionItem({
           {/* Connection status indicator */}
           <span
             className={`w-2 h-2 rounded-full flex-shrink-0 ${
-              isConnected ? "bg-green-500" : "bg-gray-300 dark:bg-gray-600"
+              rejected ? "bg-red-500" : isConnected ? "bg-green-500" : "bg-gray-300 dark:bg-gray-600"
             }`}
-            title={isConnected ? "Connected" : "Disconnected"}
+            title={rejected ? "Credentials rejected" : isConnected ? "Connected" : "Disconnected"}
           />
           <span className="text-sm font-medium truncate">
             {connection.name}
@@ -1186,8 +1622,60 @@ function ConnectionItem({
           {connection.port ? `:${connection.port}` : ""}{" "}
           {connection.username ? `(${connection.username})` : ""}
         </div>
+        {isOAuth && signedIn === false && (
+          <div className="text-xs text-amber-600 dark:text-amber-400 truncate" data-testid={`not-signed-in-${connection.id}`}>
+            Not signed in: click Sign in to connect.
+          </div>
+        )}
+        {rejected && (
+          <div className="text-xs text-red-600 dark:text-red-400 truncate" data-testid={`rejected-${connection.id}`} title={status?.credentials_rejected_reason ?? undefined}>
+            Credentials rejected: automatic reconnects are paused. Edit the connection or click Retry.
+          </div>
+        )}
       </button>
       <div className="flex items-center gap-1 ml-2">
+        {rejected && onRetry && (
+          <button
+            onClick={() => onRetry(connection.id)}
+            className="text-xs px-2 py-1 rounded bg-red-500 text-white hover:bg-red-600"
+            type="button"
+            title="Retry"
+          >
+            Retry
+          </button>
+        )}
+        {onSignIn && isOAuth && (
+          <button
+            onClick={() => onSignIn(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Sign in"
+          >
+            Sign in
+          </button>
+        )}
+        {onSignOut && isOAuth && signedIn === true && (
+          <button
+            onClick={() => onSignOut(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Sign out"
+            aria-label={`Sign out ${connection.name}`}
+          >
+            Sign out
+          </button>
+        )}
+        {onOpenInPane && (
+          <button
+            onClick={() => onOpenInPane(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Browse this connection in the active pane"
+            aria-label={`Open ${connection.name} in pane`}
+          >
+            Open in pane
+          </button>
+        )}
         <button
           onClick={() => onTest(connection.id)}
           disabled={testing}
@@ -1197,6 +1685,17 @@ function ConnectionItem({
         >
           {testing ? "..." : "Test"}
         </button>
+        {isMountable(connection.protocol) && (
+          <button
+            onClick={() => onMount(connection)}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            title="Mount as drive"
+            aria-label={`Mount ${connection.name} as drive`}
+          >
+            Mount
+          </button>
+        )}
         <button
           onClick={() => onEdit(connection)}
           className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
@@ -1218,9 +1717,17 @@ function ConnectionItem({
   );
 }
 
+/** "Mount as drive": open the mount dialog with this connection selected. */
+const openMountDialog = (conn: ConnectionProfile) => useMountsUi.getState().openDialog({ connectionId: conn.id });
+
 // ── Main Connection Panel ──
 
-export function ConnectionPanel() {
+export function ConnectionPanel({
+  onOpenInPane,
+}: {
+  /** "Open in pane": show this connection folder (pane path) in the active pane. */
+  onOpenInPane?: (panePath: string, name: string) => void;
+} = {}) {
   const [connections, setConnections] = useState<ConnectionProfile[]>([]);
   const [groups, setGroups] = useState<ConnectionGroup[]>([]);
   const [protocols, setProtocols] = useState<ProtocolOption[]>(FALLBACK_PROTOCOLS);
@@ -1245,6 +1752,35 @@ export function ConnectionPanel() {
   const [browseError, setBrowseError] = useState<string | null>(null);
   const [transferStatus, setTransferStatus] = useState<string | null>(null);
 
+  // Starred / credentials-rejected flags, by connection id
+  const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({});
+  // Google Drive / Dropbox / OneDrive connection being signed in
+  const [signInFor, setSignInFor] = useState<ConnectionProfile | null>(null);
+  // Whether each cloud connection has a stored sign-in, by connection id
+  const [signedIn, setSignedIn] = useState<Record<string, boolean>>({});
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+  // Storage of the connected account
+  const [quota, setQuota] = useState<RemoteQuota | null>(null);
+  // "Calculate size" results, by remote path
+  const [sizes, setSizes] = useState<Record<string, SizeState>>({});
+  const [entryMenu, setEntryMenu] = useState<{ entry: RemoteFileEntry; x: number; y: number } | null>(null);
+  const setActiveGuidedFlow = useUIStore((st) => st.setActiveGuidedFlow);
+  const [showCloudMenu, setShowCloudMenu] = useState(false);
+  // rclone remote manager, "Add as connection" pre-fill, crypt browsing
+  const rcloneUi = useRcloneUi();
+  const [formPrefill, setFormPrefill] = useState<ConnectionPrefill | null>(null);
+  const advancedMode = useUIStore((st) => st.appMode === "advanced");
+  const [cryptInfo, setCryptInfo] = useState<RcloneCryptInfo | null>(null);
+  const [cryptNamesFor, setCryptNamesFor] = useState<string | null>(null);
+  // The browser shows an ad-hoc rclone remote (a crypt remote's underlying
+  // one) as `adhoc:<remote>`; it has no saved connection id.
+  const connArg = connectedId?.startsWith(ADHOC_PREFIX) ? null : connectedId;
+
+  const refreshStatus = useCallback(async () => {
+    const list = await tauriInvoke<ConnectionStatus[]>("list_connection_status", undefined, []).catch(() => []);
+    setStatuses(Object.fromEntries((list ?? []).map((st) => [st.id, st])));
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const [conns, grps] = await Promise.all([
@@ -1253,10 +1789,32 @@ export function ConnectionPanel() {
       ]);
       setConnections(conns);
       setGroups(grps);
+      // Panes, sidebar and pickers see saved / deleted connections at once.
+      if (useConnectionsStore.getState().loaded) void useConnectionsStore.getState().load();
     } catch (err) {
       console.error("Failed to load connections:", err);
     }
-  }, []);
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  // Which cloud connections have a stored sign-in.
+  useEffect(() => {
+    let live = true;
+    const cloud = connections.filter((c) => OAUTH_PROTOCOLS.has(c.protocol));
+    void Promise.all(cloud.map(async (c) => [c.id, await isSignedIn(c.id).catch(() => false)] as const)).then((pairs) => {
+      if (live) setSignedIn(Object.fromEntries(pairs));
+    });
+    return () => {
+      live = false;
+    };
+  }, [connections]);
+
+  // A guided cloud wizard saved a connection elsewhere: reload.
+  useEffect(() => {
+    const onChanged = () => void refresh();
+    window.addEventListener(CONNECTIONS_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(CONNECTIONS_CHANGED_EVENT, onChanged);
+  }, [refresh]);
 
   // (2) connector_list_protocols - fetch available protocols on mount
   const fetchProtocols = useCallback(async () => {
@@ -1329,13 +1887,27 @@ export function ConnectionPanel() {
   const handleSave = useCallback(
     async (data: Record<string, unknown>) => {
       try {
-        await tauriInvoke("save_connection", data as Record<string, unknown>);
+        const saved = await tauriInvoke<ConnectionProfile | undefined>("save_connection", data as Record<string, unknown>);
         setShowForm(false);
         setEditingConnection(null);
         refresh();
+        // A new Google Drive / Dropbox / OneDrive connection signs in next.
+        if (saved && !data.connectionId && OAUTH_PROTOCOLS.has(saved.protocol)) setSignInFor(saved);
       } catch (err) {
         console.error("Failed to save connection:", err);
       }
+    },
+    [refresh]
+  );
+
+  const handleToggleStar = useCallback(
+    async (id: string, starred: boolean) => {
+      try {
+        await tauriInvoke("set_connection_starred", { connectionId: id, starred });
+      } catch (err) {
+        console.error("Failed to star connection:", err);
+      }
+      refresh();
     },
     [refresh]
   );
@@ -1384,7 +1956,7 @@ export function ConnectionPanel() {
   }, []);
 
   const handleConnect = useCallback(
-    async (id: string) => {
+    async (id: string, startPath?: string) => {
       setBrowseError(null);
       setBrowsing(true);
       try {
@@ -1404,10 +1976,10 @@ export function ConnectionPanel() {
         });
 
         // 3. List remote directory contents
-        const initialPath = conn.remote_path || "/";
+        const initialPath = startPath || conn.remote_path || "/";
         const files = await tauriInvoke<RemoteFileEntry[]>(
           "connector_list_remote",
-          { protocol: conn.protocol, path: initialPath },
+          { protocol: conn.protocol, path: initialPath, connectionId: id },
           []
         );
 
@@ -1416,8 +1988,14 @@ export function ConnectionPanel() {
         setConnectedProtocol(conn.protocol);
         setRemotePath(initialPath);
         setRemoteFiles(files);
+        setSizes({});
         // Mark as connected immediately
         setConnectedProtocols((prev) => new Set([...prev, conn.protocol]));
+        // 5. Storage quota, where the provider reports one
+        setQuota(null);
+        tauriInvoke<RemoteQuota | null>("connector_quota", { protocol: conn.protocol, connectionId: id }, null)
+          .then((q) => setQuota(q ?? null))
+          .catch(() => setQuota(null));
       } catch (err) {
         console.error("Failed to connect:", err);
         setBrowseError(
@@ -1425,10 +2003,67 @@ export function ConnectionPanel() {
         );
       } finally {
         setBrowsing(false);
+        // A rejected sign-in flags the connection (and a success clears it).
+        void refreshStatus();
       }
     },
-    []
+    [refreshStatus]
   );
+
+  // Retry: clear the credentials-rejected flag, then connect.
+  const handleRetry = useCallback(
+    async (id: string) => {
+      try {
+        await tauriInvoke("clear_connection_credentials_rejected", { connectionId: id });
+      } catch (err) {
+        console.error("Failed to clear the flag:", err);
+      }
+      await handleConnect(id);
+    },
+    [handleConnect]
+  );
+
+  // A history row asked to open a folder of a saved connection here.
+  const browseRequest = useConnectionBrowse((st) => st.request);
+  useEffect(() => {
+    if (!browseRequest) return;
+    const req = useConnectionBrowse.getState().consume();
+    if (req) void handleConnect(req.connectionId, req.path);
+  }, [browseRequest, handleConnect]);
+
+  const sizeJob = useRef(0);
+  const handleCalculateSize = useCallback(
+    async (entry: RemoteFileEntry) => {
+      if (!connectedProtocol) return;
+      const jobId = `size-${Date.now()}-${++sizeJob.current}`;
+      setSizes((prev) => ({ ...prev, [entry.path]: { jobId, running: true } }));
+      try {
+        const result = await tauriInvoke<FolderSize>("connector_folder_size", { protocol: connectedProtocol, path: entry.path, jobId, connectionId: connArg });
+        setSizes((prev) => ({ ...prev, [entry.path]: { running: false, result } }));
+      } catch (err) {
+        setSizes((prev) => ({ ...prev, [entry.path]: { running: false, error: errorText(err) } }));
+      }
+    },
+    [connectedProtocol, connArg]
+  );
+
+  const handleCancelSize = useCallback(async (path: string) => {
+    const st = sizes[path];
+    if (st?.running) await tauriInvoke("connector_folder_size_cancel", { jobId: st.jobId }, false).catch(() => false);
+  }, [sizes]);
+
+  // Close the entry context menu on any outside click / Escape
+  useEffect(() => {
+    if (!entryMenu) return;
+    const close = () => setEntryMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [entryMenu]);
 
   const handleDisconnect = useCallback(async () => {
     if (connectedProtocol) {
@@ -1450,7 +2085,27 @@ export function ConnectionPanel() {
     setRemoteFiles([]);
     setRemotePath("/");
     setBrowseError(null);
+    setQuota(null);
+    setSizes({});
   }, [connectedProtocol]);
+
+  // Forget a cloud connection's sign-in; stop browsing it if it is open.
+  const handleSignOut = useCallback(
+    async (conn: ConnectionProfile) => {
+      setSignOutError(null);
+      try {
+        await signOut(conn.id);
+      } catch (err) {
+        setSignOutError(`${conn.name}: ${errorText(err)}`);
+        return;
+      }
+      // The row now reads "Not signed in".
+      setSignedIn((prev) => ({ ...prev, [conn.id]: false }));
+      if (connectedId === conn.id) await handleDisconnect();
+      void refreshStatus();
+    },
+    [connectedId, handleDisconnect, refreshStatus]
+  );
 
   const handleBrowse = useCallback(
     async (path: string) => {
@@ -1460,7 +2115,7 @@ export function ConnectionPanel() {
       try {
         const files = await tauriInvoke<RemoteFileEntry[]>(
           "connector_list_remote",
-          { protocol: connectedProtocol, path },
+          { protocol: connectedProtocol, path, connectionId: connArg },
           []
         );
         setRemoteFiles(files);
@@ -1473,15 +2128,62 @@ export function ConnectionPanel() {
         setBrowsing(false);
       }
     },
-    [connectedProtocol]
+    [connectedProtocol, connArg]
   );
 
   // Derive the connected connection name for the header
   const connectedName = useMemo(() => {
     if (!connectedId) return null;
+    if (connectedId.startsWith(ADHOC_PREFIX)) return connectedId.slice(ADHOC_PREFIX.length);
     const conn = connections.find((c) => c.id === connectedId);
     return conn?.name || connectedId;
   }, [connectedId, connections]);
+
+  // The rclone remote the browser shows (saved connection or ad-hoc).
+  const connectedRcloneRemote = useMemo(() => {
+    if (connectedProtocol !== "rclone" || !connectedId) return null;
+    if (connectedId.startsWith(ADHOC_PREFIX)) return connectedId.slice(ADHOC_PREFIX.length);
+    const conn = connections.find((c) => c.id === connectedId);
+    return conn ? conn.extras?.rclone_remote?.trim() || conn.host : null;
+  }, [connectedProtocol, connectedId, connections]);
+
+  // Advanced: is it a crypt remote? (banner + underlying remote)
+  useEffect(() => {
+    setCryptInfo(null);
+    if (!advancedMode || !connectedRcloneRemote) return;
+    let live = true;
+    rcloneCryptInfo(connectedRcloneRemote).then(
+      (i) => live && setCryptInfo(i),
+      () => live && setCryptInfo(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [advancedMode, connectedRcloneRemote]);
+
+  // Browse an rclone remote that has no saved connection (a crypt remote's
+  // underlying remote) with the shared rclone connector.
+  const handleOpenAdhoc = useCallback(async (remote: string) => {
+    setBrowseError(null);
+    setBrowsing(true);
+    try {
+      await tauriInvoke("connector_connect", { protocol: "rclone", host: remote, port: null, username: null, remotePath: "/", connectionId: null });
+      const files = await tauriInvoke<RemoteFileEntry[]>("connector_list_remote", { protocol: "rclone", path: "/", connectionId: null }, []);
+      setConnectedId(`${ADHOC_PREFIX}${remote}`);
+      setConnectedProtocol("rclone");
+      setRemotePath("/");
+      setRemoteFiles(files);
+      setSizes({});
+      setQuota(null);
+      setConnectedProtocols((prev) => new Set([...prev, "rclone"]));
+    } catch (err) {
+      setBrowseError(errorText(err));
+    } finally {
+      setBrowsing(false);
+    }
+  }, []);
+
+  const [sharingEntry, setSharing] = useState<RemoteFileEntry | null>(null);
 
   const joinRemote = (dir: string, name: string) => (dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`);
 
@@ -1489,15 +2191,15 @@ export function ConnectionPanel() {
     if (!connectedProtocol) return;
     const files = await tauriInvoke<RemoteFileEntry[]>(
       "connector_list_remote",
-      { protocol: connectedProtocol, path: remotePath },
+      { protocol: connectedProtocol, path: remotePath, connectionId: connArg },
       [],
     );
     setRemoteFiles(files);
-  }, [connectedProtocol, remotePath]);
+  }, [connectedProtocol, connArg, remotePath]);
 
   const handleUpload = useCallback(async () => {
     if (!connectedProtocol) return;
-    const files = await pickFiles("Select files to upload");
+    const files = await pickFiles("Select files to upload", useUIStore.getState().defaultUploadDir);
     if (files.length === 0) return;
     setBrowseError(null);
     let done = 0;
@@ -1509,6 +2211,7 @@ export function ConnectionPanel() {
           protocol: connectedProtocol,
           localPath: local,
           remotePath: joinRemote(remotePath, name),
+          connectionId: connArg,
         });
         done++;
       }
@@ -1518,26 +2221,31 @@ export function ConnectionPanel() {
       setTransferStatus(null);
       setBrowseError(`Upload failed after ${done}/${files.length}: ${errorText(err)}`);
     }
-  }, [connectedProtocol, remotePath, reloadRemote]);
+  }, [connectedProtocol, connArg, remotePath, reloadRemote]);
 
   const handleDownload = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
-    const dir = await pickFolder(`Choose where to save ${entry.name}`);
+    const dir = await pickFolder(`Choose where to save ${entry.name}`, useUIStore.getState().defaultDownloadDir);
     if (!dir) return;
     setBrowseError(null);
+    // A native Google file downloads as an export: give it the format's extension.
+    const fileName = connectedProtocol === "google_drive"
+      ? googleDownloadName(entry.name, entry.extension, connections.find((c) => c.id === connectedId)?.extras?.google_drive?.export_formats)
+      : entry.name;
     setTransferStatus(`Downloading ${entry.name}...`);
     try {
       const bytes = await tauriInvoke<number>("connector_download", {
         protocol: connectedProtocol,
         remotePath: entry.path,
-        localPath: `${dir.replace(/\/$/, "")}/${entry.name}`,
+        localPath: `${dir.replace(/\/$/, "")}/${fileName}`,
+        connectionId: connArg,
       });
-      setTransferStatus(`Downloaded ${entry.name} (${formatFileSize(bytes)}) to ${dir}.`);
+      setTransferStatus(`Downloaded ${fileName} (${formatFileSize(bytes)}) to ${dir}.`);
     } catch (err) {
       setTransferStatus(null);
       setBrowseError(`Download failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol]);
+  }, [connectedProtocol, connectedId, connArg, connections]);
 
   const handleRemoteMkdir = useCallback(async () => {
     if (!connectedProtocol) return;
@@ -1548,13 +2256,14 @@ export function ConnectionPanel() {
       await tauriInvoke("connector_make_directory", {
         protocol: connectedProtocol,
         remotePath: joinRemote(remotePath, name),
+        connectionId: connArg,
       });
       setTransferStatus(`Created folder ${name}.`);
       await reloadRemote();
     } catch (err) {
       setBrowseError(`Create folder failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, remotePath, reloadRemote]);
+  }, [connectedProtocol, connArg, remotePath, reloadRemote]);
 
   const handleRemoteDelete = useCallback(async (entry: RemoteFileEntry) => {
     if (!connectedProtocol) return;
@@ -1570,13 +2279,14 @@ export function ConnectionPanel() {
         protocol: connectedProtocol,
         remotePath: entry.path,
         isDir: entry.is_dir,
+        connectionId: connArg,
       });
       setTransferStatus(`Deleted ${entry.name}.`);
       await reloadRemote();
     } catch (err) {
       setBrowseError(`Delete failed: ${errorText(err)}`);
     }
-  }, [connectedProtocol, reloadRemote]);
+  }, [connectedProtocol, connArg, reloadRemote]);
 
   const handleExport = useCallback(async () => {
     try {
@@ -1676,12 +2386,31 @@ export function ConnectionPanel() {
     [connectedProtocols]
   );
 
+  // Starred connections first, then by name (within each group too)
+  const sorted = useMemo(
+    () =>
+      connections
+        .slice()
+        .sort((a, b) => Number(!!statuses[b.id]?.starred) - Number(!!statuses[a.id]?.starred) || a.name.localeCompare(b.name)),
+    [connections, statuses]
+  );
+
   // Group connections by group_id
-  const ungrouped = connections.filter((c) => !c.group_id);
+  const ungrouped = sorted.filter((c) => !c.group_id);
   const grouped = groups.map((g) => ({
     group: g,
-    connections: connections.filter((c) => c.group_id === g.id),
+    connections: sorted.filter((c) => c.group_id === g.id),
   }));
+
+  const itemProps = (conn: ConnectionProfile) => ({
+    status: statuses[conn.id],
+    onToggleStar: (id: string, starred: boolean) => void handleToggleStar(id, starred),
+    onRetry: (id: string) => void handleRetry(id),
+    onSignIn: (c: ConnectionProfile) => setSignInFor(c),
+    signedIn: signedIn[conn.id] ?? null,
+    onSignOut: (c: ConnectionProfile) => void handleSignOut(c),
+    onOpenInPane: onOpenInPane ? (c: ConnectionProfile) => onOpenInPane(remoteLocation(c.id, c.remote_path || "/"), c.name) : undefined,
+  });
 
   return (
     <div
@@ -1696,6 +2425,7 @@ export function ConnectionPanel() {
           <button
             onClick={() => {
               setEditingConnection(null);
+              setFormPrefill(null);
               setShowForm(true);
             }}
             className="text-xs px-2 py-1 rounded bg-blue-500 text-white hover:bg-blue-600"
@@ -1703,6 +2433,60 @@ export function ConnectionPanel() {
           >
             + New
           </button>
+          <button
+            onClick={() => (rcloneUi.managerOpen ? rcloneUi.closeManager() : rcloneUi.openManager())}
+            className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+            type="button"
+            aria-pressed={rcloneUi.managerOpen}
+            title="Create and manage rclone remotes (70+ storage providers)"
+          >
+            rclone remotes
+          </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowCloudMenu((v) => !v)}
+              className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={showCloudMenu}
+            >
+              + Cloud
+            </button>
+            {showCloudMenu && (
+              <div className="absolute right-0 top-full mt-1 w-48 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg z-50" role="menu">
+                {([
+                  ["connect-gdrive", "Google Drive"],
+                  ["connect-dropbox", "Dropbox"],
+                  ["connect-onedrive", "OneDrive / SharePoint"],
+                  ["connect-gcs", "Google Cloud Storage"],
+                ] as const).map(([flow, label]) => (
+                  <button
+                    key={flow}
+                    role="menuitem"
+                    onClick={() => {
+                      setShowCloudMenu(false);
+                      setActiveGuidedFlow(flow);
+                    }}
+                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700"
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setShowCloudMenu(false);
+                    rcloneUi.openManager({ create: true });
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700 border-t border-gray-100 dark:border-gray-700"
+                  type="button"
+                >
+                  More (Box, pCloud, MEGA… via rclone)
+                </button>
+              </div>
+            )}
+          </div>
           <button
             onClick={handleExport}
             className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
@@ -1784,21 +2568,55 @@ export function ConnectionPanel() {
         </div>
       )}
 
+      {signOutError && (
+        <div className="px-3 py-1.5 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between" role="alert">
+          <span>Sign out failed: {signOutError}</span>
+          <button onClick={() => setSignOutError(null)} className="text-xs ml-2 hover:text-red-800 dark:hover:text-red-300" type="button">
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Quick connect */}
       <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700">
         <QuickConnectBar onConnect={handleConnect} />
       </div>
 
+      {/* rclone remote manager */}
+      {rcloneUi.managerOpen && (
+        <div className="border-b border-gray-200 dark:border-gray-700 max-h-[60%] overflow-y-auto">
+          <RcloneRemoteManager
+            key={`${rcloneUi.startInCreate}:${rcloneUi.createType ?? ""}`}
+            startInCreate={rcloneUi.startInCreate}
+            initialType={rcloneUi.createType}
+            onClose={rcloneUi.closeManager}
+            onAddConnection={(remote, remoteName) => {
+              rcloneUi.closeManager();
+              setEditingConnection(null);
+              setFormPrefill({ protocol: "rclone", host: remote, name: remoteName });
+              setShowForm(true);
+            }}
+          />
+        </div>
+      )}
+
       {/* Form */}
       {showForm && (
         <div className="border-b border-gray-200 dark:border-gray-700">
           <ConnectionForm
+            key={editingConnection?.id ?? formPrefill?.host ?? "new"}
             initialData={editingConnection}
-            onSave={handleSave}
+            prefill={editingConnection ? null : formPrefill}
+            onSave={(data) => {
+              setFormPrefill(null);
+              void handleSave(data);
+            }}
             onCancel={() => {
               setShowForm(false);
               setEditingConnection(null);
+              setFormPrefill(null);
             }}
+            onManageRclone={() => rcloneUi.openManager()}
             groups={groups}
             protocols={protocols}
           />
@@ -1831,6 +2649,7 @@ export function ConnectionPanel() {
                     key={conn.id}
                     connection={conn}
                     onConnect={handleConnect}
+                    onMount={openMountDialog}
                     onTest={handleTest}
                     onEdit={(c) => {
                       setEditingConnection(c);
@@ -1840,6 +2659,7 @@ export function ConnectionPanel() {
                     testResult={testResults[conn.id] || null}
                     testing={testingIds.has(conn.id)}
                     isConnected={isProtocolConnected(conn.protocol)}
+                    {...itemProps(conn)}
                   />
                 ))}
               </div>
@@ -1857,6 +2677,7 @@ export function ConnectionPanel() {
             key={conn.id}
             connection={conn}
             onConnect={handleConnect}
+            onMount={openMountDialog}
             onTest={handleTest}
             onEdit={(c) => {
               setEditingConnection(c);
@@ -1866,6 +2687,7 @@ export function ConnectionPanel() {
             testResult={testResults[conn.id] || null}
             testing={testingIds.has(conn.id)}
             isConnected={isProtocolConnected(conn.protocol)}
+            {...itemProps(conn)}
           />
         ))}
 
@@ -1918,6 +2740,15 @@ export function ConnectionPanel() {
               Disconnect
             </button>
           </div>
+          {cryptInfo?.is_crypt && (
+            <CryptBanner info={cryptInfo} onOpenUnderlying={(r) => void handleOpenAdhoc(r)} onNames={() => setCryptNamesFor(`${cryptInfo.remote}:`)} />
+          )}
+          {cryptNamesFor && <CryptNamesDialog remote={cryptNamesFor} onClose={() => setCryptNamesFor(null)} />}
+          {quota && formatQuota(quota) && (
+            <div className="px-3 py-1 text-xs text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-700" data-testid="remote-quota">
+              Storage: {formatQuota(quota)}
+            </div>
+          )}
 
           {/* Breadcrumb path */}
           <div className="flex items-center gap-1 px-3 py-1.5 bg-gray-50 dark:bg-gray-800/50 border-b border-gray-200 dark:border-gray-700 overflow-x-auto">
@@ -1974,6 +2805,17 @@ export function ConnectionPanel() {
               >
                 Upload
               </button>
+              {onOpenInPane && connArg && (
+                <button
+                  onClick={() => onOpenInPane(remoteLocation(connArg, remotePath), connectedName ?? "Connection")}
+                  className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"
+                  type="button"
+                  title="Show this folder in the active file pane"
+                  data-testid="remote-open-in-pane"
+                >
+                  Open in pane
+                </button>
+              )}
               <button
                 onClick={handleRemoteMkdir}
                 className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"
@@ -1982,6 +2824,11 @@ export function ConnectionPanel() {
               >
                 New Folder
               </button>
+              <CompareWithMenu
+                protocol={connectedProtocol}
+                connectionId={connArg}
+                remotePath={remotePath}
+              />
             </div>
           </div>
 
@@ -2013,7 +2860,14 @@ export function ConnectionPanel() {
                 return a.name.localeCompare(b.name);
               })
               .map((entry) => (
-                <div key={entry.path} className="flex items-center border-b border-gray-100 dark:border-gray-800 last:border-b-0 group">
+                <div
+                  key={entry.path}
+                  className="flex items-center border-b border-gray-100 dark:border-gray-800 last:border-b-0 group"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setEntryMenu({ entry, x: e.clientX, y: e.clientY });
+                  }}
+                >
                 <button
                   onClick={() => {
                     if (entry.is_dir) {
@@ -2048,6 +2902,18 @@ export function ConnectionPanel() {
                         {formatFileSize(entry.size)}
                       </span>
                     )}
+                    {entry.is_dir && sizes[entry.path] && (() => {
+                      const st = sizes[entry.path];
+                      if (st.running) return <span className="text-xs text-gray-400 dark:text-gray-500 animate-pulse" data-testid={`size-${entry.name}`}>Calculating…</span>;
+                      if (st.error) return <span className="text-xs text-red-500" data-testid={`size-${entry.name}`} title={st.error}>size failed</span>;
+                      const r = st.result!;
+                      return (
+                        <span className="text-xs text-gray-500 dark:text-gray-400" data-testid={`size-${entry.name}`}>
+                          {formatFileSize(r.bytes)} in {r.files} file{r.files === 1 ? "" : "s"}
+                          {r.complete ? "" : " (stopped)"}
+                        </span>
+                      );
+                    })()}
                     {entry.modified && (
                       <span className="text-xs text-gray-400 dark:text-gray-500">
                         {formatModified(entry.modified)}
@@ -2056,6 +2922,27 @@ export function ConnectionPanel() {
                   </div>
                 </button>
                 <div className="flex items-center gap-1 pr-2 flex-shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                  {entry.is_dir && sizes[entry.path]?.running && (
+                    <button
+                      onClick={() => void handleCancelSize(entry.path)}
+                      className="text-xs px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                      type="button"
+                      aria-label={`Stop calculating the size of ${entry.name}`}
+                    >
+                      Stop
+                    </button>
+                  )}
+                  {!entry.is_dir && connectedProtocol && SHAREABLE_PROTOCOLS.has(connectedProtocol) && (
+                    <button
+                      onClick={() => setSharing(entry)}
+                      className="text-xs px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
+                      type="button"
+                      aria-label={`Share ${entry.name}`}
+                      data-testid={`remote-share-${entry.name}`}
+                    >
+                      Share
+                    </button>
+                  )}
                   {!entry.is_dir && (
                     <button
                       onClick={() => handleDownload(entry)}
@@ -2082,8 +2969,132 @@ export function ConnectionPanel() {
           </div>
         </div>
       )}
+      {sharingEntry && connectedProtocol && (
+        <ShareLinkDialog protocol={connectedProtocol} connectionId={connArg} path={sharingEntry.path} name={sharingEntry.name} onClose={() => setSharing(null)} />
+      )}
+      {entryMenu && (
+        <div
+          role="menu"
+          className="fixed z-50 min-w-40 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg py-1"
+          style={{ left: entryMenu.x, top: entryMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {entryMenu.entry.is_dir ? (
+            <button
+              role="menuitem"
+              type="button"
+              className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700"
+              onClick={() => {
+                const entry = entryMenu.entry;
+                setEntryMenu(null);
+                void handleCalculateSize(entry);
+              }}
+            >
+              Calculate size
+            </button>
+          ) : (
+            <button
+              role="menuitem"
+              type="button"
+              className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-700"
+              onClick={() => {
+                const entry = entryMenu.entry;
+                setEntryMenu(null);
+                void handleDownload(entry);
+              }}
+            >
+              Download…
+            </button>
+          )}
+        </div>
+      )}
+      {signInFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-modal="true" aria-label={`Sign in: ${signInFor.name}`}>
+          <div className="w-full max-w-md mx-4 rounded-lg bg-white dark:bg-gray-900 shadow-xl p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Sign in: {signInFor.name}</h3>
+              <button type="button" className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700" onClick={() => setSignInFor(null)}>
+                Close
+              </button>
+            </div>
+            <OAuthSignIn
+              connectionId={signInFor.id}
+              protocol={signInFor.protocol}
+              savedClientId={signInFor.extras?.oauth?.client_id ?? null}
+              onSignedIn={(r) => {
+                const id = signInFor.id;
+                setSignInFor(null);
+                setSignedIn((prev) => ({ ...prev, [id]: true }));
+                setTransferStatus(r.warning ?? (r.account ? `Signed in as ${r.account}.` : "Signed in."));
+                refresh();
+                void handleConnect(id);
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 export default ConnectionPanel;
+
+/**
+ * "Compare with…" for the folder being browsed: compares a local folder
+ * (a pane's, or one picked) on the left with this remote folder on the
+ * right, in the folder compare window.
+ */
+function CompareWithMenu({ protocol, connectionId, remotePath }: { protocol: string | null; connectionId: string | null; remotePath: string }) {
+  const [open, setOpen] = useState(false);
+  const leftPane = useFileManagerStore((s) => s.getActiveTab(0)?.path);
+  const rightPane = useFileManagerStore((s) => s.getActiveTab(1)?.path);
+  const panes = [leftPane, rightPane];
+  if (!protocol) return null;
+  const compare = (local: string) => {
+    setOpen(false);
+    useCompareStore.getState().open(
+      { type: "local", path: local },
+      { type: "remote", connection_id: connectionId, protocol, path: remotePath },
+    );
+  };
+  const localPanes = panes
+    .map((p, i) => ({ path: p, label: i === 0 ? "Left pane" : "Right pane" }))
+    .filter((p): p is { path: string; label: string } => !!p.path && !p.path.includes("://"));
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="text-xs px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700"
+        data-testid="remote-compare-with"
+      >
+        Compare with…
+      </button>
+      {open && (
+        <div role="menu" className="absolute right-0 top-full z-50 mt-1 w-64 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg py-1">
+          {localPanes.map((p) => (
+            <button key={p.label} type="button" role="menuitem" onClick={() => compare(p.path)} className="block w-full truncate px-3 py-1 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-800" title={p.path} data-testid={`remote-compare-${p.label === "Left pane" ? "left" : "right"}-pane`}>
+              {p.label}: {p.path}
+            </button>
+          ))}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              void pickFolder(`Compare ${remotePath} with…`).then((dir) => {
+                if (dir) compare(dir);
+              });
+            }}
+            className="block w-full px-3 py-1 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+            data-testid="remote-compare-pick"
+          >
+            Choose a local folder…
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

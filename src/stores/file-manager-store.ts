@@ -1,5 +1,8 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { isSecondaryWindow, sharedWindowStorage } from "@/lib/app-window";
+import { locationLabel } from "@/lib/location";
+import { useConnectionsStore } from "@/stores/connections-store";
 
 // ──────────────────────────────────────────────
 // Types
@@ -248,6 +251,9 @@ export interface FileManagerState {
   unpinTab: (paneIndex: 0 | 1, tabId: string) => void;
   reorderTabs: (paneIndex: 0 | 1, fromIndex: number, toIndex: number) => void;
   navigateTab: (paneIndex: 0 | 1, tabId: string, path: string, label: string) => void;
+  /** Show `path` in a pane: open it if a folder, else open its folder and
+   *  select it (search hits, "reveal in folder"). */
+  revealPath: (paneIndex: 0 | 1, path: string, isDir: boolean) => void;
   /** Iter 20 — tab context menu. Close every non-pinned tab in this
    *  pane except `keepTabId`. Pinned tabs survive regardless of
    *  position. Each close pushes a snapshot onto the closed-tab ring
@@ -460,6 +466,12 @@ function genId(): string {
   return `id-${Date.now()}-${++_idCounter}`;
 }
 
+/** Tab label of a pane path: local paths as always; a connection folder's
+ *  listed name, or the connection's name at its root. */
+export function paneLabel(path: string): string {
+  return locationLabel(path, (id) => useConnectionsStore.getState().nameOf(id));
+}
+
 function getHomePath(): string {
   // In Tauri, we get this from the backend. Default to "/" for now.
   return "/";
@@ -510,6 +522,11 @@ const MAX_SELECTION_STASHES = 20;
 // ──────────────────────────────────────────────
 // Store
 // ──────────────────────────────────────────────
+
+export const FILE_MANAGER_STORAGE_KEY = "ufop-file-manager-state";
+
+/** What each window has for itself; everything else persisted is shared by all windows. */
+export const WINDOW_FIELDS = ["panes", "activePaneIndex", "singlePaneMode", "paneSplitPercent", "paneOrientation", "syncBrowsing", "recentlyClosedTabs", "selectionStashes"] as const;
 
 export const useFileManagerStore = create<FileManagerState>()(
   persist(
@@ -727,6 +744,16 @@ export const useFileManagerStore = create<FileManagerState>()(
           };
         });
         return stash;
+      },
+
+      revealPath: (paneIndex, path, isDir) => {
+        const pane = get().panes[paneIndex];
+        const tab = pane.tabs.find((t) => t.id === pane.activeTabId);
+        if (!tab) return;
+        const dir = isDir ? path : path.replace(/[\\/][^\\/]*$/, "") || "/";
+        const label = dir === "/" ? "Root" : dir.split(/[\\/]/).filter(Boolean).pop() || "Root";
+        get().navigateTab(paneIndex, tab.id, dir, label);
+        if (!isDir) get().setSelection(pane.id, [path]);
       },
 
       recallStash: (id, paneIndex) => {
@@ -1343,7 +1370,7 @@ export const useFileManagerStore = create<FileManagerState>()(
           if (idx <= 0) return s;
           const newIdx = idx - 1;
           const newPath = history[newIdx];
-          const newLabel = newPath === "/" ? "Root" : newPath.split("/").filter(Boolean).pop() || "Root";
+          const newLabel = paneLabel(newPath);
           pane.tabs = pane.tabs.map((t) =>
             t.id === tab.id ? { ...t, path: newPath, label: newLabel, historyIndex: newIdx } : t,
           );
@@ -1362,7 +1389,7 @@ export const useFileManagerStore = create<FileManagerState>()(
           if (idx >= history.length - 1) return s;
           const newIdx = idx + 1;
           const newPath = history[newIdx];
-          const newLabel = newPath === "/" ? "Root" : newPath.split("/").filter(Boolean).pop() || "Root";
+          const newLabel = paneLabel(newPath);
           pane.tabs = pane.tabs.map((t) =>
             t.id === tab.id ? { ...t, path: newPath, label: newLabel, historyIndex: newIdx } : t,
           );
@@ -1410,7 +1437,9 @@ export const useFileManagerStore = create<FileManagerState>()(
       },
     }),
     {
-      name: "ufop-file-manager-state",
+      name: FILE_MANAGER_STORAGE_KEY,
+      // A second window keeps its own panes and layout (see `app-window.ts`).
+      storage: createJSONStorage(() => sharedWindowStorage(localStorage, WINDOW_FIELDS, isSecondaryWindow())),
       partialize: (state) => ({
         panes: state.panes,
         singlePaneMode: state.singlePaneMode,

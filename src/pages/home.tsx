@@ -6,6 +6,7 @@ import { FileManager } from "@/components/file-manager";
 import { SimpleModeWrapper } from "@/components/simple-mode";
 import { OnboardingWizard } from "@/components/onboarding-wizard";
 import { GuidedFlowRouter } from "@/components/guided-flows/guided-flow-router";
+import { isSecondaryWindow } from "@/lib/app-window";
 import { useUIStore } from "@/stores/ui-store";
 
 /**
@@ -25,7 +26,8 @@ export function HomePage() {
   const setActiveGuidedFlow = useUIStore((s) => s.setActiveGuidedFlow);
 
   // Allow re-opening onboarding from Help > Getting Started
-  const [showOnboarding, setShowOnboarding] = useState(!onboardingComplete);
+  // (not in a second window: the first one shows it)
+  const [showOnboarding, setShowOnboarding] = useState(!onboardingComplete && !isSecondaryWindow());
 
   const handleOnboardingComplete = useCallback(() => {
     setShowOnboarding(false);

@@ -115,7 +115,15 @@
     "diskFull": "\ub514\uc2a4\ud06c \uacf5\uac04\uc774 \ubd80\uc871\ud569\ub2c8\ub2e4",
     "copyingFiles": "{{count}}\uac1c \ud30c\uc77c \ubcf5\uc0ac \uc911...",
     "movingFiles": "{{count}}\uac1c \ud30c\uc77c \uc774\ub3d9 \uc911...",
-    "deletingFiles": "{{count}}\uac1c \ud30c\uc77c \uc0ad\uc81c \uc911..."
+    "deletingFiles": "{{count}}\uac1c \ud30c\uc77c \uc0ad\uc81c \uc911...",
+    "folders": "\ud3f4\ub354",
+    "smart": "\uc2a4\ub9c8\ud2b8",
+    "copyPath": "\uacbd\ub85c \ubcf5\uc0ac",
+    "deletePermanently": "\uc601\uad6c \uc0ad\uc81c",
+    "openWith": "\uc5f0\uacb0 \ud504\ub85c\uadf8\ub7a8...",
+    "extractHere": "\uc5ec\uae30\uc5d0 \uc555\ucd95 \ud480\uae30",
+    "openInNewWindow": "\uc0c8 \ucc3d\uc5d0\uc11c \uc5f4\uae30",
+    "cloudFolders": "\ud074\ub77c\uc6b0\ub4dc \ud3f4\ub354"
   },
   "transfer": {
     "title": "\uc804\uc1a1",
@@ -268,7 +276,17 @@
     "rollback": "\uc774\uc804 \ubc84\uc804\uc73c\ub85c \ub418\ub3cc\ub9ac\uae30",
     "rollbackConfirm": "\uc774\uc804 \ubc84\uc804\uc73c\ub85c \ub418\ub3cc\ub9ac\uc2dc\uaca0\uc2b5\ub2c8\uae4c?",
     "rollbackSuccess": "\ub864\ubc31 \uc131\uacf5. \uc7ac\uc2dc\uc791\ud558\uc5ec \uc801\uc6a9\ud558\uc138\uc694.",
-    "rollbackFailed": "\ub864\ubc31 \uc2e4\ud328: {{error}}"
+    "rollbackFailed": "\ub864\ubc31 \uc2e4\ud328: {{error}}",
+    "languageSystem": "\uc2dc\uc2a4\ud15c \uae30\ubcf8\uac12 ({{name}})",
+    "languageHint": "\uba54\ub274, \uc0ac\uc774\ub4dc\ubc14, \uc124\uc815 \uc81c\ubaa9, \ud2b8\ub808\uc774 \uba54\ub274\uc5d0 \uc774 \uc5b8\uc5b4\uac00 \uc0ac\uc6a9\ub429\ub2c8\ub2e4. \uadf8 \uc678 \ud14d\uc2a4\ud2b8\ub294 \uc544\uc9c1 \uc601\uc5b4\uc785\ub2c8\ub2e4.",
+    "notifications": "\uc54c\ub9bc",
+    "privacy": "\uac1c\uc778\uc815\ubcf4",
+    "network": "\ub124\ud2b8\uc6cc\ud06c",
+    "logging": "\ub85c\uadf8",
+    "startupTray": "\uc2dc\uc791 \ubc0f \ud2b8\ub808\uc774",
+    "appLock": "\uc571 \uc7a0\uae08",
+    "reset": "\ucd08\uae30\ud654",
+    "accentColor": "\uac15\uc870 \uc0c9\uc0c1"
   },
   "onboarding": {
     "welcome": "\ud1b5\ud569 \ud30c\uc77c \uc791\uc5c5 \ud50c\ub7ab\ud3fc\uc5d0 \uc624\uc2e0 \uac83\uc744 \ud658\uc601\ud569\ub2c8\ub2e4",
@@ -361,5 +379,11 @@
     "rollbackDescription": "\ud604\uc7ac \ubc84\uc804\uc5d0 \ubb38\uc81c\uac00 \uc788\ub294 \uacbd\uc6b0 \uc774\uc804 \ubc84\uc804\uc73c\ub85c \ub864\ubc31\ud560 \uc218 \uc788\uc2b5\ub2c8\ub2e4.",
     "differentialUpdate": "\ucc28\ubd84 \uc5c5\ub370\uc774\ud2b8 \ub2e4\uc6b4\ub85c\ub4dc \uc911...",
     "fullUpdate": "\uc804\uccb4 \uc5c5\ub370\uc774\ud2b8 \ub2e4\uc6b4\ub85c\ub4dc \uc911..."
+  },
+  "nav": {
+    "back": "\ub4a4\ub85c",
+    "forward": "\uc55e\uc73c\ub85c",
+    "up": "\uc0c1\uc704 \ud3f4\ub354\ub85c \uc774\ub3d9",
+    "root": "\ub8e8\ud2b8\ub85c \uc774\ub3d9"
   }
 }

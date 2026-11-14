@@ -1,82 +1,51 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { dataStore } from '@/lib/data-store';
-import type { AuditEventType, AuditSeverity, AuditExportFormat } from '@/lib/types/audit';
+import { AUDIT_EVENT_CATEGORIES, type AuditEntry, type AuditExportFormat } from '@/lib/types/audit';
 import { exportAuditEntries } from '@/lib/utils/audit-integrity';
-import { requireRole, isAuthorized } from '@/lib/utils/require-role';
+import { isContext, requirePermission } from '@/lib/session';
+import { auditCounts, listAudit } from '@/lib/db/repos/audit';
+import { managedSubtree } from '@/lib/db/repos/orgs';
+import { pageInfo } from '@/lib/pagination';
+import { pagedJson, readPage } from '@/lib/route-helpers';
 
-/** GET /api/audit - Query audit log with search/filter */
+const SYNC_EXPORT_LIMIT = 10_000;
+
+/** GET /api/audit — the current organization's (and managed sub-organizations') audit log. */
 export async function GET(request: NextRequest) {
-  const authResult = await requireRole(request, 'admin');
-  if (!isAuthorized(authResult)) return authResult;
-
   const { searchParams } = new URL(request.url);
-  const eventType = searchParams.get('eventType') as AuditEventType | null;
-  const severity = searchParams.get('severity') as AuditSeverity | null;
-  const userId = searchParams.get('userId');
-  const dateFrom = searchParams.get('dateFrom');
-  const dateTo = searchParams.get('dateTo');
-  const search = searchParams.get('search');
   const exportFormat = searchParams.get('export') as AuditExportFormat | null;
-  const page = Math.max(1, parseInt(searchParams.get('page') || '1'));
-  const pageSize = Math.min(200, Math.max(1, parseInt(searchParams.get('pageSize') || '50')));
-
-  let entries = [...dataStore.auditEntries];
-
-  if (eventType) entries = entries.filter(e => e.eventType === eventType);
-  if (severity) entries = entries.filter(e => e.severity === severity);
-  if (userId) entries = entries.filter(e => e.userId === userId);
-  if (dateFrom) entries = entries.filter(e => new Date(e.timestamp) >= new Date(dateFrom));
-  if (dateTo) entries = entries.filter(e => new Date(e.timestamp) <= new Date(dateTo + 'T23:59:59Z'));
-  if (search) {
-    const q = search.toLowerCase();
-    entries = entries.filter(e =>
-      e.description.toLowerCase().includes(q) ||
-      e.userName.toLowerCase().includes(q) ||
-      e.eventType.toLowerCase().includes(q)
-    );
-  }
-
-  // Sort by timestamp descending
-  entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-
-  // Export if requested
+  const ctx = await requirePermission(request, 'audit.read', ...(exportFormat ? (['audit.export'] as const) : []));
+  if (!isContext(ctx)) return ctx;
+  // Per-event-type totals for the categories view.
+  if (searchParams.get('view') === 'counts') return NextResponse.json({ counts: auditCounts(managedSubtree(ctx.orgId)) });
+  const dateTo = searchParams.get('dateTo');
+  const q = {
+    orgIds: managedSubtree(ctx.orgId),
+    eventType: searchParams.get('eventType') || undefined,
+    eventTypes: searchParams.get('category') ? (AUDIT_EVENT_CATEGORIES[searchParams.get('category')!] ?? []) : undefined,
+    severity: searchParams.get('severity') || undefined,
+    userId: searchParams.get('userId') || undefined,
+    from: searchParams.get('dateFrom') || undefined,
+    to: dateTo ? (dateTo.length === 10 ? `${dateTo}T23:59:59.999Z` : dateTo) : undefined,
+    search: searchParams.get('search') || undefined,
+  };
   if (exportFormat) {
-    const content = exportAuditEntries(entries, exportFormat);
-    const contentTypes = {
-      csv: 'text/csv',
-      json: 'application/json',
-      syslog: 'text/plain',
-    };
-
-    return new NextResponse(content, {
-      headers: {
-        'Content-Type': contentTypes[exportFormat] || 'text/plain',
-        'Content-Disposition': `attachment; filename="audit-export.${exportFormat}"`,
-      },
+    if (!['csv', 'json', 'syslog'].includes(exportFormat)) return NextResponse.json({ error: 'Unknown export format' }, { status: 400 });
+    // Larger exports run in the background (POST /api/exports) instead of being cut short.
+    const { entries, total } = listAudit({ ...q, limit: SYNC_EXPORT_LIMIT });
+    if (total > SYNC_EXPORT_LIMIT) return NextResponse.json({ error: `${total} entries match; exports over ${SYNC_EXPORT_LIMIT} run in the background (Export → Start export)`, code: 'use_background_export', total }, { status: 413 });
+    const types = { csv: 'text/csv', json: 'application/json', syslog: 'text/plain' } as const;
+    return new NextResponse(exportAuditEntries(entries as unknown as AuditEntry[], exportFormat), {
+      headers: { 'Content-Type': types[exportFormat], 'Content-Disposition': `attachment; filename="audit-export.${exportFormat}"` },
     });
   }
-
-  // Paginate
-  const total = entries.length;
-  const start = (page - 1) * pageSize;
-  const paged = entries.slice(start, start + pageSize);
-
-  return NextResponse.json({
-    entries: paged,
-    total,
-    page,
-    pageSize,
-    totalPages: Math.ceil(total / pageSize),
-  });
+  const pr = readPage(request, { maxLimit: 200 });
+  if (pr instanceof NextResponse) return pr;
+  const { entries, total } = listAudit({ ...q, limit: pr.limit, offset: pr.offset });
+  // `page`/`pageSize`/`totalPages` stay for existing callers.
+  return pagedJson(request, { entries, total, page: Math.floor(pr.offset / pr.limit) + 1, pageSize: pr.limit, totalPages: Math.ceil(total / pr.limit) }, pageInfo(pr, entries.length, total));
 }
 
-/**
- * Audit entries are immutable - no POST/PUT/DELETE allowed.
- * Entries are created internally by system events, not via API.
- */
+/** Audit entries are append-only and written by the console itself. */
 export async function POST() {
-  return NextResponse.json(
-    { error: 'Audit entries are immutable and created by system events only' },
-    { status: 405 }
-  );
+  return NextResponse.json({ error: 'Audit entries are immutable and created by system events only' }, { status: 405 });
 }

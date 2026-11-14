@@ -3,7 +3,8 @@
  *
  * Features:
  * - Live preview of all changes as user types
- * - Token substitution: {name}, {ext}, {num}, {date}, {parent}, {counter}
+ * - Token substitution (shared with automation): {name}, {ext}, {num:3}, {date},
+ *   {yyyy}/{mm}/{dd}, {modified:%Y-%m}, {parent}, {size}, filters like {name|slug}
  * - Find/Replace with regex (Advanced) and literal (Simple)
  * - Sequential numbering with start/step/zero-padding
  * - Case transformation: UPPER, lower, Title, Sentence
@@ -205,7 +206,7 @@ export function BatchRename({ files, onClose, onComplete }: BatchRenameProps) {
             <label className="block text-sm font-medium">
               Pattern
               <span className="ml-2 text-xs text-text-tertiary">
-                Tokens: {"{name}"} {"{ext}"} {"{num}"} {"{date}"} {"{parent}"} {"{counter}"}
+                Tokens: {"{name}"} {"{ext}"} {"{num:3}"} {"{date}"} {"{yyyy}"} {"{mm}"} {"{dd}"} {"{parent}"} {"{size}"} {"{modified:%Y-%m}"} · filters {"{name|lower}"} {"{name|slug}"}
               </span>
             </label>
             <input

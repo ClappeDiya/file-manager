@@ -1,7 +1,8 @@
 //! Robocopy-equivalent file copy primitives used by the sync executor.
 //!
 //! - Restartable copy through a `.ufop-partial` file (/Z)
-//! - Bandwidth throttling with an inter-packet gap (/IPG)
+//! - Bandwidth throttling with an inter-packet gap (/IPG) and the shared
+//!   machine-wide limit / timetable (`crate::throttle`)
 //! - Timestamp preservation (/COPY:T, /DCOPY:T)
 //! - Symbolic links copied as links (/SL)
 //! - Zero-length "tree only" copies (/CREATE)
@@ -68,7 +69,7 @@ pub fn copy_file(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, AppE
             )
         })?;
         0
-    } else if opts.restartable || opts.inter_packet_gap_ms > 0 {
+    } else if copies_blockwise(opts) {
         copy_blockwise(src, dst, opts)?
     } else {
         fs::copy(src, dst).map_err(|e| {
@@ -115,6 +116,29 @@ pub fn validate_options(opts: &CopyOptions) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+/// [`validate_options`] for a pair in `mode`. Two-way pairs cannot move
+/// (/MOV, /MOVE): a moved file is gone from the source, so the next run
+/// finds it only in the destination and copies it back.
+pub fn validate_for_mode(opts: &CopyOptions, mode: SyncMode) -> Result<(), AppError> {
+    validate_options(opts)?;
+    if mode == SyncMode::TwoWay && (opts.move_files || opts.move_dirs) {
+        return Err(sync_err(
+            "Move files (/MOV, /MOVE) cannot be used with two-way sync: moved files would be copied back on the next run.".to_string(),
+            "Turn off Move files, or use a one-way or mirror pair to move files.",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether files are copied block by block: for /Z, /IPG, or whenever the
+/// bandwidth timetable (shared with backups and transfers; the backup caps
+/// do not apply here) has an upload limit, so that a window opening during
+/// a copy paces the rest of that file too; each block asks for the rate in
+/// force at that moment.
+fn copies_blockwise(opts: &CopyOptions) -> bool {
+    opts.restartable || opts.inter_packet_gap_ms > 0 || crate::throttle::limits_uploads()
 }
 
 /// Block copy with optional resume (/Z) and inter-packet gap (/IPG).
@@ -164,12 +188,14 @@ fn copy_blockwise(src: &Path, dst: &Path, opts: &CopyOptions) -> Result<u64, App
     let mut buffer = vec![0u8; BLOCK_SIZE];
     let mut written = 0u64;
     loop {
+        let block_started = std::time::Instant::now();
         let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         writer.write_all(&buffer[..n])?;
         written += n as u64;
+        crate::throttle::TIMETABLE_UPLOAD.wait(n, block_started);
         if !gap.is_zero() {
             std::thread::sleep(gap);
         }
@@ -363,6 +389,44 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Regression: the backup machine-wide upload cap (and the console's
+    /// managed cap) also paced every sync copy, a change for anyone who had
+    /// set one for backups. Sync follows only the bandwidth timetable.
+    #[test]
+    fn backup_machine_caps_do_not_slow_sync_copies() {
+        let _g = crate::throttle::test_lock();
+        let dir = TempDir::new().unwrap();
+        let (src, dst) = (dir.path().join("a.bin"), dir.path().join("b.bin"));
+        fs::write(&src, vec![1u8; 256 * 1024]).unwrap();
+        crate::throttle::GLOBAL_UPLOAD.set(64 * 1024);
+        let started = std::time::Instant::now();
+        let r = copy_file(&src, &dst, &CopyOptions::default());
+        crate::throttle::GLOBAL_UPLOAD.set(0);
+        r.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "paced by the backup cap: {:?}", started.elapsed());
+        assert_eq!(fs::read(&dst).unwrap().len(), 256 * 1024);
+    }
+
+    /// Regression: block-by-block copying (where the timetable is applied)
+    /// was chosen only when a window was active as a file started, so a
+    /// window opening during a long copy did not slow that file. Any
+    /// configured timetable now copies block by block, and each block asks
+    /// the timetable for the rate in force at that moment.
+    #[test]
+    fn a_configured_timetable_copies_block_by_block() {
+        let _g = crate::throttle::test_lock();
+        let opts = CopyOptions::default();
+        crate::throttle::set_schedule(vec![]).unwrap();
+        assert!(!copies_blockwise(&opts), "no timetable: plain copy");
+        // A window that is not active now (on another weekday).
+        let today = chrono::Datelike::weekday(&chrono::Local::now()).num_days_from_monday() as u8;
+        let later = crate::throttle::BandwidthWindow { days: vec![(today + 3) % 7], start: "00:00".into(), end: "23:59".into(), upload_bps: 1_000, download_bps: 0 };
+        crate::throttle::set_schedule(vec![later]).unwrap();
+        let blockwise = copies_blockwise(&opts);
+        crate::throttle::set_schedule(vec![]).unwrap();
+        assert!(blockwise, "a window can open mid-file");
+    }
+
     #[test]
     fn restartable_copy_resumes_partial_file() {
         let dir = TempDir::new().unwrap();
@@ -507,5 +571,22 @@ mod validate_tests {
             ..Default::default()
         };
         assert!(validate_options(&bad_threads).is_err());
+    }
+
+    /// Review: /MOV on a two-way pair moved a file and the next run copied
+    /// it back as "new in the destination". Moving has no meaning in two-way.
+    #[test]
+    fn move_is_refused_for_two_way_pairs() {
+        for (move_files, move_dirs) in [(true, false), (true, true), (false, true)] {
+            let opts = CopyOptions { move_files, move_dirs, ..Default::default() };
+            let err = validate_for_mode(&opts, SyncMode::TwoWay).unwrap_err();
+            assert!(err.to_string().contains("two-way"), "{err}");
+            for mode in [SyncMode::OneWay, SyncMode::Mirror, SyncMode::VersionedBackup] {
+                assert!(validate_for_mode(&opts, mode).is_ok());
+            }
+        }
+        assert!(validate_for_mode(&CopyOptions::default(), SyncMode::TwoWay).is_ok());
+        let bad_threads = CopyOptions { threads: 0, ..Default::default() };
+        assert!(validate_for_mode(&bad_threads, SyncMode::OneWay).is_err(), "still checks every option");
     }
 }

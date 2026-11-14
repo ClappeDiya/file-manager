@@ -1,3 +1,5 @@
+import { t } from "@/lib/i18n";
+import { GUIDED_FLOW_IDS, GUIDED_FLOW_META } from "@/components/guided-flows/flow-meta";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useAiStore, type AiExecutionResult, type ParsedJobConfig } from "@/stores/ai-store";
@@ -42,9 +44,18 @@ import {
   Sparkles,
   ArrowRight,
   ArrowLeftRight,
+  FolderUp,
+  AppWindow,
+  Lock,
   Shield,
   Filter,
   FolderSync,
+  DatabaseBackup,
+  HardDrive,
+  CalendarClock,
+  CircleHelp,
+  ScrollText,
+  MonitorSmartphone,
   Upload,
   History,
   ShieldCheck,
@@ -488,7 +499,7 @@ export function CommandPalette({ commands, isOpen, onClose, onExecutionResult }:
             placeholder={
               ollamaAvailable
                 ? "Type a command or describe what you want..."
-                : "Type a command..."
+                : t("commandPalette.placeholder")
             }
             className={cn(
               "flex-1 h-12 bg-transparent border-none outline-none",
@@ -676,6 +687,8 @@ export function getDefaultCommands(actions: {
   onToggleSidebar?: () => void;
   onSetViewMode?: (mode: string) => void;
   onSetTheme?: (theme: string) => void;
+  /** Text size one step larger (1), smaller (-1) or default (0). */
+  onTextSize?: (step: -1 | 0 | 1) => void;
   onAddToFavorites?: () => void;
   onTogglePreview?: () => void;
   /** Open the Lineage / "Show File History" panel for the first
@@ -700,6 +713,7 @@ export function getDefaultCommands(actions: {
   onOpenInEditor?: () => void;
   onOpenSettings?: () => void;
   onToggleAutomations?: () => void;
+  onToggleOperations?: () => void;
   onCreateAutomation?: () => void;
   onCreateSmartSpace?: () => void;
   onToggleActivityTimeline?: () => void;
@@ -745,17 +759,53 @@ export function getDefaultCommands(actions: {
    *  destination — the only user-facing path that feeds the Transfer
    *  Queue (previously the engine queue had zero producers). */
   onQueueCopyTo?: () => void;
+  /** Compare the left and right panes' folders (standalone folder compare). */
+  onComparePanes?: () => void;
+  /** Compare the active pane's folder with a folder picked next. */
+  onCompareFolderWith?: () => void;
   /** Open the Connection Manager panel \u2014 saved profiles,
    *  quick-connect, connection test, third-party import, and
    *  the 17-protocol registry (SFTP, S3, Google Drive, WebDAV,
    *  SMB, FTP, Azure Blob, GCS, Dropbox, Box, OneDrive, iCloud
    *  Drive, Mega, pCloud, Nextcloud, OpenStack Swift, MinIO). */
   onOpenConnections?: () => void;
+  /** Turn the active pane's breadcrumb into the editable address field. */
+  onEditAddress?: () => void;
+  onGoToParentFolder?: () => void;
+  /** Open another app window at the active pane's folder. */
+  onNewWindow?: () => void;
+  /** Show the lock screen in every window (when the app lock is on). */
+  onLockApp?: () => void;
+  /** Start a guided wizard (`GUIDED_FLOW_IDS`). */
+  onOpenGuidedFlow?: (id: string) => void;
+  /** Open the Connection Manager on its rclone remote manager. */
+  onOpenRcloneRemotes?: () => void;
+  /** Open Settings expanded and scrolled to its rclone section. */
+  onOpenRcloneSettings?: () => void;
+  /** Open Settings at one section (`startup`, `app-lock`, `reset`…). */
+  onOpenSettingsSection?: (section: string) => void;
   /** Open the Sync Panel \u2014 sync-pair health indicators,
    *  create-pair wizard, dry-run preview, conflict resolution,
    *  reports, and rollback. Iter 28 surfaces the long-orphaned
    *  1454-LOC component. */
   onOpenSync?: () => void;
+  /** Open the Backups panel — versioned, deduplicated, encrypted
+   *  backup jobs with restore, maintenance and run history. */
+  onOpenBackups?: () => void;
+  /** Advanced mode only (undefined hides the entry). */
+  onOpenSchedules?: () => void;
+  /** Advanced mode only (undefined hides the entry). */
+  onOpenLogViewer?: () => void;
+  /** Help > Send feedback. */
+  onSendFeedback?: () => void;
+  /** Open Nearby computers (peer discovery and transfers). */
+  onOpenNearby?: () => void;
+  /** Open the Mounts list (saved and running mounts, with mount/unmount/edit/remove). */
+  onOpenMounts?: () => void;
+  /** Open the mount dialog to mount a connection as a drive or folder. */
+  onMountDrive?: () => void;
+  /** Send the selection to another computer (undefined hides the entry). */
+  onSendToComputer?: () => void;
   /** Open the Transfer History (Journal) panel \u2014 searchable
    *  table of every historical transfer with status, checksum
    *  verification, retry count, duration, and speed; CSV/JSON
@@ -1019,6 +1069,31 @@ export function getDefaultCommands(actions: {
       action: () => actions.onSetTheme?.("system"),
       keywords: ["theme", "system", "auto"],
     },
+    // Text size (the keys are bound by useTextSizeShortcuts)
+    {
+      id: "text-size-larger",
+      label: "Larger Text",
+      shortcut: `${cmd}+`,
+      category: "Appearance",
+      action: () => actions.onTextSize?.(1),
+      keywords: ["text size", "font", "bigger", "zoom in", "accessibility"],
+    },
+    {
+      id: "text-size-smaller",
+      label: "Smaller Text",
+      shortcut: `${cmd}-`,
+      category: "Appearance",
+      action: () => actions.onTextSize?.(-1),
+      keywords: ["text size", "font", "smaller", "zoom out"],
+    },
+    {
+      id: "text-size-default",
+      label: "Default Text Size",
+      shortcut: `${cmd}0`,
+      category: "Appearance",
+      action: () => actions.onTextSize?.(0),
+      keywords: ["text size", "font", "reset", "actual size"],
+    },
     // Workspace commands
     {
       id: "save-workspace",
@@ -1149,6 +1224,109 @@ export function getDefaultCommands(actions: {
     // and rollback. All 14 sync IPC commands were already
     // registered in the Rust backend; the component just had
     // zero importers until iter 28.
+    {
+      id: "open-backups",
+      label: "Backups\u2026",
+      description:
+        "Versioned, deduplicated, encrypted backups \u2014 create jobs, run, restore old versions, verify, repair, schedule",
+      icon: <DatabaseBackup className="h-4 w-4" />,
+      shortcut: `${cmd}\u2325B`,
+      category: "Navigation",
+      action: actions.onOpenBackups || (() => {}),
+      keywords: [
+        "backup",
+        "backups",
+        "restore",
+        "version",
+        "versions",
+        "snapshot",
+        "retention",
+        "deduplication",
+        "encrypted backup",
+        "verify backup",
+        "duplicati",
+        "time machine",
+      ],
+    },
+    {
+      id: "open-nearby",
+      label: "Nearby Computers\u2026",
+      description: "Find other computers running UFOP on this network, accept incoming files, connect by address",
+      icon: <MonitorSmartphone className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenNearby || (() => {}),
+      keywords: ["peer", "peers", "nearby", "airdrop", "lan", "local network", "computer", "device", "mdns", "bonjour", "receive"],
+    },
+    {
+      id: "mount-drive",
+      label: "Mount Drive\u2026",
+      description: "Mount a saved connection (cloud, SFTP, SMB, WebDAV, NFS) as a folder or drive on this computer",
+      icon: <HardDrive className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onMountDrive || (() => {}),
+      keywords: ["mount", "drive", "disk", "volume", "fuse", "rclone", "remote drive", "network drive", "map drive", "sshfs"],
+    },
+    {
+      id: "open-mounts",
+      label: "Show Mounts",
+      description: "See saved and mounted drives; mount, unmount, edit or remove them",
+      icon: <HardDrive className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenMounts || (() => {}),
+      keywords: ["mounts", "mounted", "drives", "unmount", "eject", "remote drives", "network drives"],
+    },
+    ...(actions.onSendToComputer
+      ? [
+          {
+            id: "send-to-computer",
+            label: "Send Selection to Another Computer\u2026",
+            description: "Send the selected files and folders over an encrypted connection; the other computer approves first",
+            icon: <MonitorSmartphone className="h-4 w-4" />,
+            category: "File",
+            action: actions.onSendToComputer,
+            keywords: ["send", "share", "peer", "airdrop", "transfer", "computer", "nearby"],
+          },
+        ]
+      : []),
+    ...(actions.onSendFeedback
+      ? [
+          {
+            id: "send-feedback",
+            label: "Help: Send Feedback\u2026",
+            description: "Tell us what went wrong or what you would like; diagnostics are included only if you tick the box",
+            icon: <CircleHelp className="h-4 w-4" />,
+            category: "Navigation",
+            action: actions.onSendFeedback,
+            keywords: ["help", "feedback", "bug", "report", "suggest", "idea", "support", "contact"],
+          },
+        ]
+      : []),
+    ...(actions.onOpenLogViewer
+      ? [
+          {
+            id: "open-log-viewer",
+            label: "Open Log Viewer\u2026",
+            description: "Read the app's own log: filter by level, module, time and text, follow it live, copy lines",
+            icon: <ScrollText className="h-4 w-4" />,
+            category: "Navigation",
+            action: actions.onOpenLogViewer,
+            keywords: ["log", "logs", "logging", "viewer", "debug", "errors", "tail", "diagnostics"],
+          },
+        ]
+      : []),
+    ...(actions.onOpenSchedules
+      ? [
+          {
+            id: "open-schedules",
+            label: "Schedules & holiday calendars\u2026",
+            description: "Named schedules for sync pairs and rules; holiday calendars that skip scheduled runs",
+            icon: <CalendarClock className="h-4 w-4" />,
+            category: "Navigation",
+            action: actions.onOpenSchedules,
+            keywords: ["schedule", "schedules", "cron", "holiday", "holidays", "calendar", "business days", "bank holiday"],
+          },
+        ]
+      : []),
     {
       id: "open-sync",
       label: "Sync Pairs\u2026",
@@ -1345,6 +1523,81 @@ export function getDefaultCommands(actions: {
       ],
     },
     {
+      id: "edit-address",
+      label: "Go to Address\u2026",
+      description: "Type a folder path, conn://\u2026 or <connection name>:path in the active pane",
+      icon: <Globe className="h-4 w-4" />,
+      shortcut: `${cmd}L`,
+      category: "Navigation",
+      action: actions.onEditAddress || (() => {}),
+      keywords: ["address", "path", "go to", "location", "breadcrumb", "type path", "cloud", "connection"],
+    },
+    {
+      id: "new-window",
+      label: "New Window",
+      description: "Open another UFOP window at the active pane's folder (each window has its own panes and tabs)",
+      icon: <AppWindow className="h-4 w-4" />,
+      shortcut: `${cmd}N`,
+      category: "Navigation",
+      action: actions.onNewWindow || (() => {}),
+      keywords: ["window", "new window", "another window", "second window", "multiple windows", "open window"],
+    },
+    {
+      id: "go-to-parent-folder",
+      label: "Go to Parent Folder",
+      description: "Open the folder that contains the active pane's folder",
+      icon: <FolderUp className="h-4 w-4" />,
+      shortcut: isMac ? `${cmd}\u2191` : "Alt+\u2191",
+      category: "Navigation",
+      action: actions.onGoToParentFolder || (() => {}),
+      keywords: ["up", "parent", "back up", "folder up", "..", "backspace", "go up"],
+    },
+    {
+      id: "open-rclone-remotes",
+      label: "rclone Remotes\u2026",
+      description: "Create, edit, test and delete rclone remotes (Box, pCloud, MEGA, S3, SFTP, 70+ providers)",
+      icon: <Globe className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenRcloneRemotes || (() => {}),
+      keywords: ["rclone", "remote", "remotes", "rclone config", "box", "pcloud", "mega", "crypt", "provider", "cloud"],
+    },
+    {
+      id: "startup-tray-settings",
+      label: "Startup & Tray Settings\u2026",
+      description: "Start at login, start minimised, minimise or close to the tray, show the tray icon",
+      icon: <Settings className="h-4 w-4" />,
+      category: "Navigation",
+      action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("startup") : actions.onOpenSettings?.()),
+      keywords: ["startup", "login", "autostart", "tray", "minimise", "minimize", "close", "background", "menu bar"],
+    },
+    {
+      id: "lock-app",
+      label: "Lock UFOP",
+      description: "Show the lock screen in every window until the master password is entered (turn it on in Settings \u2192 App Lock)",
+      icon: <Lock className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onLockApp || (() => actions.onOpenSettingsSection?.("app-lock")),
+      keywords: ["lock", "app lock", "password", "privacy", "away", "screen lock"],
+    },
+    {
+      id: "reset-settings",
+      label: "Reset Settings\u2026",
+      description: "Put appearance, startup and tray, and sync defaults back to the defaults (data is kept)",
+      icon: <RotateCcw className="h-4 w-4" />,
+      category: "Navigation",
+      action: () => (actions.onOpenSettingsSection ? actions.onOpenSettingsSection("reset") : actions.onOpenSettings?.()),
+      keywords: ["reset", "defaults", "factory", "restore settings", "start over", "preferences"],
+    },
+    {
+      id: "rclone-settings",
+      label: "rclone Program & Config\u2026",
+      description: "Choose the rclone binary and rclone.conf, check the version, install the managed copy (Settings \u2192 rclone)",
+      icon: <Globe className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onOpenRcloneSettings || actions.onOpenSettings || (() => {}),
+      keywords: ["rclone", "binary", "version", "rclone.conf", "config", "update", "install"],
+    },
+    {
       id: "open-vault",
       label: "Encrypted Vault…",
       description:
@@ -1435,6 +1688,14 @@ export function getDefaultCommands(actions: {
         "privacy",
         "logs",
       ],
+    },
+    {
+      id: "toggle-operations",
+      label: "Show Operations (Transfers, Syncs, Backups)",
+      icon: <Zap className="h-4 w-4" />,
+      category: "Navigation",
+      action: actions.onToggleOperations || (() => {}),
+      keywords: ["progress", "running", "queue", "activity", "jobs", "cancel"],
     },
     // Automations (Quickflows)
     {
@@ -1624,6 +1885,24 @@ export function getDefaultCommands(actions: {
       ],
     },
     {
+      id: "compare-panes",
+      label: "Compare Panes",
+      description: "Compare the left and right folders recursively, then copy or delete the differences",
+      icon: <FolderSync className="h-4 w-4" />,
+      category: "File Operations",
+      action: actions.onComparePanes || (() => {}),
+      keywords: ["compare", "compare folders", "diff folders", "folder diff", "reconcile", "differences", "check"],
+    },
+    {
+      id: "compare-folder-with",
+      label: "Compare Folder With…",
+      description: "Compare the active pane's folder with another folder you pick",
+      icon: <FolderSync className="h-4 w-4" />,
+      category: "File Operations",
+      action: actions.onCompareFolderWith || (() => {}),
+      keywords: ["compare", "compare with", "diff folders", "folder diff", "reconcile"],
+    },
+    {
       id: "queue-copy",
       label: "Queue Copy to Destination…",
       description:
@@ -1769,6 +2048,23 @@ export function getDefaultCommands(actions: {
       ],
     },
   ];
+
+  // Every guided wizard, by name (Simple mode also lists them).
+  if (actions.onOpenGuidedFlow) {
+    const open = actions.onOpenGuidedFlow;
+    for (const id of GUIDED_FLOW_IDS) {
+      const meta = GUIDED_FLOW_META[id];
+      commands.push({
+        id: `guided-${id}`,
+        label: `${meta.label} (guided)`,
+        description: meta.description,
+        icon: <Sparkles className="h-4 w-4" />,
+        category: "Guided",
+        action: () => open(id),
+        keywords: ["wizard", "guided", "step by step", "help me", meta.category.toLowerCase()],
+      });
+    }
+  }
 
   // Inject the first nine bookmarks as their own palette entries so the
   // user can fuzzy-search them by name without remembering slot numbers.

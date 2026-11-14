@@ -1,138 +1,33 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { v4 as uuidv4 } from 'uuid';
-import { requireRole, isAuthorized } from '@/lib/utils/require-role';
+import { audit, badRequest, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
+import { createWebhook, deliveryStats, EVENT_CATALOG, listWebhooks, type WebhookInput } from '@/lib/db/repos/webhooks';
+import { orgErrorResponse } from '@/lib/route-helpers';
 
 /**
- * Webhook Management API (T-059)
+ * Outbound webhooks of the current organization.
  *
- * GET /api/webhooks - List registered webhooks
- * POST /api/webhooks - Register a new webhook
- *
- * Events: transfer.started, transfer.completed, transfer.failed,
- *         sync.started, sync.completed, sync.conflict,
- *         user.created, user.deactivated,
- *         policy.violation, approval.requested, approval.resolved,
- *         connector.connected, connector.disconnected
+ * GET  /api/webhooks — subscriptions with delivery counts, and the event catalog
+ * POST /api/webhooks {name, url, events, headers?, enabled?} — returns the signing secret once
  */
-
-interface Webhook {
-  id: string;
-  url: string;
-  events: string[];
-  secret: string;
-  is_active: boolean;
-  created_at: string;
-  updated_at: string;
-  last_triggered: string | null;
-  failure_count: number;
-  created_by: string;
-}
-
-const webhooks: Webhook[] = [];
-
-const VALID_EVENTS = [
-  'transfer.started',
-  'transfer.completed',
-  'transfer.failed',
-  'transfer.paused',
-  'sync.started',
-  'sync.completed',
-  'sync.conflict',
-  'sync.error',
-  'user.created',
-  'user.deactivated',
-  'user.role_changed',
-  'policy.violation',
-  'policy.updated',
-  'approval.requested',
-  'approval.resolved',
-  'connector.connected',
-  'connector.disconnected',
-  'connector.error',
-  'ai.action_executed',
-  'ai.suggestion_generated',
-];
-
-/** GET /api/webhooks */
 export async function GET(request: NextRequest) {
-  const authResult = await requireRole(request, 'manager');
-  if (!isAuthorized(authResult)) return authResult;
-
+  const ctx = await requirePermission(request, 'alerts.read');
+  if (!isContext(ctx)) return ctx;
   return NextResponse.json({
-    webhooks: webhooks.map(w => ({
-      ...w,
-      secret: w.secret.slice(0, 4) + '****', // Mask secret
-    })),
-    total: webhooks.length,
-    available_events: VALID_EVENTS,
+    webhooks: listWebhooks(ctx.orgId).map((w) => ({ ...w, stats: deliveryStats(ctx.orgId, w.id) })),
+    events: EVENT_CATALOG,
   });
 }
 
-/** POST /api/webhooks */
 export async function POST(request: NextRequest) {
-  const authResult = await requireRole(request, 'manager');
-  if (!isAuthorized(authResult)) return authResult;
-
+  const ctx = await requireStepUp(request, 'alerts.write');
+  if (!isContext(ctx)) return ctx;
+  const b = await readJson<WebhookInput>(request);
+  if (!b) return badRequest('Invalid request');
   try {
-    const body = await request.json();
-    const { url, events } = body;
-
-    if (!url) {
-      return NextResponse.json({ error: 'url is required' }, { status: 400 });
-    }
-
-    // Validate URL format
-    try {
-      new URL(url);
-    } catch {
-      return NextResponse.json({ error: 'Invalid URL format' }, { status: 400 });
-    }
-
-    if (!events || !Array.isArray(events) || events.length === 0) {
-      return NextResponse.json(
-        { error: 'events array is required (at least one event)' },
-        { status: 400 }
-      );
-    }
-
-    const invalidEvents = events.filter((e: string) => !VALID_EVENTS.includes(e));
-    if (invalidEvents.length > 0) {
-      return NextResponse.json(
-        {
-          error: `Invalid events: ${invalidEvents.join(', ')}`,
-          valid_events: VALID_EVENTS,
-        },
-        { status: 400 }
-      );
-    }
-
-    const secret = `whsec_${uuidv4().replace(/-/g, '')}`;
-
-    const webhook: Webhook = {
-      id: `wh_${uuidv4().slice(0, 12)}`,
-      url,
-      events,
-      secret,
-      is_active: true,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      last_triggered: null,
-      failure_count: 0,
-      created_by: authResult.user.email,
-    };
-
-    webhooks.push(webhook);
-
-    return NextResponse.json(
-      {
-        webhook: {
-          ...webhook,
-          secret, // Show full secret only on creation
-        },
-      },
-      { status: 201 }
-    );
-  } catch {
-    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
+    const { webhook, secret } = createWebhook(ctx.orgId, b, ctx.user.email);
+    audit(ctx, { eventType: 'webhook.create', description: `Created webhook "${webhook.name}" (${new URL(webhook.url).host})`, resourceType: 'webhook', resourceId: webhook.id, metadata: { events: webhook.events } });
+    return NextResponse.json({ webhook, secret }, { status: 201 });
+  } catch (e) {
+    return orgErrorResponse(e);
   }
 }

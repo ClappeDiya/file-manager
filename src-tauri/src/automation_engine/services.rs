@@ -1,0 +1,236 @@
+//! Engine services available to automation actions.
+//!
+//! Actions such as "run a sync pair" or "upload to a connection" are carried
+//! out by other managers that live in Tauri's managed state. The executor
+//! only sees this trait, so it stays testable without a Tauri app: tests pass
+//! a recording mock, the app passes [`tauri_services::TauriActionServices`].
+//!
+//! When no services are attached (unit tests, headless callers), these
+//! actions fail with an explanation instead of reporting a success that
+//! never happened.
+
+use crate::core::traits::BoxFuture;
+
+/// Error text used when an action needs an engine that isn't attached.
+pub const SERVICES_UNAVAILABLE: &str =
+    "This action needs the desktop app's engines, which are not available in this context";
+
+/// Engines an automation action can delegate to. Every method returns a
+/// short human-readable outcome (shown in the run history) or an error.
+pub trait ActionServices: Send + Sync {
+    /// Run a saved sync pair to completion.
+    fn run_sync(&self, pair_id: &str) -> BoxFuture<'_, Result<String, String>>;
+
+    /// Upload `local_path` into `remote_dir` on a saved connection,
+    /// connecting first when needed. Returns the remote path written.
+    fn transfer_to_connector(
+        &self,
+        protocol: &str,
+        connection_id: &str,
+        local_path: &str,
+        remote_dir: &str,
+    ) -> BoxFuture<'_, Result<String, String>>;
+
+    /// Run a saved custom command against `files`. Unattended runs never
+    /// bypass the command allowlist.
+    fn run_custom_command(
+        &self,
+        command_id: &str,
+        files: Vec<String>,
+    ) -> BoxFuture<'_, Result<String, String>>;
+
+    /// Show an OS notification.
+    fn notify(&self, title: &str, body: &str) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Deliver a message through a configured channel (email, Slack,
+    /// Teams, Telegram, XMPP).
+    fn send_message(
+        &self,
+        notification: &crate::backup_engine::notify::Notification,
+        title: &str,
+        body: &str,
+    ) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Apply `instruction` to a file's text with the local AI model.
+    fn ai_task<'a>(&'a self, _instruction: &'a str, _file_name: &'a str, _text: &'a str) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async { Err(SERVICES_UNAVAILABLE.to_string()) })
+    }
+
+    /// A rule finished a run (success or failure, not a dry run): report it
+    /// through the rule's notification profile. Never fails the run.
+    fn run_finished<'a>(&'a self, _rule: &'a super::AutomationRule, _log: &'a super::AutomationLog) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// Compare a sync pair's two sides (`full`: contents, not just sizes).
+    /// Ok with a one-line outcome when they agree; Err naming the differences.
+    fn verify_pair<'a>(&'a self, _pair_id: &'a str, _full: bool) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async { Err(SERVICES_UNAVAILABLE.to_string()) })
+    }
+
+    /// Judge a destructive step against the safety interlock. Without the
+    /// ledger only the absolute limits apply.
+    fn assess_intent<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, crate::safety::RiskAssessment> {
+        Box::pin(async move { crate::safety::assess_static(intent) })
+    }
+
+    /// Record a finished destructive step so later assessments know what is
+    /// usual for this user.
+    fn record_operation<'a>(&'a self, _intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// Another rule by id (workflow steps that run a nested rule).
+    fn rule<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Option<super::AutomationRule>> {
+        Box::pin(async { None })
+    }
+}
+
+/// Join a remote directory and a file name with exactly one `/`.
+pub fn remote_join(remote_dir: &str, file_name: &str) -> String {
+    let dir = remote_dir.trim_end_matches('/');
+    if dir.is_empty() {
+        format!("/{file_name}")
+    } else {
+        format!("{dir}/{file_name}")
+    }
+}
+
+#[cfg(test)]
+pub mod mock {
+    //! Recording mock used by executor and manager tests.
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    pub struct RecordingServices {
+        pub calls: Mutex<Vec<String>>,
+        /// When set, every call fails with this message.
+        pub fail_with: Option<String>,
+        /// Rules nested workflow steps can run.
+        pub rules: Mutex<Vec<crate::automation_engine::AutomationRule>>,
+        /// `name:status` of every finished run reported to `run_finished`.
+        pub finished: Mutex<Vec<String>>,
+        /// (path, content at the time of the call) of every upload.
+        pub uploaded: Mutex<Vec<(String, Vec<u8>)>>,
+        /// Sync pairs `verify_pair` can compare.
+        pub pairs: Mutex<Vec<ufop_core::sync_types::SyncPair>>,
+        /// Destructive steps reported to `record_operation` (`kind:files:bytes`).
+        pub operations: Mutex<Vec<String>>,
+        /// When set, `assess_intent` answers with this level instead of the static limits.
+        pub assess_level: Mutex<Option<crate::safety::RiskLevel>>,
+    }
+
+    impl RecordingServices {
+        pub fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn record(&self, call: String) -> Result<(), String> {
+            self.calls.lock().unwrap().push(call);
+            match &self.fail_with {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl ActionServices for RecordingServices {
+        fn run_sync(&self, pair_id: &str) -> BoxFuture<'_, Result<String, String>> {
+            let r = self.record(format!("sync:{pair_id}"));
+            Box::pin(async move { r.map(|_| "sync done".to_string()) })
+        }
+
+        fn transfer_to_connector(
+            &self,
+            protocol: &str,
+            connection_id: &str,
+            local_path: &str,
+            remote_dir: &str,
+        ) -> BoxFuture<'_, Result<String, String>> {
+            let name = std::path::Path::new(local_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let remote = remote_join(remote_dir, &name);
+            self.uploaded.lock().unwrap().push((local_path.to_string(), std::fs::read(local_path).unwrap_or_default()));
+            let r = self.record(format!("transfer:{protocol}:{connection_id}:{local_path}->{remote}"));
+            Box::pin(async move { r.map(|_| remote) })
+        }
+
+        fn run_custom_command(
+            &self,
+            command_id: &str,
+            files: Vec<String>,
+        ) -> BoxFuture<'_, Result<String, String>> {
+            let r = self.record(format!("command:{command_id}:{}", files.join(",")));
+            Box::pin(async move { r.map(|_| "exit 0".to_string()) })
+        }
+
+        fn notify(&self, title: &str, body: &str) -> BoxFuture<'_, Result<(), String>> {
+            let r = self.record(format!("notify:{title}:{body}"));
+            Box::pin(async move { r })
+        }
+
+        fn send_message(
+            &self,
+            notification: &crate::backup_engine::notify::Notification,
+            title: &str,
+            body: &str,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            let kind = serde_json::to_value(&notification.channel).ok().and_then(|v| v["type"].as_str().map(str::to_string)).unwrap_or_default();
+            let r = self.record(format!("message:{kind}:{title}:{body}"));
+            Box::pin(async move { r })
+        }
+
+        fn verify_pair<'a>(&'a self, pair_id: &'a str, full: bool) -> BoxFuture<'a, Result<String, String>> {
+            let found = self.pairs.lock().unwrap().iter().find(|p| p.id.to_string() == pair_id).cloned();
+            let r = self.record(format!("verify:{pair_id}:{full}")).and_then(|_| found.ok_or_else(|| format!("Sync pair {pair_id} not found"))).and_then(|p| crate::sync_engine::verify_outcome(&p, full));
+            Box::pin(async move { r })
+        }
+
+        fn assess_intent<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, crate::safety::RiskAssessment> {
+            let mut a = crate::safety::assess_static(intent);
+            if let Some(level) = *self.assess_level.lock().unwrap() {
+                a.level = level;
+                a.requires_confirmation = level.requires_confirmation();
+                a.reasons = vec![format!("test says {level:?}")];
+            }
+            Box::pin(async move { a })
+        }
+
+        fn record_operation<'a>(&'a self, intent: &'a crate::safety::OperationIntent) -> BoxFuture<'a, ()> {
+            self.operations.lock().unwrap().push(format!("{}:{}:{}", intent.kind, intent.affected_files, intent.total_bytes));
+            Box::pin(async {})
+        }
+
+        fn run_finished<'a>(&'a self, rule: &'a crate::automation_engine::AutomationRule, log: &'a crate::automation_engine::AutomationLog) -> BoxFuture<'a, ()> {
+            self.finished.lock().unwrap().push(format!("{}:{:?}", rule.name, log.status));
+            Box::pin(async {})
+        }
+
+        fn rule<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Option<crate::automation_engine::AutomationRule>> {
+            let r = self.rules.lock().unwrap().iter().find(|r| r.id == id).cloned();
+            Box::pin(async move { r })
+        }
+
+        fn ai_task<'a>(&'a self, instruction: &'a str, file_name: &'a str, text: &'a str) -> BoxFuture<'a, Result<String, String>> {
+            let r = self.record(format!("ai:{instruction}:{file_name}:{}", text.chars().count()));
+            let answer = format!("{} chars about {file_name}", text.chars().count());
+            Box::pin(async move { r.map(|_| answer) })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_join_normalises_slashes() {
+        assert_eq!(remote_join("/inbox/", "a.txt"), "/inbox/a.txt");
+        assert_eq!(remote_join("/inbox", "a.txt"), "/inbox/a.txt");
+        assert_eq!(remote_join("", "a.txt"), "/a.txt");
+        assert_eq!(remote_join("/", "a.txt"), "/a.txt");
+    }
+}

@@ -115,7 +115,15 @@
     "diskFull": "Not enough disk space",
     "copyingFiles": "Copying {{count}} files...",
     "movingFiles": "Moving {{count}} files...",
-    "deletingFiles": "Deleting {{count}} files..."
+    "deletingFiles": "Deleting {{count}} files...",
+    "folders": "Folders",
+    "smart": "Smart",
+    "copyPath": "Copy Path",
+    "deletePermanently": "Delete Permanently",
+    "openWith": "Open With...",
+    "extractHere": "Extract Here",
+    "openInNewWindow": "Open in New Window",
+    "cloudFolders": "Cloud folders"
   },
   "transfer": {
     "title": "Transfer",
@@ -268,7 +276,17 @@
     "rollback": "Rollback to Previous Version",
     "rollbackConfirm": "Are you sure you want to rollback to the previous version?",
     "rollbackSuccess": "Successfully rolled back. Restart to apply.",
-    "rollbackFailed": "Rollback failed: {{error}}"
+    "rollbackFailed": "Rollback failed: {{error}}",
+    "languageSystem": "System default ({{name}})",
+    "languageHint": "Menus, the sidebar, settings headings and the tray menu use this language; other text is still in English.",
+    "notifications": "Notifications",
+    "privacy": "Privacy",
+    "network": "Network",
+    "logging": "Logging",
+    "startupTray": "Startup & Tray",
+    "appLock": "App Lock",
+    "reset": "Reset",
+    "accentColor": "Accent colour"
   },
   "onboarding": {
     "welcome": "Welcome to Unified File Operations Platform",
@@ -361,5 +379,11 @@
     "rollbackDescription": "If the current version has issues, you can rollback to the previous version.",
     "differentialUpdate": "Downloading differential update...",
     "fullUpdate": "Downloading full update..."
+  },
+  "nav": {
+    "back": "Navigate back",
+    "forward": "Navigate forward",
+    "up": "Go to parent folder",
+    "root": "Navigate to root"
   }
 }

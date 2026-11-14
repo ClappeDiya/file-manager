@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import { ConnectionPanel } from "@/components/connection-panel";
 import { PromptDialogHost } from "@/components/prompt-dialog-host";
 import { pickFiles, pickFolder } from "@/lib/folder-picker";
+import { useCompareStore } from "@/stores/compare-store";
 
 const mockInvoke = vi.fn();
 
@@ -99,7 +100,7 @@ describe("ConnectionPanel remote browser", () => {
       expect.objectContaining({ protocol: "sftp", connectionId: "conn-1" }),
     ]);
     expect(calls("connector_list_remote")).toEqual([
-      expect.objectContaining({ protocol: "sftp", path: "/" }),
+      expect.objectContaining({ protocol: "sftp", path: "/", connectionId: "conn-1" }),
     ]);
   });
 
@@ -117,8 +118,8 @@ describe("ConnectionPanel remote browser", () => {
     await screen.findByText(/Uploaded 2 files/);
 
     expect(calls("connector_upload")).toEqual([
-      expect.objectContaining({ localPath: "/local/a.bin", remotePath: "/a.bin" }),
-      expect.objectContaining({ localPath: "/local/b.bin", remotePath: "/b.bin" }),
+      expect.objectContaining({ localPath: "/local/a.bin", remotePath: "/a.bin", connectionId: "conn-1" }),
+      expect.objectContaining({ localPath: "/local/b.bin", remotePath: "/b.bin", connectionId: "conn-1" }),
     ]);
     // The remote listing was refreshed afterwards.
     expect(calls("connector_list_remote").length).toBeGreaterThanOrEqual(2);
@@ -141,6 +142,7 @@ describe("ConnectionPanel remote browser", () => {
       expect.objectContaining({
         remotePath: "/report.txt",
         localPath: "/downloads/report.txt",
+        connectionId: "conn-1",
       }),
     ]);
   });
@@ -161,7 +163,7 @@ describe("ConnectionPanel remote browser", () => {
 
     await waitFor(() =>
       expect(calls("connector_make_directory")).toEqual([
-        expect.objectContaining({ remotePath: "/newfolder" }),
+        expect.objectContaining({ remotePath: "/newfolder", connectionId: "conn-1" }),
       ]),
     );
   });
@@ -187,8 +189,60 @@ describe("ConnectionPanel remote browser", () => {
 
     await waitFor(() =>
       expect(calls("connector_remove")).toEqual([
-        expect.objectContaining({ remotePath: "/report.txt", isDir: false }),
+        expect.objectContaining({ remotePath: "/report.txt", isDir: false, connectionId: "conn-1" }),
       ]),
     );
+  });
+
+  // The connector writes a native Google file exactly where it is told,
+  // so the panel names the export with the connection's format.
+  it("downloads a native Google file with its export format's extension", async () => {
+    const gconn = { ...CONN, id: "g-1", name: "My Drive", protocol: "google_drive", host: "", extras: { google_drive: { root: "my_drive", shared_drive_id: null, shared_drive_name: null, export_formats: { document: "pdf", spreadsheet: null, presentation: null, drawing: null } } } };
+    const listing = [
+      { name: "Plan", path: "/f1", is_dir: false, size: 0, modified: null, extension: "gdoc" },
+      { name: "Budget", path: "/f2", is_dir: false, size: 0, modified: null, extension: "gsheet" },
+    ];
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_connections") return Promise.resolve([gconn]);
+      if (cmd === "get_connection") return Promise.resolve(gconn);
+      if (cmd === "connector_list_protocols") return Promise.resolve(["google_drive"]);
+      if (cmd === "connector_list_remote") return Promise.resolve(listing);
+      return Promise.resolve(backendFor(cmd));
+    });
+    vi.mocked(pickFolder).mockResolvedValue("/downloads");
+    render(
+      <>
+        <ConnectionPanel />
+        <PromptDialogHost />
+      </>,
+    );
+    fireEvent.click(await screen.findByText("My Drive"));
+    await screen.findByText("Plan");
+    fireEvent.click(screen.getByTestId("remote-download-Plan"));
+    await screen.findByText(/Downloaded Plan\.pdf/);
+    fireEvent.click(screen.getByTestId("remote-download-Budget"));
+    await screen.findByText(/Downloaded Budget\.xlsx/);
+    expect(calls("connector_download")).toEqual([
+      expect.objectContaining({ protocol: "google_drive", remotePath: "/f1", localPath: "/downloads/Plan.pdf", connectionId: "g-1" }),
+      expect.objectContaining({ protocol: "google_drive", remotePath: "/f2", localPath: "/downloads/Budget.xlsx", connectionId: "g-1" }),
+    ]);
+  });
+
+  it("Compare with… compares a picked local folder with the folder being browsed", async () => {
+    vi.mocked(pickFolder).mockResolvedValue("/home/me/site");
+    useCompareStore.setState({ request: null });
+    render(
+      <>
+        <ConnectionPanel />
+        <PromptDialogHost />
+      </>,
+    );
+    await connectAndBrowse();
+    fireEvent.click(screen.getByTestId("remote-compare-with"));
+    fireEvent.click(screen.getByTestId("remote-compare-pick"));
+    await waitFor(() => expect(useCompareStore.getState().request).not.toBeNull());
+    const req = useCompareStore.getState().request!;
+    expect(req.left).toEqual({ type: "local", path: "/home/me/site" });
+    expect(req.right).toEqual({ type: "remote", connection_id: "conn-1", protocol: "sftp", path: "/" });
   });
 });

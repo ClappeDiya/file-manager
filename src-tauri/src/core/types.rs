@@ -403,6 +403,14 @@ pub struct TransferConfig {
     pub journal_retention_days: u32,
     /// Minimum file size for chunking (bytes).
     pub chunk_threshold: u64,
+    /// Files transferred at once per saved connection by pane copies and
+    /// moves to or from it (the others wait in the queue).
+    #[serde(default = "default_location_jobs_per_connection")]
+    pub max_location_jobs_per_connection: u32,
+}
+
+fn default_location_jobs_per_connection() -> u32 {
+    4
 }
 
 impl Default for TransferConfig {
@@ -421,6 +429,7 @@ impl Default for TransferConfig {
             merkle_sidecar: true,
             journal_retention_days: 30,
             chunk_threshold: 10 * 1024 * 1024, // 10 MB
+            max_location_jobs_per_connection: default_location_jobs_per_connection(),
         }
     }
 }
@@ -527,6 +536,10 @@ pub struct TransferJob {
     pub speed_bps: u64,
     /// Estimated time remaining in seconds.
     pub eta_seconds: Option<u64>,
+    /// Run by another engine (a connector transfer of a folder comparison)
+    /// and only shown in the queue: it can be cancelled, not paused or retried.
+    #[serde(default)]
+    pub external: bool,
 }
 
 /// A resolved conflict with the decision made.
@@ -671,7 +684,15 @@ pub enum ConnectionProtocol {
     OneDrive,
     Local,
     AzureBlob,
+    /// Azure Data Lake Storage Gen2 (`dfs` endpoint).
+    AdlsGen2,
+    /// Azure Files (REST).
+    AzureFiles,
     Swift,
+    /// Any rclone remote (GCS, Box, pCloud, Mega…).
+    Rclone,
+    /// Backblaze B2 native API (key ID + application key).
+    B2,
 }
 
 impl ConnectionProtocol {
@@ -689,7 +710,11 @@ impl ConnectionProtocol {
             Self::OneDrive => "onedrive",
             Self::Local => "local",
             Self::AzureBlob => "azure_blob",
+            Self::AdlsGen2 => "adls_gen2",
+            Self::AzureFiles => "azure_files",
             Self::Swift => "swift",
+            Self::Rclone => "rclone",
+            Self::B2 => "b2",
         }
     }
 
@@ -707,7 +732,11 @@ impl ConnectionProtocol {
             "onedrive" => Self::OneDrive,
             "local" => Self::Local,
             "azure_blob" => Self::AzureBlob,
+            "adls_gen2" => Self::AdlsGen2,
+            "azure_files" => Self::AzureFiles,
             "swift" => Self::Swift,
+            "rclone" => Self::Rclone,
+            "b2" => Self::B2,
             _ => Self::Local,
         }
     }
@@ -785,6 +814,199 @@ pub struct ConnectionProfile {
     /// "follow" = resolve and transfer target, "skip" = ignore symlinks,
     /// "preserve" = recreate symlinks at destination (default).
     pub symlink_policy: Option<String>,
+
+    /// Connector-specific settings (role assumption, rclone remote, preset).
+    #[serde(default)]
+    pub extras: ConnectionExtras,
+}
+
+/// Per-connection flags kept outside the profile (they change without the
+/// profile being edited).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionStatus {
+    pub id: Uuid,
+    /// Listed first in the Connections panel.
+    pub starred: bool,
+    /// When the service last rejected the credentials; `None` = not flagged.
+    pub credentials_rejected_at: Option<DateTime<Utc>>,
+    /// What the service said.
+    pub credentials_rejected_reason: Option<String>,
+}
+
+/// STS AssumeRole on top of a connection's keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssumeRoleConfig {
+    pub role_arn: String,
+    /// Required by many cross-account trust policies.
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    /// 900..=43200 seconds; default 3600.
+    #[serde(default)]
+    pub duration_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConnectionExtras {
+    pub assume_role: Option<AssumeRoleConfig>,
+    /// rclone remote name (`gdrive:`) for rclone connections.
+    pub rclone_remote: Option<String>,
+    /// Provider preset the connection was created from (`r2`, `egnyte`…).
+    pub preset: Option<String>,
+    /// OpenStack Swift sign-in settings.
+    pub swift: Option<SwiftSettings>,
+    /// WebDAV sign-in mode and server vendor.
+    pub webdav: Option<WebDavSettings>,
+    /// SMB/CIFS Windows domain.
+    pub smb: Option<SmbSettings>,
+    /// OAuth sign-in (Google Drive, Dropbox, OneDrive): which app to use.
+    pub oauth: Option<OAuthSettings>,
+    /// Google Drive: which part of Drive to open, export formats.
+    pub google_drive: Option<GoogleDriveSettings>,
+    /// OneDrive / SharePoint document library.
+    pub onedrive: Option<OneDriveSettings>,
+    /// Dropbox team space / team folder (namespace root).
+    pub dropbox: Option<DropboxSettings>,
+}
+
+/// How a WebDAV connection signs in. The secret is the password (basic)
+/// or the bearer token.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebDavAuthMode {
+    #[default]
+    Basic,
+    /// `Authorization: Bearer <token>` (app passwords / OAuth tokens).
+    Bearer,
+    /// No credentials.
+    None,
+}
+
+/// WebDAV server family; Nextcloud and ownCloud get their chunked uploads.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebDavVendor {
+    #[default]
+    Generic,
+    Nextcloud,
+    Owncloud,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebDavSettings {
+    pub auth: WebDavAuthMode,
+    pub vendor: WebDavVendor,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SmbSettings {
+    /// Windows domain or workgroup (`CORP`); empty = none.
+    pub domain: Option<String>,
+}
+
+/// OneDrive account kind, which decides the Microsoft sign-in endpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OneDriveAccountKind {
+    #[default]
+    Personal,
+    /// Work or school (Microsoft 365, SharePoint).
+    Business,
+}
+
+/// OAuth app settings. Tokens never live here: they are in the credential
+/// store under the connection's credential key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OAuthSettings {
+    /// Your own OAuth client ID (Advanced); `None` = the app's built-in one.
+    pub client_id: Option<String>,
+    /// OneDrive: personal or work/school account.
+    pub account_kind: OneDriveAccountKind,
+}
+
+/// Which part of Google Drive a connection opens.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleDriveRoot {
+    #[default]
+    MyDrive,
+    SharedWithMe,
+    /// One shared drive (`shared_drive_id`).
+    SharedDrive,
+}
+
+/// Google Docs export format per native type (Advanced); `None` = default
+/// (Docs → docx, Sheets → xlsx, Slides → pptx, Drawings → pdf).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GoogleExportFormats {
+    pub document: Option<String>,
+    pub spreadsheet: Option<String>,
+    pub presentation: Option<String>,
+    pub drawing: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GoogleDriveSettings {
+    pub root: GoogleDriveRoot,
+    pub shared_drive_id: Option<String>,
+    pub shared_drive_name: Option<String>,
+    pub export_formats: GoogleExportFormats,
+}
+
+/// A SharePoint site's document library to open instead of the user's
+/// own OneDrive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OneDriveSettings {
+    pub site_id: Option<String>,
+    pub site_name: Option<String>,
+    pub drive_id: Option<String>,
+    pub drive_name: Option<String>,
+}
+
+/// Dropbox namespace to use as the root (`Dropbox-API-Path-Root`): a team
+/// space root or a team folder.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DropboxSettings {
+    pub root_namespace_id: Option<String>,
+    pub root_label: Option<String>,
+}
+
+/// How a Swift connection signs in.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwiftAuthKind {
+    /// Keystone v3 user name and password, scoped to a project.
+    #[default]
+    Password,
+    /// Keystone v3 application credential (id + secret).
+    ApplicationCredential,
+    /// TempAuth / v1 (`X-Auth-User` / `X-Auth-Key`).
+    TempAuth,
+}
+
+/// OpenStack Swift settings. The secret is the password, the application
+/// credential secret or the TempAuth key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SwiftSettings {
+    pub auth_kind: SwiftAuthKind,
+    /// Keystone or TempAuth URL; when empty, `https://<host>:<port>/v3`.
+    pub auth_url: Option<String>,
+    pub project_name: Option<String>,
+    /// User and project domain (Keystone password sign-in); default `Default`.
+    pub domain_name: Option<String>,
+    /// Catalog region to use when the project has several.
+    pub region: Option<String>,
+    pub application_credential_id: Option<String>,
 }
 
 /// Global proxy configuration.
@@ -1013,6 +1235,8 @@ mod tests {
             ConnectionProtocol::OneDrive,
             ConnectionProtocol::Local,
             ConnectionProtocol::AzureBlob,
+            ConnectionProtocol::AdlsGen2,
+            ConnectionProtocol::AzureFiles,
             ConnectionProtocol::Swift,
         ];
         for p in &protocols {

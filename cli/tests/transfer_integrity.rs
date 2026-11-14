@@ -34,7 +34,7 @@ fn every_output_format_copies_and_verifies_the_destination_tree() {
         if format != "human" {
             let text = String::from_utf8(result.stdout).unwrap();
             let data: serde_json::Value = if format == "json" {
-                serde_json::from_str(&text).unwrap()
+                serde_json::Deserializer::from_str(&text).into_iter::<serde_json::Value>().collect::<Result<Vec<_>, _>>().unwrap().pop().unwrap()
             } else {
                 serde_yaml::from_str(&text).unwrap()
             };
@@ -104,7 +104,7 @@ fn a_partial_backup_reports_skips_without_claiming_verification() {
         .output()
         .unwrap();
     assert_eq!(result.status.code(), Some(1));
-    let data: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let data: serde_json::Value = serde_json::Deserializer::from_slice(&result.stdout).into_iter::<serde_json::Value>().collect::<Result<Vec<_>, _>>().unwrap().pop().unwrap();
     assert_eq!(data["verified"], false);
     assert_eq!(data["files_skipped"], 1);
     assert_eq!(fs::read(destination.join("a")).unwrap(), b"keep");
@@ -128,7 +128,7 @@ fn overwrite_verifies_actual_replacement_and_missing_source_is_a_failure() {
         .unwrap();
     assert!(result.status.success());
     assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
-    let data: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let data: serde_json::Value = serde_json::Deserializer::from_slice(&result.stdout).into_iter::<serde_json::Value>().collect::<Result<Vec<_>, _>>().unwrap().pop().unwrap();
     assert_eq!(data["verified"], true);
     let missing_dest = temp.path().join("no-output");
     let result = Command::new(env!("CARGO_BIN_EXE_ufop"))

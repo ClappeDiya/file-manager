@@ -90,6 +90,13 @@ pub async fn save_connection(
     default_remote_dir: Option<String>,
     // Charset
     charset: Option<String>,
+    // Upload-time permission defaults (SFTP/FTP)
+    default_file_mode: Option<String>,
+    default_dir_mode: Option<String>,
+    // Connector-specific settings (role assumption, preset, rclone remote)
+    extras: Option<crate::core::types::ConnectionExtras>,
+    // SFTP private-key passphrase: None = unchanged, "" = remove.
+    key_passphrase: Option<String>,
     manager: State<'_, ConnectionManager>,
     master_pw: State<'_, MasterPasswordManager>,
     repo: State<'_, Repository>,
@@ -100,6 +107,9 @@ pub async fn save_connection(
         .and_then(|s| Uuid::parse_str(&s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
+    // Editing keeps what the form doesn't show (creation date, FTP tuning,
+    // symlink policy, conflict/retry policies…).
+    let existing = manager.get_connection(id).await.ok().flatten();
     let profile = ConnectionProfile {
         id,
         name,
@@ -109,14 +119,14 @@ pub async fn save_connection(
         username,
         credential_ref: None,
         remote_path: remote_path.unwrap_or_else(|| "/".to_string()),
-        created_at: Utc::now(),
-        last_used: None,
+        created_at: existing.as_ref().map(|e| e.created_at).unwrap_or_else(Utc::now),
+        last_used: existing.as_ref().and_then(|e| e.last_used),
         group_id: group_id.and_then(|s| Uuid::parse_str(&s).ok()),
         bandwidth_limit_bps: bandwidth_limit_bps.unwrap_or(0),
-        conflict_policy: None,
-        retry_policy: None,
+        conflict_policy: existing.as_ref().and_then(|e| e.conflict_policy),
+        retry_policy: existing.as_ref().and_then(|e| e.retry_policy.clone()),
         verify_checksums: verify_checksums.unwrap_or(false),
-        checksum_algorithm: None,
+        checksum_algorithm: existing.as_ref().and_then(|e| e.checksum_algorithm),
         proxy_type,
         proxy_host,
         proxy_port,
@@ -125,16 +135,17 @@ pub async fn save_connection(
         default_local_dir,
         default_remote_dir,
         charset,
-        default_file_mode: None,
-        default_dir_mode: None,
-        ftp_use_mlsd: None,
-        ftp_force_passive_ip: None,
-        ftp_post_login_commands: None,
-        symlink_policy: None,
+        default_file_mode: default_file_mode.filter(|m| !m.trim().is_empty()),
+        default_dir_mode: default_dir_mode.filter(|m| !m.trim().is_empty()),
+        ftp_use_mlsd: existing.as_ref().and_then(|e| e.ftp_use_mlsd),
+        ftp_force_passive_ip: existing.as_ref().and_then(|e| e.ftp_force_passive_ip),
+        ftp_post_login_commands: existing.as_ref().and_then(|e| e.ftp_post_login_commands.clone()),
+        symlink_policy: existing.as_ref().and_then(|e| e.symlink_policy.clone()),
+        extras: extras.unwrap_or_else(|| existing.map(|e| e.extras).unwrap_or_default()),
     };
 
     let conn_name = profile.name.clone();
-    let result = manager.save_connection(profile, password).await;
+    let result = manager.save_connection_with_secrets(profile, password, key_passphrase).await;
     if result.is_ok() {
         SecurityAudit::log_connection_change(repo.inner(), "save", &conn_name).await;
     }
@@ -172,6 +183,41 @@ pub async fn get_connection(
         p.proxy_password = decrypt_proxy_password(p.proxy_password.take(), master_pw.inner()).await;
     }
     Ok(profile)
+}
+
+fn parse_connection_id(connection_id: &str) -> Result<Uuid, AppError> {
+    Uuid::parse_str(connection_id).map_err(|_| AppError::Connection {
+        message: format!("Invalid connection ID: {connection_id}"),
+        advice: "Provide a valid UUID.".to_string(),
+    })
+}
+
+/// Star or unstar a connection; starred connections are listed first.
+#[tauri::command]
+pub async fn set_connection_starred(
+    connection_id: String,
+    starred: bool,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AppError> {
+    manager.set_starred(parse_connection_id(&connection_id)?, starred).await
+}
+
+/// Starred and credentials-rejected flags of every saved connection.
+#[tauri::command]
+pub async fn list_connection_status(
+    manager: State<'_, ConnectionManager>,
+) -> Result<Vec<crate::core::types::ConnectionStatus>, AppError> {
+    manager.list_status().await
+}
+
+/// Clear a connection's credentials-rejected flag (the Retry button), so
+/// automatic reconnects try it again.
+#[tauri::command]
+pub async fn clear_connection_credentials_rejected(
+    connection_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AppError> {
+    manager.clear_credentials_rejected(parse_connection_id(&connection_id)?).await
 }
 
 /// Delete a connection.
@@ -371,7 +417,7 @@ pub async fn import_from_third_party(
                 .and_then(|n| Path::new(n).file_name())
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "import.txt".to_string());
-            let dir = std::env::temp_dir().join(format!("ufop-import-{}", uuid::Uuid::new_v4()));
+            let dir = ufop_core::session::user_temp_subdir("imports").join(uuid::Uuid::new_v4().to_string());
             std::fs::create_dir_all(&dir)?;
             let p = dir.join(name);
             std::fs::write(&p, content)?;
@@ -443,6 +489,7 @@ pub async fn import_from_third_party(
             ftp_force_passive_ip: None,
             ftp_post_login_commands: None,
             symlink_policy: None,
+            extras: Default::default(),
         };
 
         let password = entry.password.clone();

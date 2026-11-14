@@ -19,6 +19,9 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
+import { structuredKind } from "@/lib/structured-preview";
+import { StructuredPreview } from "@/components/structured-preview";
+import { OfficePreview } from "@/components/office-preview";
 
 // ── Types ──
 
@@ -532,11 +535,11 @@ function InspectorContent({ preview, protocol, advancedMode: _advancedMode }: {
         </div>
       )}
 
-      {protocol === "azure_blob" && (
+      {(protocol === "azure_blob" || protocol === "adls_gen2" || protocol === "azure_files") && (
         <div>
-          <h4 className="text-xs font-semibold text-text-secondary mb-2 uppercase tracking-wider">Azure Blob Properties</h4>
+          <h4 className="text-xs font-semibold text-text-secondary mb-2 uppercase tracking-wider">Azure Properties</h4>
           <div className="text-xs space-y-1.5">
-            <MetadataRow label="Protocol" value="Azure Blob Storage" />
+            <MetadataRow label="Protocol" value={protocol === "adls_gen2" ? "Azure Data Lake Storage Gen2" : protocol === "azure_files" ? "Azure Files" : "Azure Blob Storage"} />
           </div>
         </div>
       )}
@@ -640,7 +643,8 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
     case "text": {
       const lang = getLanguageClass(preview.render_hint);
       const lines = preview.content?.split("\n") || [];
-      return (
+      const kind = structuredKind(preview.file_name);
+      const rawView = (
         <div className="p-2">
           <div className="flex items-center justify-between px-2 py-1 mb-1 text-xs text-text-tertiary bg-surface-secondary rounded-t">
             <span>{lang}</span>
@@ -655,6 +659,11 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
             ))}
           </pre>
         </div>
+      );
+      return kind ? (
+        <StructuredPreview kind={kind} text={preview.content ?? ""} fileName={preview.file_name} path={preview.path} raw={rawView} />
+      ) : (
+        rawView
       );
     }
 
@@ -694,6 +703,9 @@ function PreviewContent({ preview, exif: _exif }: { preview: PreviewResult; exif
           <p className="text-sm text-text-tertiary">{preview.file_name}</p>
         </div>
       );
+
+    case "office":
+      return <OfficePreview path={preview.path} fileName={preview.file_name} text={preview.content} />;
 
     case "archive":
       return (

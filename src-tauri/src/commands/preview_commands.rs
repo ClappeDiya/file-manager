@@ -14,6 +14,9 @@ const MAX_PREVIEW_SIZE: u64 = 10 * 1024 * 1024;
 /// Files larger than this get metadata-only preview (50 MB).
 const METADATA_ONLY_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Characters of extracted text shown for office documents.
+const OFFICE_TEXT_CHARS: usize = 200_000;
+
 /// Maximum text preview lines.
 const MAX_TEXT_LINES: usize = 500;
 
@@ -42,6 +45,9 @@ pub enum PreviewType {
     Audio,
     Video,
     Archive,
+    /// Office document: `content` is its extracted text (null for formats
+    /// without extraction); `preview_office_render` renders it.
+    Office,
     Exif,
     Binary,
     Directory,
@@ -306,6 +312,14 @@ pub async fn preview_file(path: String) -> Result<PreviewResult, AppError> {
         // Markdown: return raw content for rendered display
         let text = read_text_preview(&path, file_size)?;
         (PreviewType::Markdown, Some(text), "markdown".into())
+    } else if ufop_core::doctext::office_kind(&ext).is_some() {
+        // Office documents: extracted text now; a rendered page on request.
+        let p = path.clone();
+        let text = tokio::task::spawn_blocking(move || ufop_core::doctext::extract_text(Path::new(&p), OFFICE_TEXT_CHARS))
+            .await
+            .map_err(|e| AppError::internal(format!("Text extraction failed: {e}")))?
+            .unwrap_or(None);
+        (PreviewType::Office, text, format!("office:{}", ext.to_ascii_lowercase()))
     } else if is_archive_ext(&ext) {
         // Archives: list contents
         let listing = list_archive_contents(&path, &ext)?;
@@ -340,6 +354,16 @@ pub async fn preview_file(path: String) -> Result<PreviewResult, AppError> {
         is_metadata_only: false,
         render_hint,
     })
+}
+
+/// Render an office document through the OS (Quick Look on macOS) or
+/// LibreOffice: a cached PDF or image to show, or `kind: "none"` with the reason.
+#[tauri::command]
+pub async fn preview_office_render(
+    path: String,
+    renderer: tauri::State<'_, std::sync::Arc<crate::thumbnail_engine::office::OfficeRenderer>>,
+) -> Result<crate::thumbnail_engine::office::OfficeRender, AppError> {
+    renderer.inner().render(Path::new(&path)).await
 }
 
 /// Get EXIF data for an image file.
@@ -588,5 +612,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = preview_file(dir.path().to_string_lossy().to_string()).await.unwrap();
         assert_eq!(r.content.as_deref(), Some("(empty folder)"));
+    }
+
+    #[tokio::test]
+    async fn office_documents_preview_as_office_with_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let rtf = dir.path().join("memo.RTF");
+        std::fs::write(&rtf, r"{\rtf1\ansi Quarterly\par plan}").unwrap();
+        let r = preview_file(rtf.to_string_lossy().to_string()).await.unwrap();
+        assert!(matches!(r.preview_type, PreviewType::Office));
+        assert_eq!(r.render_hint, "office:rtf");
+        assert_eq!(r.content.as_deref(), Some("Quarterly\nplan"));
+        // Legacy binary formats: office, but no text (rendered or opened instead).
+        let doc = dir.path().join("old.doc");
+        std::fs::write(&doc, [0xd0, 0xcf, 0x11, 0xe0]).unwrap();
+        let r = preview_file(doc.to_string_lossy().to_string()).await.unwrap();
+        assert!(matches!(r.preview_type, PreviewType::Office));
+        assert_eq!(r.content, None);
+        // A damaged file still previews (no text) rather than failing.
+        let bad = dir.path().join("broken.docx");
+        std::fs::write(&bad, "not a zip").unwrap();
+        assert!(preview_file(bad.to_string_lossy().to_string()).await.unwrap().content.is_none());
     }
 }

@@ -9,11 +9,43 @@
  * - Conflict resolution UI
  * - Reports and rollback
  */
-import { useState, useCallback, useEffect } from "react";
-import { tauriInvoke } from "@/hooks/use-tauri";
+import { NamedSchedulePicker } from "@/components/schedule-pickers";
+import { refId, useScheduleStore } from "@/stores/schedule-store";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { SyncRunOptionsSection } from "@/components/sync-run-options";
+import { DEFAULT_RUN_OPTIONS, type SyncPair as StoreSyncPair, type SyncReport } from "@/stores/sync-store";
+import { RunNotifyPicker } from "@/components/run-notify-picker";
+import type { RunNotify } from "@/lib/run-notify";
+import { formatNextRun, useNextRuns } from "@/lib/upcoming-runs";
+import { useUIStore } from "@/stores/ui-store";
+import {
+  appendRules,
+  FilterPresetPicker,
+  FilterRulesSummary,
+  FilterRulesEditor,
+  ImportRulesButton,
+  useFilterGroups,
+} from "@/components/filter-rules-editor";
+import {
+  changedOptionKeys,
+  emptyPairForm,
+  filterFromForm,
+  formFromPair,
+  optionsForMode,
+  pairFromForm,
+  type SyncPairForm,
+} from "@/lib/sync-pair-form";
+import { downloadText } from "@/lib/backup-helpers";
+import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { SyncProgressCard } from "@/components/sync-progress-card";
 import { SyncComparison } from "@/components/sync-comparison";
+import { SyncRunItems } from "@/components/sync-run-items";
+import { HistoryRangeChips } from "@/components/history-range-chips";
+import { ALL_TIME, formatLocalTime, rangeArgs, type HistoryRange } from "@/lib/history-range";
+import { triggerLabel } from "@/lib/run-trigger";
+import { canOpen, localTarget, openTarget } from "@/lib/open-location";
+import { TwoWayHistory } from "@/components/sync-two-way-history";
 import {
   CopyPresetPicker,
   RobocopyCommandPreview,
@@ -22,43 +54,16 @@ import {
 } from "@/components/robocopy-options";
 import {
   DEFAULT_COPY_OPTIONS,
-  applyPreset,
   countChangedOptions,
   describeExitCode,
   type CopyOptions,
   type RobocopyJob,
 } from "@/lib/copy-options";
+import { FolderField } from "@/components/remote-folder-picker";
 
 // ── Types ──
 
-interface SyncPair {
-  id: string;
-  name: string;
-  source_path: string;
-  dest_path: string;
-  mode: string;
-  enabled: boolean;
-  last_run: string | null;
-  trigger: string | { scheduled: { cron_expr: string } };
-  filter: SyncFilter;
-  conflict_policy: string;
-  verify_mode: string;
-  checksum_enabled: boolean;
-  created_at: string;
-  time_offset_secs: number | null;
-  copy_options?: CopyOptions;
-}
-
-interface SyncFilter {
-  include_patterns: string[];
-  exclude_patterns: string[];
-  include_regex: string[];
-  exclude_regex: string[];
-  min_size: number;
-  max_size: number;
-  file_types: string[];
-  exclude_file_types: string[];
-}
+type SyncPair = StoreSyncPair;
 
 interface SyncPreview {
   pair_id: string;
@@ -79,6 +84,10 @@ interface SyncPreview {
   total_bytes: number;
   dirs_to_create?: string[];
   dirs_to_remove?: string[];
+  /** Two-way: source folders removed (deleted in the destination). */
+  source_dirs_to_remove?: string[];
+  /** How the plan was made (e.g. a first two-way run deletes nothing). */
+  notes?: string[];
 }
 
 interface SyncDiffEntry {
@@ -90,27 +99,8 @@ interface SyncDiffEntry {
   dest_modified: string | null;
   reason: string;
   path_length_warning: string | null;
-}
-
-interface SyncReport {
-  id: string;
-  pair_id: string;
-  pair_name: string;
-  started_at: string;
-  ended_at: string;
-  duration_ms: number;
-  files_added: number;
-  files_modified: number;
-  files_deleted: number;
-  files_skipped: number;
-  conflicts_resolved: number;
-  errors: number;
-  bytes_transferred: number;
-  status: string;
-  health: string;
-  error_messages: string[];
-  resumed: boolean;
-  exit_code?: number;
+  /** Side the action writes to; two-way sync also writes to the source. */
+  direction?: "to_dest" | "to_source";
 }
 
 interface SyncConflictItem {
@@ -185,7 +175,9 @@ function triggerName(trigger: string | { scheduled: { cron_expr: string } }): st
     }
   }
   if ("scheduled" in trigger) {
-    return `Scheduled (${trigger.scheduled.cron_expr})`;
+    const named = refId(trigger.scheduled.cron_expr);
+    const name = named && useScheduleStore.getState().schedules.find((s) => s.id === named)?.name;
+    return `Scheduled (${name ?? trigger.scheduled.cron_expr})`;
   }
   return "Unknown";
 }
@@ -193,12 +185,23 @@ function triggerName(trigger: string | { scheduled: { cron_expr: string } }): st
 // ── Main Component ──
 
 export function SyncPanel() {
+  const appMode = useUIStore((s) => s.appMode);
   const [view, setView] = useState<SyncPanelView>("list");
-  const [pairs, setPairs] = useState<SyncPair[]>([]);
+  const { nextRuns, refresh: refreshNextRuns } = useNextRuns("sync", true);
+  const [pairs, setPairsState] = useState<SyncPair[]>([]);
+  // The latest list, for saves that run after a debounce.
+  const pairsRef = useRef<SyncPair[]>([]);
+  const setPairs = useCallback((next: SyncPair[] | ((prev: SyncPair[]) => SyncPair[])) => {
+    pairsRef.current = typeof next === "function" ? next(pairsRef.current) : next;
+    setPairsState(pairsRef.current);
+  }, []);
   const [healthMap, setHealthMap] = useState<Record<string, SyncHealth>>({});
   const [_selectedPair, _setSelectedPair] = useState<SyncPair | null>(null);
   const [preview, setPreview] = useState<SyncPreview | null>(null);
   const [reports, setReports] = useState<SyncReport[]>([]);
+  // Which pair (all when null) and dates the History view shows.
+  const [reportsPairId, setReportsPairId] = useState<string | null>(null);
+  const [reportsRange, setReportsRange] = useState<HistoryRange>(ALL_TIME);
   const [conflicts, setConflicts] = useState<SyncConflictItem[]>([]);
   const [quarantine, _setQuarantine] = useState<QuarantineEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -223,10 +226,11 @@ export function SyncPanel() {
         }
       }
       setHealthMap(healthResults);
+      void refreshNextRuns();
     } catch (e: any) {
       setError(e?.message || "Failed to load sync pairs");
     }
-  }, []);
+  }, [refreshNextRuns]);
 
   useEffect(() => {
     loadPairs();
@@ -234,26 +238,48 @@ export function SyncPanel() {
 
   // ── Create Pair ──
 
-  const [createForm, setCreateForm] = useState({
-    name: "",
-    sourcePath: "",
-    destPath: "",
-    mode: "one_way",
-    trigger: "manual",
-    cronExpr: "0 0 */6 * * * *",
-    conflictPolicy: "create_conflict_copy",
-    verifyMode: "fast",
-    checksumEnabled: false,
-    advancedMode: false,
-    excludePatterns: "",
-    includePatterns: "",
-    fileTypes: "",
-    maxSize: 0,
-    minSize: 0,
-    timeOffsetSecs: null as number | null,
-    copyOptions: DEFAULT_COPY_OPTIONS as CopyOptions,
-    presetId: null as string | null,
-  });
+  // Global sync defaults (Settings › Advanced): new pairs start from them
+  // and store only the options they change.
+  const [syncDefaults, setSyncDefaults] = useState<CopyOptions>(DEFAULT_COPY_OPTIONS);
+  const [createForm, setCreateForm] = useState<SyncPairForm>(() => emptyPairForm());
+  /** The pair being edited (null: creating a new one). */
+  const [editing, setEditing] = useState<SyncPair | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const loadSyncDefaults = useCallback(async () => {
+    const d = await tauriInvokeSafe<CopyOptions>("get_sync_default_options", undefined, DEFAULT_COPY_OPTIONS);
+    const merged = { ...DEFAULT_COPY_OPTIONS, ...d };
+    setSyncDefaults(merged);
+    return merged;
+  }, []);
+
+  useEffect(() => {
+    void loadSyncDefaults();
+  }, [loadSyncDefaults]);
+
+  // The form opens at once with the defaults known so far; fresher
+  // defaults replace the options while the user has not touched them.
+  const refreshDefaultsInForm = (shown: CopyOptions, layer: (d: CopyOptions) => CopyOptions) => {
+    void loadSyncDefaults().then((d) =>
+      setCreateForm((f) => (JSON.stringify(f.copyOptions) === JSON.stringify(shown) ? { ...f, copyOptions: layer(d) } : f)),
+    );
+  };
+
+  const openCreate = () => {
+    const form = emptyPairForm(syncDefaults);
+    setEditing(null);
+    setCreateForm(form);
+    setView("create");
+    refreshDefaultsInForm(form.copyOptions, (d) => d);
+  };
+
+  const openEdit = (pair: SyncPair) => {
+    const form = formFromPair(pair, syncDefaults);
+    setEditing(pair);
+    setCreateForm(form);
+    setView("create");
+    refreshDefaultsInForm(form.copyOptions, (d) => formFromPair(pair, d).copyOptions);
+  };
 
   // Time offset auto-detection state (used for inline display)
   const [_detectedOffset, _setDetectedOffset] = useState<number | null>(null);
@@ -263,65 +289,81 @@ export function SyncPanel() {
     setLoading(true);
     setError(null);
     try {
-      const filter: SyncFilter = {
-        include_patterns: createForm.includePatterns
-          ? createForm.includePatterns.split(",").map((s) => s.trim())
-          : [],
-        exclude_patterns: createForm.excludePatterns
-          ? createForm.excludePatterns.split(",").map((s) => s.trim())
-          : [],
-        include_regex: [],
-        exclude_regex: [],
-        min_size: createForm.minSize,
-        max_size: createForm.maxSize,
-        file_types: createForm.fileTypes
-          ? createForm.fileTypes.split(",").map((s) => s.trim())
-          : [],
-        exclude_file_types: [],
-      };
-
-      await tauriInvoke("create_sync_pair", {
-        name: createForm.name,
-        sourcePath: createForm.sourcePath,
-        destPath: createForm.destPath,
-        mode: createForm.mode,
-        trigger: createForm.trigger,
-        cronExpr: createForm.trigger === "scheduled" ? createForm.cronExpr : null,
-        filterJson: JSON.stringify(filter),
-        conflictPolicy: createForm.conflictPolicy,
-        verifyMode: createForm.verifyMode,
-        checksumEnabled: createForm.checksumEnabled,
-        timeOffsetSecs: createForm.timeOffsetSecs,
-        optionsJson: JSON.stringify(createForm.copyOptions),
-      });
+      if (editing) {
+        await tauriInvoke("update_sync_pair", {
+          pairJson: JSON.stringify(pairFromForm(createForm, editing, syncDefaults)),
+        });
+      } else {
+        await tauriInvoke("create_sync_pair", {
+          name: createForm.name,
+          sourcePath: createForm.sourcePath,
+          destPath: createForm.destPath,
+          mode: createForm.mode,
+          trigger: createForm.trigger,
+          cronExpr: createForm.trigger === "scheduled" ? createForm.cronExpr : null,
+          filterJson: JSON.stringify(filterFromForm(createForm)),
+          conflictPolicy: createForm.conflictPolicy,
+          verifyMode: createForm.verifyMode,
+          checksumEnabled: createForm.checksumEnabled,
+          destState: createForm.destState,
+          checksumAlgorithm: createForm.checksumAlgorithm,
+          timeOffsetSecs: createForm.timeOffsetSecs,
+          optionsJson: JSON.stringify(optionsForMode(createForm.copyOptions, createForm.mode)),
+          runOptionsJson: JSON.stringify(createForm.runOptions),
+          optionOverrides: changedOptionKeys(optionsForMode(createForm.copyOptions, createForm.mode), syncDefaults),
+        });
+      }
 
       setView("list");
       await loadPairs();
-      setCreateForm({
-        name: "",
-        sourcePath: "",
-        destPath: "",
-        mode: "one_way",
-        trigger: "manual",
-        cronExpr: "0 0 */6 * * * *",
-        conflictPolicy: "create_conflict_copy",
-        verifyMode: "fast",
-        checksumEnabled: false,
-        advancedMode: false,
-        excludePatterns: "",
-        includePatterns: "",
-        fileTypes: "",
-        maxSize: 0,
-        minSize: 0,
-        timeOffsetSecs: null,
-        copyOptions: DEFAULT_COPY_OPTIONS,
-        presetId: null,
-      });
+      setEditing(null);
+      setCreateForm(emptyPairForm(syncDefaults));
       _setDetectedOffset(null);
     } catch (e: any) {
-      setError(e?.message || "Failed to create sync pair");
+      setError(e?.message || (editing ? "Failed to update sync pair" : "Failed to create sync pair"));
     } finally {
       setLoading(false);
+    }
+  };
+
+  // ── Duplicate / export / import ──
+
+  const handleDuplicate = async (pairId: string) => {
+    setError(null);
+    try {
+      const copy = await tauriInvoke<SyncPair>("duplicate_sync_pair", { pairId });
+      setNotice(
+        copy.enabled
+          ? `Created "${copy.name}".`
+          : `Created "${copy.name}". It is disabled, so its schedule is off: point it at its own folders, then turn it on in Edit.`,
+      );
+      await loadPairs();
+    } catch (e: any) {
+      setError(e?.message || "Failed to duplicate sync pair");
+    }
+  };
+
+  const handleExport = async (pair: SyncPair) => {
+    setError(null);
+    try {
+      const json = await tauriInvoke<string>("export_sync_pair", { pairId: pair.id });
+      downloadText(`sync-pair-${pair.name.replace(/[^\w.-]+/g, "_")}.json`, json);
+    } catch (e: any) {
+      setError(e?.message || "Export failed");
+    }
+  };
+
+  const handleImport = async (file: File) => {
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await tauriInvoke<{ pair: SyncPair; warnings: string[] }>("import_sync_pair", { json: await file.text() });
+      setNotice(
+        [`Imported "${result.pair.name}".`, ...result.warnings].join(" "),
+      );
+      await loadPairs();
+    } catch (e: any) {
+      setError(e?.message || "Import failed");
     }
   };
 
@@ -371,6 +413,24 @@ export function SyncPanel() {
     }
   };
 
+  // ── Result notifications of an existing pair ──
+
+  const handleSaveNotify = async (pairId: string, patch: RunNotify) => {
+    // Build from the latest state, not from the pair a stale closure captured.
+    const pair = pairsRef.current.find((p) => p.id === pairId);
+    if (!pair) return;
+    const updated: SyncPair = { ...pair, run_options: { ...DEFAULT_RUN_OPTIONS, ...pair.run_options, ...patch } };
+    pairsRef.current = pairsRef.current.map((p) => (p.id === pairId ? updated : p));
+    setPairs(pairsRef.current);
+    try {
+      await tauriInvoke("update_sync_pair", { pairJson: JSON.stringify(updated) });
+    } catch (e: any) {
+      pairsRef.current = pairsRef.current.map((p) => (p.id === pairId ? pair : p));
+      setPairs(pairsRef.current);
+      setError(e?.message || "Failed to save the notification settings");
+    }
+  };
+
   // ── Rollback ──
 
   const handleRollback = async (pairId: string) => {
@@ -389,10 +449,15 @@ export function SyncPanel() {
 
   // ── Load Reports ──
 
-  const handleViewReports = async (pairId: string) => {
+  // Stored history (survives restarts); falls back to this session's runs.
+  const handleViewReports = async (pairId: string | null, range: HistoryRange = ALL_TIME) => {
     try {
-      const result = await tauriInvoke<SyncReport[]>("get_sync_reports", { pairId });
+      const result = await tauriInvoke<SyncReport[]>("get_sync_run_history", { pairId, limit: 200, ...rangeArgs(range) }).catch(() =>
+        pairId ? tauriInvoke<SyncReport[]>("get_sync_reports", { pairId }) : Promise.resolve([] as SyncReport[]),
+      );
       setReports(result);
+      setReportsPairId(pairId);
+      setReportsRange(range);
       setView("reports");
     } catch (e: any) {
       setError(e?.message || "Failed to load reports");
@@ -461,7 +526,34 @@ export function SyncPanel() {
             List
           </button>
           <button
-            onClick={() => setView("create")}
+            onClick={() => void handleViewReports(null)}
+            className={`px-2 py-1 text-xs rounded ${
+              view === "reports"
+                ? "bg-blue-500 text-white"
+                : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            }`}
+            aria-label="Run history"
+          >
+            History
+          </button>
+          {appMode === "advanced" && (
+            <label className="px-2 py-1 text-xs rounded text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer">
+              Import
+              <input
+                type="file"
+                accept=".json,application/json"
+                className="hidden"
+                aria-label="Import a sync pair"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) void handleImport(f);
+                }}
+              />
+            </label>
+          )}
+          <button
+            onClick={openCreate}
             className="px-2 py-1 text-xs rounded bg-green-500 text-white hover:bg-green-600"
             aria-label="Create new sync pair"
           >
@@ -469,6 +561,15 @@ export function SyncPanel() {
           </button>
         </div>
       </div>
+
+      {notice && (
+        <div className="p-2 text-xs text-blue-800 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-300 border-b border-blue-200" role="status">
+          {notice}
+          <button onClick={() => setNotice(null)} className="ml-2 underline" aria-label="Dismiss notice">
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Error Banner */}
       {error && (
@@ -504,6 +605,11 @@ export function SyncPanel() {
             onDelete={handleDeletePair}
             onRollback={handleRollback}
             onViewReports={handleViewReports}
+            onSaveNotify={handleSaveNotify}
+            nextRuns={nextRuns}
+            onEdit={openEdit}
+            onDuplicate={handleDuplicate}
+            onExport={appMode === "advanced" ? handleExport : undefined}
             syncRunning={syncRunning}
           />
         )}
@@ -513,8 +619,13 @@ export function SyncPanel() {
             form={createForm}
             setForm={setCreateForm}
             onSubmit={handleCreatePair}
-            onCancel={() => setView("list")}
+            onCancel={() => {
+              setEditing(null);
+              setView("list");
+            }}
             loading={loading}
+            editing={editing !== null}
+            defaults={syncDefaults}
           />
         )}
 
@@ -533,6 +644,9 @@ export function SyncPanel() {
         {view === "reports" && (
           <ReportsView
             reports={reports}
+            pairs={pairs}
+            range={reportsRange}
+            onRangeChange={(r) => void handleViewReports(reportsPairId, r)}
             onBack={() => setView("list")}
           />
         )}
@@ -558,6 +672,43 @@ export function SyncPanel() {
 
 // ── Sub-Components ──
 
+/** How long typing pauses before a pair's notification settings are saved. */
+export const NOTIFY_SAVE_DELAY_MS = 500;
+
+/**
+ * The notify picker of one pair card. Edits show at once; the save runs once
+ * typing pauses (not per keystroke) and is flushed when the card closes.
+ */
+function PairNotify({ pair, onSave, advanced }: { pair: SyncPair; onSave: (pairId: string, notify: RunNotify) => Promise<void>; advanced: boolean }) {
+  const [draft, setDraft] = useState<RunNotify>(pair.run_options ?? {});
+  const pending = useRef<RunNotify | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const save = useRef(onSave);
+  useEffect(() => {
+    save.current = onSave;
+  });
+  const flush = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+    const patch = pending.current;
+    pending.current = null;
+    if (patch) void save.current(pair.id, patch);
+  }, [pair.id]);
+  useEffect(() => flush, [flush]);
+  return (
+    <RunNotifyPicker
+      value={draft}
+      advanced={advanced}
+      onChange={(patch) => {
+        setDraft((d) => ({ ...d, ...patch }));
+        pending.current = { ...pending.current, ...patch };
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(flush, NOTIFY_SAVE_DELAY_MS);
+      }}
+    />
+  );
+}
+
 function PairListView({
   pairs,
   healthMap,
@@ -566,6 +717,11 @@ function PairListView({
   onDelete,
   onRollback,
   onViewReports,
+  onSaveNotify,
+  nextRuns,
+  onEdit,
+  onDuplicate,
+  onExport,
   syncRunning,
 }: {
   pairs: SyncPair[];
@@ -575,8 +731,17 @@ function PairListView({
   onDelete: (id: string) => void;
   onRollback: (id: string) => void;
   onViewReports: (id: string) => void;
+  onSaveNotify: (pairId: string, notify: RunNotify) => Promise<void>;
+  /** Next scheduled run by pair id (RFC 3339). */
+  nextRuns: Record<string, string>;
+  onEdit?: (pair: SyncPair) => void;
+  onDuplicate?: (id: string) => void;
+  /** Advanced: save the pair's definition as a file. */
+  onExport?: (pair: SyncPair) => void;
   syncRunning: boolean;
 }) {
+  const advanced = useUIStore((s) => s.appMode === "advanced");
+  const [notifyOpen, setNotifyOpen] = useState<string | null>(null);
   if (pairs.length === 0) {
     return (
       <div className="text-center text-sm text-zinc-500 py-8">
@@ -617,6 +782,11 @@ function PairListView({
               <div className="truncate" title={pair.dest_path}>
                 Dest: {pair.dest_path}
               </div>
+              {!pair.enabled && (
+                <div className="text-amber-600 dark:text-amber-400" data-testid="sync-pair-disabled">
+                  Disabled: it does not run until you turn it on in Edit.
+                </div>
+              )}
               <div>
                 Trigger: {triggerName(pair.trigger)}
                 {pair.last_run && (
@@ -625,7 +795,13 @@ function PairListView({
                   </span>
                 )}
               </div>
+              {nextRuns[pair.id] && pair.enabled && (
+                <div data-testid={`sync-next-run-${pair.id}`} title={new Date(nextRuns[pair.id]).toLocaleString()}>
+                  Next run: {formatNextRun(nextRuns[pair.id])}
+                </div>
+              )}
             </div>
+            {pair.mode === "two_way" && <TwoWayHistory pairId={pair.id} refreshKey={pair.last_run} />}
 
             <div className="flex gap-1 mt-2 flex-wrap">
               <button
@@ -650,12 +826,49 @@ function PairListView({
               >
                 Reports
               </button>
+              {onEdit && (
+                <button
+                  onClick={() => onEdit(pair)}
+                  className="px-2 py-1 text-xs rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                  aria-label={`Edit ${pair.name}`}
+                >
+                  Edit
+                </button>
+              )}
+              {onDuplicate && (
+                <button
+                  onClick={() => onDuplicate(pair.id)}
+                  className="px-2 py-1 text-xs rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                  aria-label={`Duplicate ${pair.name}`}
+                >
+                  Duplicate
+                </button>
+              )}
+              {onExport && (
+                <button
+                  onClick={() => onExport(pair)}
+                  className="px-2 py-1 text-xs rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                  aria-label={`Export ${pair.name}`}
+                >
+                  Export
+                </button>
+              )}
               <button
                 onClick={() => onRollback(pair.id)}
-                className="px-2 py-1 text-xs rounded bg-yellow-100 text-yellow-800 hover:bg-yellow-200"
+                disabled={syncRunning}
+                title={syncRunning ? "Wait for the running sync to finish" : undefined}
+                className="px-2 py-1 text-xs rounded bg-yellow-100 text-yellow-800 hover:bg-yellow-200 disabled:opacity-50"
                 aria-label={`Rollback last sync for ${pair.name}`}
               >
                 Rollback
+              </button>
+              <button
+                onClick={() => setNotifyOpen(notifyOpen === pair.id ? null : pair.id)}
+                className="px-2 py-1 text-xs rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                aria-expanded={notifyOpen === pair.id}
+                aria-label={`Notifications for ${pair.name}`}
+              >
+                Notify
               </button>
               <button
                 onClick={() => {
@@ -669,11 +882,41 @@ function PairListView({
                 Delete
               </button>
             </div>
+            {notifyOpen === pair.id && (
+              <div className="mt-2">
+                <PairNotify pair={pair} onSave={onSaveNotify} advanced={advanced} />
+              </div>
+            )}
           </div>
         );
       })}
     </div>
   );
+}
+
+/** Shown when the backend list is unavailable (browser preview). */
+const FALLBACK_QUICK_PRESETS = [
+  { id: "macos_metadata", label: "macOS (.DS_Store, ._*)", patterns: [".DS_Store", "._*", ".Spotlight-V100", ".fseventsd", ".Trashes"] },
+  { id: "windows_metadata", label: "Windows (Thumbs.db)", patterns: ["Thumbs.db", "desktop.ini", "System Volume Information", "$RECYCLE.BIN"] },
+  { id: "version_control", label: "Git/SVN (.git, .svn)", patterns: [".git", ".svn", ".hg", ".bzr"] },
+  { id: "ide_files", label: "IDE (.idea, .vscode)", patterns: [".idea", ".vscode", "*.swp", "*~"] },
+  { id: "temp_files", label: "Temp (*.tmp, *.log)", patterns: ["*.tmp", "*.temp", "*.bak", "*.log"] },
+  { id: "node_modules", label: "Node (node_modules)", patterns: ["node_modules", ".npm", ".yarn"] },
+];
+
+/** The sync filter presets (built-in exclusions plus the shared file-type groups). */
+function useQuickFilterPresets() {
+  const [presets, setPresets] = useState(FALLBACK_QUICK_PRESETS);
+  useEffect(() => {
+    let live = true;
+    void tauriInvokeSafe<{ id: string; name: string; description: string; patterns: string[] }[]>("get_sync_filter_presets", undefined, []).then(
+      (list) => live && Array.isArray(list) && list.length > 0 && setPresets(list.map((p) => ({ id: p.id, label: p.name, patterns: p.patterns }))),
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
+  return presets;
 }
 
 function CreatePairView({
@@ -682,15 +925,24 @@ function CreatePairView({
   onSubmit,
   onCancel,
   loading,
+  editing = false,
+  defaults = DEFAULT_COPY_OPTIONS,
 }: {
-  form: any;
-  setForm: (f: any) => void;
+  form: SyncPairForm;
+  setForm: (f: SyncPairForm) => void;
   onSubmit: () => void;
   onCancel: () => void;
   loading: boolean;
+  /** Editing an existing pair (same form, saves with update_sync_pair). */
+  editing?: boolean;
+  /** Global sync defaults: presets start from them. */
+  defaults?: CopyOptions;
 }) {
-  const update = (field: string, value: any) =>
+  const update = (field: keyof SyncPairForm, value: any) =>
     setForm({ ...form, [field]: value });
+  const advancedView = useUIStore((s) => s.appMode === "advanced");
+  const groups = useFilterGroups();
+  const quickPresets = useQuickFilterPresets();
 
   const [cronValidation, setCronValidation] = useState<{
     valid: boolean;
@@ -708,11 +960,9 @@ function CreatePairView({
     const timeout = setTimeout(async () => {
       setCronValidating(true);
       try {
-        const result = await tauriInvoke<{ valid: boolean; next_runs: string[]; error: string | null }>(
-          "validate_sync_cron",
-          { cronExpr: form.cronExpr }
-        );
-        setCronValidation(result);
+        // Next runs of the cron (or named schedule), days off marked.
+        const runs = await tauriInvoke<{ at: string; skipped_by: string | null }[]>("schedule_preview", { cronExpr: form.cronExpr, count: 3 });
+        setCronValidation({ valid: true, next_runs: runs.map((r) => (r.skipped_by ? `${r.at}|${r.skipped_by}` : r.at)), error: null });
       } catch (e: any) {
         setCronValidation({ valid: false, next_runs: [], error: e?.message || "Validation failed" });
       } finally {
@@ -725,7 +975,7 @@ function CreatePairView({
   return (
     <div className="space-y-3">
       <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-        {form.advancedMode ? "Advanced Setup" : "Simple Setup"}
+        {editing ? `Edit "${form.name}"` : form.advancedMode ? "Advanced Setup" : "Simple Setup"}
       </h3>
 
       <div className="flex items-center gap-2 text-xs">
@@ -781,24 +1031,32 @@ function CreatePairView({
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Source Path
-        <input
-          type="text"
-          value={form.sourcePath}
-          onChange={(e) => update("sourcePath", e.target.value)}
-          className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
-          placeholder="/home/user/documents"
-        />
+        <div className="mt-1">
+          <FolderField
+            value={form.sourcePath}
+            onChange={(v) => update("sourcePath", v)}
+            inputClassName="flex-1 min-w-0 px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            placeholder="/home/user/documents"
+            pickerTitle="Sync source folder"
+            testId="sync-source-path"
+            allowConnections={false}
+          />
+        </div>
       </label>
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
         Destination Path
-        <input
-          type="text"
-          value={form.destPath}
-          onChange={(e) => update("destPath", e.target.value)}
-          className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
-          placeholder="/backup/documents"
-        />
+        <div className="mt-1">
+          <FolderField
+            value={form.destPath}
+            onChange={(v) => update("destPath", v)}
+            inputClassName="flex-1 min-w-0 px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            placeholder="/backup/documents"
+            pickerTitle="Sync destination folder"
+            testId="sync-dest-path"
+            allowConnections={false}
+          />
+        </div>
       </label>
 
       <label className="block text-xs text-zinc-600 dark:text-zinc-400">
@@ -815,13 +1073,20 @@ function CreatePairView({
         </select>
       </label>
 
+      <SyncRunOptionsSection
+        mode={form.mode}
+        runOptions={form.runOptions}
+        copyOptions={form.copyOptions}
+        onChange={(runOptions, copyOptions) => setForm({ ...form, runOptions, copyOptions })}
+      />
+
       <CopyPresetPicker
         activeId={form.presetId}
         onPick={(preset) =>
           setForm({
             ...form,
             mode: preset.mode,
-            copyOptions: applyPreset(preset),
+            copyOptions: { ...defaults, ...preset.options },
             presetId: preset.id,
           })
         }
@@ -841,9 +1106,22 @@ function CreatePairView({
         </select>
       </label>
 
+      {editing && (
+        <label className="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+          <input type="checkbox" checked={form.enabled} onChange={(e) => update("enabled", e.target.checked)} />
+          Enabled (runs on its trigger and from Sync Now)
+        </label>
+      )}
+
       {form.trigger === "scheduled" && (
         <div className="space-y-1">
-          <label className="block text-xs text-zinc-600 dark:text-zinc-400">
+          <NamedSchedulePicker
+            className="block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            value={form.cronExpr}
+            customCron={refId(form.cronExpr) ? "0 0 */6 * * * *" : form.cronExpr}
+            onChange={(cron) => update("cronExpr", cron)}
+          />
+          <label className={`block text-xs text-zinc-600 dark:text-zinc-400 ${refId(form.cronExpr) ? "hidden" : ""}`}>
             Cron Expression
             <input
               type="text"
@@ -871,9 +1149,15 @@ function CreatePairView({
                 <div className="p-1.5 bg-green-50 dark:bg-green-900/20 rounded text-[11px] text-green-700 dark:text-green-400">
                   <div className="font-medium">Valid - Next 3 runs:</div>
                   <ul className="mt-0.5 space-y-0.5">
-                    {cronValidation.next_runs.slice(0, 3).map((run, i) => (
-                      <li key={i}>{new Date(run).toLocaleString()}</li>
-                    ))}
+                    {cronValidation.next_runs.slice(0, 3).map((run, i) => {
+                      const [at, skipped] = run.split("|");
+                      return (
+                        <li key={i} className={skipped ? "line-through opacity-70" : ""}>
+                          {new Date(at).toLocaleString()}
+                          {skipped && ` (skipped: ${skipped})`}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               ) : (
@@ -928,6 +1212,44 @@ function CreatePairView({
           </label>
 
           <label className="block text-xs text-zinc-600 dark:text-zinc-400">
+            Checksum algorithm
+            <select
+              data-testid="sync-checksum-algorithm"
+              value={form.checksumAlgorithm}
+              onChange={(e) => update("checksumAlgorithm", e.target.value)}
+              className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            >
+              <option value="xxh3">xxHash3 (fast)</option>
+              <option value="sha256">SHA-256 (cryptographic)</option>
+            </select>
+          </label>
+
+          <label className="block text-xs text-zinc-600 dark:text-zinc-400">
+            Destination state
+            <select
+              data-testid="sync-dest-state"
+              value={form.destState}
+              onChange={(e) => update("destState", e.target.value)}
+              className="mt-1 block w-full px-2 py-1 text-xs border rounded dark:bg-zinc-800 dark:border-zinc-600"
+            >
+              <option value="scan">Scan the destination every run</option>
+              <option value="trusted_inventory">Trust the inventory from the last run (fast)</option>
+              <option value="blind_upload">Blind upload (copy everything, never delete)</option>
+            </select>
+          </label>
+          {form.mode === "two_way" && form.destState === "blind_upload" && (
+            <p className="text-[10px] text-amber-600 dark:text-amber-400" data-testid="sync-blind-two-way-hint">
+              Blind upload never reads the destination, so a two-way pair only copies source files to it: nothing is
+              deleted and destination changes are not brought back.
+            </p>
+          )}
+          {form.mode === "two_way" && form.destState === "trusted_inventory" && (
+            <p className="text-[10px] text-amber-600 dark:text-amber-400" data-testid="sync-inventory-two-way-hint">
+              Two-way pairs scan the destination every run anyway: a saved inventory cannot show changes made there.
+            </p>
+          )}
+
+          <label className="block text-xs text-zinc-600 dark:text-zinc-400">
             Exclude Patterns (comma-separated globs)
             <input
               type="text"
@@ -942,14 +1264,7 @@ function CreatePairView({
           <div className="space-y-2">
             <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Quick Filter Presets</label>
             <div className="flex flex-wrap gap-1.5">
-              {[
-                { id: "macos_metadata", label: "macOS (.DS_Store, ._*)", patterns: [".DS_Store", "._*", ".Spotlight-V100", ".fseventsd", ".Trashes"] },
-                { id: "windows_metadata", label: "Windows (Thumbs.db)", patterns: ["Thumbs.db", "desktop.ini", "System Volume Information", "$RECYCLE.BIN"] },
-                { id: "version_control", label: "Git/SVN (.git, .svn)", patterns: [".git", ".svn", ".hg", ".bzr"] },
-                { id: "ide_files", label: "IDE (.idea, .vscode)", patterns: [".idea", ".vscode", "*.swp", "*~"] },
-                { id: "temp_files", label: "Temp (*.tmp, *.log)", patterns: ["*.tmp", "*.temp", "*.bak", "*.log"] },
-                { id: "node_modules", label: "Node (node_modules)", patterns: ["node_modules", ".npm", ".yarn"] },
-              ].map((preset) => {
+              {quickPresets.map((preset) => {
                 const currentExcludePatterns = form.excludePatterns
                   ? form.excludePatterns.split(",").map((s: string) => s.trim()).filter(Boolean)
                   : [];
@@ -1082,25 +1397,28 @@ function CreatePairView({
               sourcePath={form.sourcePath}
               destPath={form.destPath}
               mode={form.mode}
-              filter={{
-                include_patterns: form.includePatterns
-                  ? form.includePatterns.split(",").map((x: string) => x.trim()).filter(Boolean)
-                  : [],
-                exclude_patterns: form.excludePatterns
-                  ? form.excludePatterns.split(",").map((x: string) => x.trim()).filter(Boolean)
-                  : [],
-                include_regex: [],
-                exclude_regex: [],
-                min_size: form.minSize,
-                max_size: form.maxSize,
-                file_types: [],
-                exclude_file_types: [],
-              }}
+              filter={filterFromForm(form)}
               options={form.copyOptions}
             />
           </div>
         </>
       )}
+
+      <div className="space-y-1.5" data-testid="sync-filter-rules">
+        <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+          Filter rules
+          {form.rules.length > 0 && <span className="ml-1 font-normal text-zinc-400">({form.rules.length}, first match wins)</span>}
+        </div>
+        <FilterPresetPicker rules={form.rules} onApply={(extra) => update("rules", appendRules(form.rules, extra))} />
+        {advancedView ? (
+          <>
+            <FilterRulesEditor rules={form.rules} onChange={(rules) => update("rules", rules)} groups={groups} />
+            <ImportRulesButton onImport={(extra) => update("rules", appendRules(form.rules, extra))} />
+          </>
+        ) : (
+          <FilterRulesSummary rules={form.rules} onChange={(rules) => update("rules", rules)} />
+        )}
+      </div>
 
       <div className="flex gap-2 pt-2">
         <button
@@ -1108,7 +1426,7 @@ function CreatePairView({
           disabled={loading || !form.name || !form.sourcePath || !form.destPath}
           className="flex-1 px-3 py-1.5 text-xs rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
         >
-          {loading ? "Creating..." : "Create Sync Pair"}
+          {loading ? (editing ? "Saving..." : "Creating...") : editing ? "Save Changes" : "Create Sync Pair"}
         </button>
         <button
           onClick={onCancel}
@@ -1136,7 +1454,9 @@ export function PreviewView({
 }) {
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
   const [tab, setTab] = useState<"summary" | "compare">("summary");
-  const deleteCount = preview.total_deletions + (preview.dirs_to_remove?.length ?? 0);
+  const deleteCount =
+    preview.total_deletions + (preview.dirs_to_remove?.length ?? 0) + (preview.source_dirs_to_remove?.length ?? 0);
+  const sourceDeletes = preview.deletions.filter((d) => d.direction === "to_source").length;
   const [deleteAck, setDeleteAck] = useState(false);
 
   const categories = [
@@ -1191,6 +1511,12 @@ export function PreviewView({
       <div className="text-xs text-zinc-500">
         Total: {formatBytes(preview.total_bytes)} to transfer
       </div>
+
+      {(preview.notes ?? []).map((note) => (
+        <p key={note} className="text-[11px] text-blue-700 dark:text-blue-300" data-testid="sync-preview-note">
+          {note}
+        </p>
+      ))}
 
       <div className="flex gap-1 text-xs" role="tablist" aria-label="Preview view">
         {(["summary", "compare"] as const).map((t) => (
@@ -1282,8 +1608,11 @@ export function PreviewView({
             className="mt-0.5"
           />
           <span>
-            I understand {deleteCount} item{deleteCount === 1 ? "" : "s"} will be deleted from the
-            destination. You can undo this with Rollback for 7 days.
+            I understand {deleteCount} item{deleteCount === 1 ? "" : "s"} will be deleted
+            {sourceDeletes > 0
+              ? ` (${sourceDeletes} from the source, ${deleteCount - sourceDeletes} from the destination)`
+              : " from the destination"}
+            . You can undo this with Rollback for 7 days.
           </span>
         </label>
       )}
@@ -1316,12 +1645,30 @@ export function PreviewView({
 
 function ReportsView({
   reports,
+  pairs,
+  range,
+  onRangeChange,
   onBack,
 }: {
   reports: SyncReport[];
+  pairs: SyncPair[];
+  range: HistoryRange;
+  onRangeChange: (range: HistoryRange) => void;
   onBack: () => void;
 }) {
   const [exportError, setExportError] = useState<string | null>(null);
+  // Runs whose changed-files list is open.
+  const [openItems, setOpenItems] = useState<Set<string>>(new Set());
+  const toggleItems = (id: string) =>
+    setOpenItems((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  const open = async (path: string | undefined) => {
+    const err = await openTarget(localTarget(path));
+    if (err) setExportError(err);
+  };
 
   const handleExportReportCsv = async (pairId: string, reportId: string, pairName: string) => {
     setExportError(null);
@@ -1363,8 +1710,9 @@ function ReportsView({
         >
           Back to list
         </button>
+        <HistoryRangeChips value={range} onChange={onRangeChange} />
         <div className="text-center text-sm text-zinc-500 py-4">
-          No sync reports available.
+          {range.preset === "all" ? "No sync reports available." : "No sync runs in this date range."}
         </div>
       </div>
     );
@@ -1383,6 +1731,7 @@ function ReportsView({
           Back
         </button>
       </div>
+      <HistoryRangeChips value={range} onChange={onRangeChange} />
 
       {reports.map((report) => (
         <div
@@ -1414,7 +1763,9 @@ function ReportsView({
               Transferred: {formatBytes(report.bytes_transferred)}
             </div>
             <div>Status: {report.status}</div>
+            <div data-testid="run-trigger">Started: {triggerLabel(report.trigger)}</div>
             {report.resumed && <div>Resumed from interruption</div>}
+            {!!report.versions_pruned && <div>Old versions removed: {report.versions_pruned}</div>}
             {report.exit_code !== undefined && (
               <div className="col-span-2" title="Robocopy-compatible exit code">
                 Exit code {report.exit_code}: {describeExitCode(report.exit_code)}
@@ -1431,9 +1782,50 @@ function ReportsView({
           )}
 
           <div className="text-[10px] text-zinc-400 mt-2">
-            {new Date(report.started_at).toLocaleString()} -{" "}
-            {new Date(report.ended_at).toLocaleString()}
+            {formatLocalTime(report.started_at)} - {formatLocalTime(report.ended_at)}
           </div>
+
+          {/* Open the folders, and see which files the run changed */}
+          {(() => {
+            const pair = pairs.find((p) => p.id === report.pair_id);
+            const changed = report.files_added + report.files_modified + report.files_deleted + report.conflicts_resolved + report.errors;
+            return (
+              <div className="flex gap-1 mt-2 flex-wrap">
+                <button
+                  onClick={() => void open(pair?.source_path)}
+                  disabled={!pair || !canOpen(localTarget(pair.source_path))}
+                  title={pair ? pair.source_path : "This pair no longer exists"}
+                  className="px-2 py-1 text-[11px] rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50"
+                  aria-label={`Open source of report ${report.id}`}
+                >
+                  Open source
+                </button>
+                <button
+                  onClick={() => void open(pair?.dest_path)}
+                  disabled={!pair || !canOpen(localTarget(pair.dest_path))}
+                  title={pair ? pair.dest_path : "This pair no longer exists"}
+                  className="px-2 py-1 text-[11px] rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50"
+                  aria-label={`Open destination of report ${report.id}`}
+                >
+                  Open destination
+                </button>
+                <button
+                  onClick={() => toggleItems(report.id)}
+                  disabled={changed === 0}
+                  aria-expanded={openItems.has(report.id)}
+                  className="px-2 py-1 text-[11px] rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 disabled:opacity-50"
+                  aria-label={`Changed files of report ${report.id}`}
+                >
+                  {openItems.has(report.id) ? "Hide changed files" : "Changed files"}
+                </button>
+              </div>
+            );
+          })()}
+          {openItems.has(report.id) && (
+            <div className="mt-2">
+              <SyncRunItems runId={report.id} />
+            </div>
+          )}
 
           {/* Export buttons */}
           <div className="flex gap-1 mt-2">

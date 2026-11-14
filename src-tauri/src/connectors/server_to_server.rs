@@ -511,7 +511,7 @@ impl ServerTransferManager {
     pub async fn list_transfers(&self) -> Vec<ServerTransferJob> {
         let jobs = self.jobs.read().await;
         let mut list: Vec<_> = jobs.values().cloned().collect();
-        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        list.sort_by_key(|j| std::cmp::Reverse(j.created_at));
         list
     }
 
@@ -545,9 +545,8 @@ impl ServerTransferManager {
         job.speed_bps = speed_bps;
         job.updated_at = Utc::now();
 
-        if speed_bps > 0 {
-            let remaining = job.total_bytes.saturating_sub(transferred_bytes);
-            job.eta_seconds = Some(remaining / speed_bps);
+        if let Some(eta) = job.total_bytes.saturating_sub(transferred_bytes).checked_div(speed_bps) {
+            job.eta_seconds = Some(eta);
         }
 
         // Mark current file as active

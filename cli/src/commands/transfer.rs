@@ -1,4 +1,4 @@
-//! Local transfer execution is shared with the desktop guided flows.
+//! Local transfer execution with verified destination outcomes.
 use crate::{
     output::{self, ProgressEvent},
     OutputFormat,
@@ -64,7 +64,7 @@ pub async fn execute(
             if let Some(bar) = &bar {
                 bar.set_message(format!("{bytes} bytes · {}", path.display()));
                 bar.tick();
-            } else {
+            } else if matches!(format, OutputFormat::Json) {
                 let event = ProgressEvent {
                     event: "progress".into(),
                     progress: 0.0,
@@ -74,7 +74,7 @@ pub async fn execute(
                     eta_seconds: None,
                     current_file: Some(path.display().to_string()),
                 };
-                eprintln!("{}", serde_json::to_string(&event).unwrap_or_default());
+                event.emit();
             }
         },
     )?;

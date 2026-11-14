@@ -279,110 +279,129 @@ impl SafetyInterlock {
         baseline: &[LedgerEvent],
         intent_hash: String,
     ) -> RiskAssessment {
-        let sample_size = baseline.len() as u32;
-        let (median_files, median_bytes) = compute_medians(baseline);
+        classify_intent(intent, baseline, intent_hash)
+    }
+}
 
-        let mut reasons: Vec<String> = Vec::new();
-        let mut level = RiskLevel::Low;
+/// Assess `intent` against the absolute limits only, with no history: what
+/// unattended callers (automation steps) check when they cannot reach the
+/// ledger. Never lower than what [`SafetyInterlock::assess`] says for an
+/// empty baseline.
+pub fn assess_static(intent: &OperationIntent) -> RiskAssessment {
+    classify_intent(intent, &[], compute_intent_hash(intent))
+}
 
-        let is_destructive = DESTRUCTIVE_KINDS.iter().any(|k| *k == intent.kind);
+/// Core classification — pure function over the intent and a slice of
+/// historical events. Kept separate so it is directly testable without a
+/// database.
+fn classify_intent(
+    intent: &OperationIntent,
+    baseline: &[LedgerEvent],
+    intent_hash: String,
+) -> RiskAssessment {
+    let sample_size = baseline.len() as u32;
+    let (median_files, median_bytes) = compute_medians(baseline);
 
-        // Rule 1: absolute hard caps — always trip High, regardless of history.
-        if intent.affected_files >= DESTRUCTIVE_VOLUME_HARD_CAP {
+    let mut reasons: Vec<String> = Vec::new();
+    let mut level = RiskLevel::Low;
+
+    let is_destructive = DESTRUCTIVE_KINDS.iter().any(|k| *k == intent.kind);
+
+    // Rule 1: absolute hard caps — always trip High, regardless of history.
+    if intent.affected_files >= DESTRUCTIVE_VOLUME_HARD_CAP {
+        reasons.push(format!(
+            "Operation would touch {} files — above the absolute safety ceiling ({}).",
+            intent.affected_files, DESTRUCTIVE_VOLUME_HARD_CAP
+        ));
+        level = RiskLevel::High;
+    }
+    if intent.total_bytes >= BYTES_HARD_CAP {
+        reasons.push(format!(
+            "Operation would move or delete {:.1} GiB — above the absolute safety ceiling.",
+            intent.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+        level = RiskLevel::High;
+    }
+
+    // Rule 2: destructive operation with no precedent at all ⇒ at least Medium.
+    if is_destructive
+        && sample_size == 0
+        && intent.affected_files >= DESTRUCTIVE_VOLUME_FLOOR
+        && level == RiskLevel::Low
+    {
+        reasons.push(format!(
+            "First-ever {} on this device, and it touches {} files.",
+            kind_label(&intent.kind), intent.affected_files
+        ));
+        level = RiskLevel::Medium;
+    }
+
+    // Rule 3: ratio against historical median.
+    if sample_size > 0 && median_files > 0 && intent.affected_files >= DESTRUCTIVE_VOLUME_FLOOR {
+        let ratio = intent.affected_files as f64 / median_files as f64;
+        if ratio >= HIGH_MULTIPLIER && level != RiskLevel::High {
+            let runs = distinct_runs(baseline);
             reasons.push(format!(
-                "Operation would touch {} files — above the absolute safety ceiling ({}).",
-                intent.affected_files, DESTRUCTIVE_VOLUME_HARD_CAP
+                "This operation touches {} files — {:.0}× your usual {} (median {} files over your last {}).",
+                intent.affected_files,
+                ratio,
+                kind_label(&intent.kind),
+                median_files,
+                pluralize_runs(runs)
             ));
             level = RiskLevel::High;
-        }
-        if intent.total_bytes >= BYTES_HARD_CAP {
+        } else if ratio >= MEDIUM_MULTIPLIER && level == RiskLevel::Low {
             reasons.push(format!(
-                "Operation would move or delete {:.1} GiB — above the absolute safety ceiling.",
-                intent.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-            ));
-            level = RiskLevel::High;
-        }
-
-        // Rule 2: destructive operation with no precedent at all ⇒ at least Medium.
-        if is_destructive
-            && sample_size == 0
-            && intent.affected_files >= DESTRUCTIVE_VOLUME_FLOOR
-            && level == RiskLevel::Low
-        {
-            reasons.push(format!(
-                "First-ever {} on this device, and it touches {} files.",
-                kind_label(&intent.kind), intent.affected_files
+                "This operation touches {} files — {:.0}× your usual {} (median {} files).",
+                intent.affected_files, ratio, kind_label(&intent.kind), median_files
             ));
             level = RiskLevel::Medium;
         }
+    }
 
-        // Rule 3: ratio against historical median.
-        if sample_size > 0 && median_files > 0 && intent.affected_files >= DESTRUCTIVE_VOLUME_FLOOR {
-            let ratio = intent.affected_files as f64 / median_files as f64;
-            if ratio >= HIGH_MULTIPLIER && level != RiskLevel::High {
-                let runs = distinct_runs(baseline);
-                reasons.push(format!(
-                    "This operation touches {} files — {:.0}× your usual {} (median {} files over your last {}).",
-                    intent.affected_files,
-                    ratio,
-                    kind_label(&intent.kind),
-                    median_files,
-                    pluralize_runs(runs)
-                ));
-                level = RiskLevel::High;
-            } else if ratio >= MEDIUM_MULTIPLIER && level == RiskLevel::Low {
-                reasons.push(format!(
-                    "This operation touches {} files — {:.0}× your usual {} (median {} files).",
-                    intent.affected_files, ratio, kind_label(&intent.kind), median_files
-                ));
-                level = RiskLevel::Medium;
-            }
+    // Rule 4: byte-volume ratio — only for operations the ledger actually
+    // tracks byte counts on.
+    if sample_size > 0 && median_bytes > 0 && intent.total_bytes > 0 {
+        let ratio = intent.total_bytes as f64 / median_bytes as f64;
+        if ratio >= HIGH_MULTIPLIER && level != RiskLevel::High {
+            reasons.push(format!(
+                "Byte volume is {:.0}× your usual {} (median {}).",
+                ratio,
+                kind_label(&intent.kind),
+                format_bytes(median_bytes)
+            ));
+            level = RiskLevel::High;
+        } else if ratio >= MEDIUM_MULTIPLIER && level == RiskLevel::Low {
+            reasons.push(format!(
+                "Byte volume is {:.0}× your usual {} (median {}).",
+                ratio,
+                kind_label(&intent.kind),
+                format_bytes(median_bytes)
+            ));
+            level = RiskLevel::Medium;
         }
+    }
 
-        // Rule 4: byte-volume ratio — only for operations the ledger actually
-        // tracks byte counts on.
-        if sample_size > 0 && median_bytes > 0 && intent.total_bytes > 0 {
-            let ratio = intent.total_bytes as f64 / median_bytes as f64;
-            if ratio >= HIGH_MULTIPLIER && level != RiskLevel::High {
-                reasons.push(format!(
-                    "Byte volume is {:.0}× your usual {} (median {}).",
-                    ratio,
-                    kind_label(&intent.kind),
-                    format_bytes(median_bytes)
-                ));
-                level = RiskLevel::High;
-            } else if ratio >= MEDIUM_MULTIPLIER && level == RiskLevel::Low {
-                reasons.push(format!(
-                    "Byte volume is {:.0}× your usual {} (median {}).",
-                    ratio,
-                    kind_label(&intent.kind),
-                    format_bytes(median_bytes)
-                ));
-                level = RiskLevel::Medium;
-            }
-        }
+    if reasons.is_empty() {
+        reasons.push(if sample_size == 0 {
+            "No precedent yet — operation is within default safety bounds.".to_string()
+        } else {
+            format!(
+                "Within your usual pattern for {} operations ({} prior runs in baseline).",
+                kind_label(&intent.kind),
+                sample_size
+            )
+        });
+    }
 
-        if reasons.is_empty() {
-            reasons.push(if sample_size == 0 {
-                "No precedent yet — operation is within default safety bounds.".to_string()
-            } else {
-                format!(
-                    "Within your usual pattern for {} operations ({} prior runs in baseline).",
-                    kind_label(&intent.kind),
-                    sample_size
-                )
-            });
-        }
-
-        RiskAssessment {
-            requires_confirmation: level.requires_confirmation(),
-            level,
-            reasons,
-            baseline_sample_size: sample_size,
-            baseline_median_files: median_files,
-            baseline_median_bytes: median_bytes,
-            intent_hash,
-        }
+    RiskAssessment {
+        requires_confirmation: level.requires_confirmation(),
+        level,
+        reasons,
+        baseline_sample_size: sample_size,
+        baseline_median_files: median_files,
+        baseline_median_bytes: median_bytes,
+        intent_hash,
     }
 }
 

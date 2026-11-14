@@ -126,6 +126,12 @@ pub fn resolve_conflict(
 /// Generate a conflict copy path with (conflict YYYY-MM-DD) suffix.
 /// e.g., "document.txt" -> "document (conflict 2026-03-15).txt"
 pub fn generate_conflict_path(original: &Path) -> PathBuf {
+    generate_conflict_path_with(original, |p| p.exists())
+}
+
+/// Like [`generate_conflict_path`], with the caller deciding which names
+/// are taken (two-way sync needs a name free on both sides).
+pub fn generate_conflict_path_with(original: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let stem = original
         .file_stem()
@@ -144,7 +150,7 @@ pub fn generate_conflict_path(original: &Path) -> PathBuf {
 
     // If the conflict path already exists, add a counter
     let mut counter = 2;
-    while path.exists() {
+    while taken(&path) {
         let new_name = if let Some(ext) = ext {
             format!("{} (conflict {} {}).{}", stem, date, counter, ext)
         } else {

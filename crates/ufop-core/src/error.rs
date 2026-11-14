@@ -25,6 +25,11 @@ pub enum AppError {
     #[error("Connection failed: {message}. {advice}")]
     Connection { message: String, advice: String },
 
+    /// The service rejected the credentials (HTTP 401/403, bad password,
+    /// revoked token). Retrying with the same credentials cannot help.
+    #[error("Sign-in rejected: {message}. {advice}")]
+    Authentication { message: String, advice: String },
+
     #[error("Transfer failed: {message}. {advice}")]
     Transfer { message: String, advice: String },
 
@@ -82,6 +87,11 @@ impl Serialize for AppError {
             },
             Self::Connection { message, advice } => ErrorPayload {
                 error_type: "connection",
+                message: message.clone(),
+                advice: advice.clone(),
+            },
+            Self::Authentication { message, advice } => ErrorPayload {
+                error_type: "authentication",
                 message: message.clone(),
                 advice: advice.clone(),
             },
@@ -202,6 +212,20 @@ impl AppError {
             message: message.into(),
             advice: advice.into(),
         }
+    }
+
+    /// The service rejected the credentials (see [`AppError::Authentication`]).
+    pub fn auth(message: impl Into<String>, advice: impl Into<String>) -> Self {
+        Self::Authentication {
+            message: message.into(),
+            advice: advice.into(),
+        }
+    }
+
+    /// `true` when the credentials were rejected: retrying is pointless and
+    /// the connection is flagged until the user edits it or retries.
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(self, Self::Authentication { .. })
     }
 
     /// Convenience for transfer errors.

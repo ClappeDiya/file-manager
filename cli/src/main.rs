@@ -10,6 +10,7 @@
 mod commands;
 mod config;
 mod output;
+mod secrets;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;
@@ -18,9 +19,13 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(name = "ufop", version, about, long_about = None)]
 pub struct Cli {
-    /// Output format
-    #[arg(long, global = true, default_value = "human")]
-    format: OutputFormat,
+    /// Output format (default: the profile's `default_format`, else human)
+    #[arg(long, global = true)]
+    format: Option<OutputFormat>,
+
+    /// Named profile (API server, tokens, format) from the config file
+    #[arg(long, global = true, env = "UFOP_PROFILE")]
+    profile: Option<String>,
 
     /// Output as JSON (shorthand for --format json)
     #[arg(long, global = true, conflicts_with = "yaml")]
@@ -29,6 +34,10 @@ pub struct Cli {
     /// Output as YAML (shorthand for --format yaml)
     #[arg(long, global = true, conflicts_with = "json")]
     yaml: bool,
+
+    /// Output as CSV (shorthand for --format csv)
+    #[arg(long, global = true, conflicts_with_all = ["json", "yaml"])]
+    csv: bool,
 
     /// Dry run - show what would happen without executing
     #[arg(long, global = true)]
@@ -46,6 +55,18 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Console log level (error, warn, info, debug, trace); overrides -v
+    #[arg(long, global = true, env = "UFOP_LOG_LEVEL")]
+    log_level: Option<String>,
+
+    /// Also write logs to this file (appended)
+    #[arg(long, global = true, env = "UFOP_LOG_FILE")]
+    log_file: Option<std::path::PathBuf>,
+
+    /// Log level for --log-file (defaults to info)
+    #[arg(long, global = true, default_value = "info")]
+    log_file_level: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -55,8 +76,12 @@ pub enum OutputFormat {
     Human,
     Json,
     Yaml,
+    /// Comma-separated values (RFC 4180) on stdout; messages go to stderr.
+    Csv,
 }
 
+// Parsed once per run from the command line; variant sizes do not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Authenticate with the UFOP server
@@ -111,6 +136,22 @@ pub enum Commands {
     #[command(subcommand)]
     Sync(SyncCommands),
 
+    /// Control a running ufop-server (login, run, pause, logs, health…)
+    #[command(subcommand)]
+    Server(commands::server::ServerCommands),
+
+    /// Versioned, deduplicated, encrypted backups (run, restore, verify, repair…)
+    #[command(subcommand)]
+    Backup(commands::backup::BackupCommands),
+
+    /// Management console agent: register / claim, status, run the agent loop
+    #[command(subcommand)]
+    Agent(commands::agent::AgentCommands),
+
+    /// File gateway: serve local folders through a ufop-server, or use one
+    #[command(subcommand)]
+    Gateway(commands::gateway::GatewayCommands),
+
     /// Check compatibility of paths across platforms
     Compat {
         /// Paths to check
@@ -148,7 +189,7 @@ pub enum Commands {
     Rename {
         /// Files or directory to rename
         path: String,
-        /// Pattern with tokens: {name}, {ext}, {num}, {date}, {parent}, {counter}
+        /// Pattern with tokens: {name} {ext} {num:3} {date} {yyyy} {mm} {dd} {parent} {size} {modified:%Y-%m}; filters {name|lower} {name|slug}
         #[arg(long)]
         pattern: Option<String>,
         /// Find string (literal or regex)
@@ -180,6 +221,41 @@ pub enum Commands {
 
     /// Show server/platform status
     Status,
+
+    /// Serve file tools to an AI client over the Model Context Protocol (stdio), confined to --root directories
+    Mcp(commands::mcp::McpArgs),
+
+    /// Manage named profiles (servers, tokens, output format)
+    #[command(subcommand)]
+    Profile(commands::profile::ProfileCommands),
+
+    /// Print a shell completion script: bash, zsh, fish, powershell, elvish
+    ///
+    /// bash: `ufop completions bash > ~/.local/share/bash-completion/completions/ufop`;
+    /// zsh: `ufop completions zsh > "${fpath[1]}/_ufop"`; fish:
+    /// `ufop completions fish > ~/.config/fish/completions/ufop.fish`;
+    /// PowerShell: `ufop completions powershell | Out-String | Invoke-Expression`.
+    Completions {
+        #[arg(value_parser = commands::completions::SHELLS)]
+        shell: String,
+    },
+
+    /// Verify a downloaded release: the minisign signature of SHA256SUMS and
+    /// the SHA-256 of every listed file that is present
+    VerifyRelease(commands::verify_release::VerifyReleaseArgs),
+
+    /// Print a man page (`ufop man backup run`), or write all of them with --out
+    Man {
+        /// Folder to write every page into (ufop.1, ufop-backup.1, …)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Command path (empty = the top page)
+        command: Vec<String>,
+    },
+
+    /// Print every command and option as JSON (what the desktop terminal's help drawer lists)
+    #[command(hide = true)]
+    HelpJson,
 }
 
 #[derive(Subcommand, Debug)]
@@ -289,8 +365,12 @@ impl Cli {
             OutputFormat::Json
         } else if self.yaml {
             OutputFormat::Yaml
+        } else if self.csv {
+            OutputFormat::Csv
+        } else if let Some(f) = &self.format {
+            f.clone()
         } else {
-            self.format.clone()
+            config::CliConfig::load().default_format.as_deref().and_then(|f| commands::profile::parse_format(f).ok()).unwrap_or(OutputFormat::Human)
         }
     }
 
@@ -313,25 +393,99 @@ fn parse_rate_limit(s: &str) -> u64 {
     }
 }
 
+fn parse_level(s: &str) -> Result<tracing_subscriber::filter::LevelFilter, String> {
+    use tracing_subscriber::filter::LevelFilter;
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "off" => LevelFilter::OFF,
+        "error" => LevelFilter::ERROR,
+        "warn" | "warning" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" | "profiling" => LevelFilter::TRACE,
+        _ => return Err(format!("unknown log level '{s}' (use error, warn, info, debug or trace)")),
+    })
+}
+
+/// Command line for the log, with the values of secret-looking options hidden.
+fn redact_args(args: impl Iterator<Item = String>) -> Vec<String> {
+    let secret = |a: &str| ["pass", "token", "secret", "key", "password"].iter().any(|k| a.starts_with("--") && a.to_ascii_lowercase().contains(k)) && !a.ends_with("-env");
+    let mut out = Vec::new();
+    let mut hide_next = false;
+    for a in args {
+        if hide_next {
+            out.push("***".into());
+            hide_next = false;
+        } else if let Some((flag, _)) = a.split_once('=').filter(|(f, _)| secret(f)) {
+            out.push(format!("{flag}=***"));
+        } else {
+            hide_next = secret(&a);
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn init_logging(verbose: u8, level: Option<&str>, file: Option<&std::path::Path>, file_level: &str) -> Result<(), String> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+    let console = match level {
+        Some(l) => parse_level(l)?.to_string(),
+        None => match verbose {
+            0 => "warn",
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        }
+        .to_string(),
+    };
+    let console_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(console));
+    let file_layer = match file {
+        Some(path) => {
+            let lvl = parse_level(file_level)?;
+            if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(d).map_err(|e| format!("log file {}: {e}", path.display()))?;
+            }
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("log file {}: {e}", path.display()))?;
+            Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)).with_filter(lvl))
+        }
+        None => None,
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(console_filter))
+        .with(file_layer)
+        .init();
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Machine-wide defaults (arguments and environment) from the preload file.
+    let preload = ufop_core::preload::Preload::load();
+    if let Some(p) = &preload {
+        p.apply_env("ufop");
+    }
+    let argv: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse_from(match &preload {
+        Some(p) => p.merge_args("ufop", argv),
+        None => argv,
+    });
 
-    // Initialize tracing based on verbosity
-    let filter = match cli.verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .init();
+    // Console logging from --log-level / -v (RUST_LOG wins); optional log file.
+    if let Err(e) = init_logging(cli.verbose, cli.log_level.as_deref(), cli.log_file.as_deref(), &cli.log_file_level) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
 
+    tracing::info!(target: "ufop", "ufop {} started", redact_args(std::env::args().skip(1)).join(" "));
+    config::select(cli.profile.clone(), cli.api_url.clone());
     let format = cli.effective_format();
+    // A named profile must exist, except where the command creates it (sign-in) or manages profiles.
+    if let Some(p) = cli.profile.as_deref().filter(|p| !p.is_empty()) {
+        let creates = matches!(cli.command, Commands::Login { .. } | Commands::Profile(_) | Commands::Server(commands::server::ServerCommands::Login { .. }));
+        if !config::valid_profile_name(p) || (!creates && !config::CliConfig::load_raw(&config::CliConfig::path()).has_profile(p)) {
+            output::print_error(&format, &format!("no profile named '{p}' (see `ufop profile list`)"));
+            return ExitCode::from(2);
+        }
+    }
     let dry_run = cli.dry_run;
     let rate_limit = cli.rate_limit_bps();
 
@@ -355,6 +509,18 @@ async fn main() -> ExitCode {
         }
         Commands::Sync(cmd) => {
             commands::sync::execute(cmd, &format, dry_run).await
+        }
+        Commands::Server(cmd) => {
+            commands::server::execute(cmd, &format).await
+        }
+        Commands::Backup(cmd) => {
+            commands::backup::execute(cmd, &format, dry_run).await
+        }
+        Commands::Agent(cmd) => {
+            commands::agent::execute(cmd, &format).await
+        }
+        Commands::Gateway(cmd) => {
+            commands::gateway::execute(cmd, &format).await
         }
         Commands::Compat { paths, targets } => {
             commands::compat::execute(paths, targets, &format).await
@@ -380,13 +546,76 @@ async fn main() -> ExitCode {
         Commands::Status => {
             commands::status::execute(&format).await
         }
+        Commands::Mcp(args) => {
+            commands::mcp::execute(args).await
+        }
+        Commands::Profile(cmd) => {
+            commands::profile::execute(cmd, &format).await
+        }
+        Commands::VerifyRelease(args) => commands::verify_release::execute(&args, &format),
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            commands::completions::script(&Cli::command(), &shell).map(|s| {
+                print!("{s}");
+                0
+            }).map_err(Into::into)
+        }
+        Commands::HelpJson => {
+            use clap::CommandFactory;
+            println!("{}", ufop_core::cli_gen::describe_json(&Cli::command()));
+            Ok(0)
+        }
+        Commands::Man { out, command } => {
+            use clap::CommandFactory;
+            commands::completions::man(&Cli::command(), out.as_deref(), &command).map(|pages| {
+                match &out {
+                    Some(dir) => eprintln!("Wrote {} man page(s) to {}", pages.len(), dir.display()),
+                    None => pages.iter().for_each(|(_, body)| print!("{body}")),
+                }
+                0
+            }).map_err(Into::into)
+        }
     };
 
     match result {
-        Ok(code) => ExitCode::from(code),
+        Ok(code) => {
+            tracing::info!(target: "ufop", "finished with exit code {code}");
+            ExitCode::from(code)
+        }
         Err(e) => {
+            tracing::error!(target: "ufop", "{e}");
             output::print_error(&format, &e.to_string());
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+
+    /// Every subcommand's arguments are consistent with the global ones
+    /// (a subcommand `--limit` once collided with the global `--limit`).
+    #[test]
+    fn command_tree_is_valid() {
+        // Building the whole (unoptimised) command tree needs more than the
+        // 2 MiB of a test thread; the binary's main thread has 8 MiB.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                use clap::CommandFactory;
+                Cli::command().debug_assert();
+                Cli::try_parse_from(["ufop", "server", "shares", "log", "abc", "-n", "5"]).unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn redacts_secret_options_and_parses_levels() {
+        let a = ["backup", "run", "--passphrase", "pw", "--token=abc", "--passphrase-env", "VAR", "--dest", "/d"].map(String::from);
+        assert_eq!(redact_args(a.into_iter()).join(" "), "backup run --passphrase *** --token=*** --passphrase-env VAR --dest /d");
+        assert!(parse_level("WARNING").is_ok() && parse_level("nope").is_err());
     }
 }

@@ -1,112 +1,147 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { dataStore } from '@/lib/data-store';
-import type { AdminUser, Role } from '@/lib/types/auth';
-import { requireRole, isAuthorized } from '@/lib/utils/require-role';
+import { paged } from '@/lib/pagination';
+import { revokeUserApiTokens } from '@/lib/db/repos/api-tokens';
+import { orgErrorResponse, pagedJson, publicOrigin, readPage } from '@/lib/route-helpers';
+import { ROLE_HIERARCHY, type Role } from '@/lib/types/auth';
+import { audit, badRequest, can, canIn, isContext, readJson, requirePermission, requireStepUp } from '@/lib/session';
+import { canManageRole } from '@/lib/utils/permissions';
+import { effectiveRole, membersOf, membershipsOf, OrgError, setMembership } from '@/lib/db/repos/orgs';
+import { listRemovedMembers, offboardMember, restoreMember, RESTORE_DAYS, setMembershipExpiry } from '@/lib/offboarding';
+import { listUsers, publicUser, updateUser } from '@/lib/db/repos/users';
+import { groupsOfUser } from '@/lib/db/repos/groups';
+import { createInvitation, listInvitations } from '@/lib/db/repos/invitations';
+import { revokeUserSessions } from '@/lib/db/repos/sessions';
+import { sendInvitationEmail } from '@/lib/mailer';
 
-/** GET /api/users - List all users */
+/** GET /api/users — the organization's roster: members (with groups) and invitations. */
 export async function GET(request: NextRequest) {
-  const authResult = await requireRole(request, 'admin');
-  if (!isAuthorized(authResult)) return authResult;
-
+  const ctx = await requirePermission(request, 'users.read');
+  if (!isContext(ctx)) return ctx;
   const { searchParams } = new URL(request.url);
   const role = searchParams.get('role');
-  const search = searchParams.get('search');
+  const search = searchParams.get('search')?.toLowerCase();
   const active = searchParams.get('active');
-
-  let result = [...dataStore.users];
-
-  if (role) result = result.filter(u => u.role === role);
-  if (active !== null) result = result.filter(u => u.isActive === (active === 'true'));
-  if (search) {
-    const q = search.toLowerCase();
-    result = result.filter(u =>
-      u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
-    );
-  }
-
-  return NextResponse.json({ users: result, total: result.length });
+  const members = membersOf(ctx.orgId);
+  const byId = new Map(members.map((m) => [m.userId, m]));
+  let users = listUsers(members.map((m) => m.userId)).map((u) => ({
+    ...publicUser(u),
+    role: byId.get(u.id)!.role,
+    memberSince: byId.get(u.id)!.createdAt,
+    expiresAt: byId.get(u.id)!.expiresAt,
+    groups: groupsOfUser(u.id).filter((g) => g.orgId === ctx.orgId).map((g) => ({ id: g.id, name: g.name, role: g.memberRole })),
+  }));
+  if (role) users = users.filter((u) => u.role === role);
+  if (active !== null) users = users.filter((u) => u.isActive === (active === 'true'));
+  if (search) users = users.filter((u) => u.name.toLowerCase().includes(search) || u.email.toLowerCase().includes(search));
+  const invitations = can(ctx, 'users.invite') ? listInvitations(ctx.orgId) : [];
+  const removed = can(ctx, 'users.remove') ? listRemovedMembers(ctx.orgId) : [];
+  // Every member unless a page is asked for (the Users screen shows all).
+  const pr = readPage(request, { defaultLimit: Infinity });
+  if (pr instanceof NextResponse) return pr;
+  const { items, page } = paged(users, pr);
+  return pagedJson(request, { users: items, total: users.length, invitations, removed, restoreDays: RESTORE_DAYS }, page);
 }
 
-/** POST /api/users - Invite a new user */
+/** POST /api/users — invite someone to this organization (optionally into a group). */
 export async function POST(request: NextRequest) {
-  const authResult = await requireRole(request, 'admin');
-  if (!isAuthorized(authResult)) return authResult;
-
+  const ctx = await requirePermission(request, 'users.invite');
+  if (!isContext(ctx)) return ctx;
+  const b = await readJson<{ email?: string; role?: Role; groupId?: string | null; groupRole?: 'owner' | 'member' }>(request);
+  if (!b?.email) return badRequest('Email is required');
+  const role: Role = b.role ?? 'user';
+  if (!(role in ROLE_HIERARCHY)) return badRequest('Unknown role');
+  if (role !== 'user' && !canManageRole(ctx.role, role) && ctx.role !== 'org_owner') return badRequest('You cannot invite someone with a role at or above your own', 403);
   try {
-    const body = await request.json();
-    const { email, role, name } = body;
-
-    if (!email) {
-      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
-    }
-
-    if (dataStore.users.some(u => u.email === email)) {
-      return NextResponse.json({ error: 'User already exists' }, { status: 409 });
-    }
-
-    const { v4: uuidv4 } = await import('uuid');
-    const newUser: AdminUser = {
-      id: `usr_${uuidv4().slice(0, 12)}`,
-      email,
-      name: name || email.split('@')[0],
-      role: (role as Role) || 'user',
-      permissions: [],
-      organizationId: 'org_001',
-      createdAt: new Date().toISOString(),
-      isActive: true,
-    };
-
-    dataStore.users.push(newUser);
-    return NextResponse.json({ user: newUser }, { status: 201 });
-  } catch {
-    return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
+    const { invitation, token } = createInvitation(ctx.orgId, { email: b.email, role, groupId: b.groupId ?? null, groupRole: b.groupRole ?? 'member' }, ctx.user.email);
+    const link = `${publicOrigin(request)}/invite/${encodeURIComponent(token)}`;
+    const delivery = await sendInvitationEmail(ctx.orgId, invitation.email, link, ctx.user.name);
+    audit(ctx, { eventType: 'admin.user_invite', description: `Invited ${invitation.email} as ${role}`, resourceType: 'invitation', resourceId: invitation.id, metadata: { emailed: delivery.sent } });
+    return NextResponse.json({ invitation, link, emailed: delivery.sent, emailError: delivery.error }, { status: 201 });
+  } catch (e) {
+    if (e instanceof OrgError) return badRequest(e.message, e.status);
+    throw e;
   }
 }
 
-/** PATCH /api/users - Bulk operations */
+/**
+ * PATCH /api/users — bulk actions on members of this organization:
+ * deactivate | activate | sign_out | set_role {role} | remove {successorId?} |
+ * set_expiry {expiresAt: ISO | null} | restore (members removed in the last RESTORE_DAYS days).
+ */
 export async function PATCH(request: NextRequest) {
-  const authResult = await requireRole(request, 'admin');
-  if (!isAuthorized(authResult)) return authResult;
-
-  try {
-    const body = await request.json();
-    const { action, userIds } = body;
-
-    if (!action || !Array.isArray(userIds)) {
-      return NextResponse.json({ error: 'Action and userIds required' }, { status: 400 });
+  const b = await readJson<{ action?: string; userIds?: string[]; role?: Role; successorId?: string | null; expiresAt?: string | null }>(request);
+  const perm = b?.action === 'remove' || b?.action === 'restore' || b?.action === 'set_expiry' ? 'users.remove' : b?.action === 'set_role' ? 'roles.write' : 'users.deactivate'; // deactivate, activate, sign_out
+  // Removing, restoring and expiring members and changing roles are sensitive: they need a recent sign-in.
+  const sensitive = ['remove', 'restore', 'set_expiry', 'set_role'].includes(b?.action ?? '');
+  const ctx = sensitive ? await requireStepUp(request, perm) : await requirePermission(request, perm);
+  if (!isContext(ctx)) return ctx;
+  if (!b?.action || !Array.isArray(b.userIds) || b.userIds.length === 0) return badRequest('Action and userIds required');
+  if (b.userIds.includes(ctx.user.id)) return badRequest('Cannot modify your own account via bulk operations', 403);
+  if (b.action === 'restore') {
+    try {
+      const restored = b.userIds.map((id) => restoreMember(ctx.orgId, id));
+      audit(ctx, { eventType: 'admin.user_restore', severity: 'warning', description: `Restored ${restored.map((r) => `${r.email} (${r.role})`).join(', ')}`, metadata: { userIds: b.userIds } });
+      return NextResponse.json({ success: true, affected: restored.length });
+    } catch (e) {
+      return orgErrorResponse(e);
     }
-
-    // Prevent self-deactivation/deletion
-    const currentUserEmail = authResult.user.email;
-    const currentUser = dataStore.users.find(u => u.email === currentUserEmail);
-    if (currentUser && userIds.includes(currentUser.id)) {
-      return NextResponse.json({ error: 'Cannot modify your own account via bulk operations' }, { status: 403 });
-    }
-
-    switch (action) {
-      case 'deactivate':
-        dataStore.users = dataStore.users.map(u => userIds.includes(u.id) ? { ...u, isActive: false } : u);
-        break;
-      case 'activate':
-        dataStore.users = dataStore.users.map(u => userIds.includes(u.id) ? { ...u, isActive: true } : u);
-        break;
-      case 'remove': {
-        // Prevent removing the last admin
-        const remainingAdmins = dataStore.users.filter(u =>
-          u.role === 'org_owner' && u.isActive && !userIds.includes(u.id)
-        );
-        if (remainingAdmins.length === 0) {
-          return NextResponse.json({ error: 'Cannot remove the last administrator' }, { status: 403 });
-        }
-        dataStore.users = dataStore.users.filter(u => !userIds.includes(u.id));
-        break;
-      }
-      default:
-        return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
-    }
-
-    return NextResponse.json({ success: true, affected: userIds.length });
-  } catch {
-    return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
   }
+  const members = new Map(membersOf(ctx.orgId).map((m) => [m.userId, m]));
+  for (const id of b.userIds) {
+    const m = members.get(id);
+    if (!m) return badRequest(`User ${id} is not a member of this organization`, 404);
+    // Compare with the effective role here (a parent's role is delegated down), not just the direct membership.
+    const theirs = effectiveRole(id, ctx.orgId) ?? m.role;
+    if (ctx.role !== 'org_owner' && !canManageRole(ctx.role, theirs)) return badRequest('You cannot change someone whose role is at or above your own', 403);
+    // Deactivation locks the whole account: only when every organization it belongs to is yours to manage.
+    if ((b.action === 'deactivate' || b.action === 'activate' || b.action === 'sign_out') && membershipsOf(id).some((x) => x.orgId !== ctx.orgId && !canIn(ctx, x.orgId, 'users.deactivate'))) {
+      return badRequest('This account also belongs to other organizations; remove it from this organization instead', 403);
+    }
+  }
+  const owners = [...members.values()].filter((m) => m.role === 'org_owner' && !b.userIds!.includes(m.userId));
+  switch (b.action) {
+    case 'deactivate':
+    case 'activate':
+      for (const id of b.userIds) {
+        updateUser(id, { isActive: b.action === 'activate' });
+        if (b.action === 'deactivate') {
+          revokeUserSessions(id, 'deactivated');
+          revokeUserApiTokens(id);
+        }
+      }
+      break;
+    case 'sign_out':
+      for (const id of b.userIds) revokeUserSessions(id, `signed out by ${ctx.user.email}`);
+      break;
+    case 'remove': {
+      if (owners.length === 0) return badRequest('Cannot remove the last organization owner', 403);
+      if (b.successorId && b.userIds.includes(b.successorId)) return badRequest('The successor cannot be one of the members being removed');
+      try {
+        const results = b.userIds.map((id) => offboardMember(ctx.orgId, id, { by: ctx.user.email, reason: 'removed', successor: b.successorId ?? null }));
+        audit(ctx, { eventType: 'admin.user_remove', severity: 'warning', description: `remove ${b.userIds.length} user(s)${b.successorId ? ' with a successor' : ''} (restorable for ${RESTORE_DAYS} days)`, metadata: { userIds: b.userIds, successorId: b.successorId ?? null, results } });
+        return NextResponse.json({ success: true, affected: b.userIds.length, results });
+      } catch (e) {
+        return orgErrorResponse(e);
+      }
+    }
+    case 'set_expiry':
+      try {
+        for (const id of b.userIds) setMembershipExpiry(ctx.orgId, id, b.expiresAt ?? null);
+      } catch (e) {
+        return orgErrorResponse(e);
+      }
+      break;
+    case 'set_role': {
+      if (!b.role || !(b.role in ROLE_HIERARCHY)) return badRequest('Unknown role');
+      if (ctx.role !== 'org_owner' && !canManageRole(ctx.role, b.role)) return badRequest('You cannot assign a role at or above your own', 403);
+      if (b.role !== 'org_owner' && owners.length === 0) return badRequest('Cannot demote the last organization owner', 403);
+      for (const id of b.userIds) setMembership(id, ctx.orgId, b.role);
+      break;
+    }
+    default:
+      return badRequest('Unknown action');
+  }
+  const event = { deactivate: 'admin.user_deactivate', activate: 'admin.user_activate', set_role: 'admin.role_change', sign_out: 'admin.user_sign_out', set_expiry: 'admin.user_expiry' }[b.action] ?? 'admin.settings_change';
+  audit(ctx, { eventType: event, description: `${b.action} ${b.userIds.length} user(s)${b.role ? ` → ${b.role}` : ''}${b.action === 'set_expiry' ? ` → ${b.expiresAt ?? 'no expiry'}` : ''}`, metadata: { userIds: b.userIds } });
+  return NextResponse.json({ success: true, affected: b.userIds.length });
 }

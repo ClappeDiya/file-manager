@@ -1,4 +1,4 @@
-//! Local transfers shared by the guided desktop flows and CLI.
+//! Local file transfers used by the CLI.
 //! Each file is staged and verified before publication. A move removes originals
 //! only after every file has been copied and verified.
 use crate::{error::AppError, sync::copier, sync_types::CopyOptions};

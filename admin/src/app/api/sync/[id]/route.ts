@@ -1,3 +1,4 @@
+import { isEnabled, notAvailable } from '@/lib/features';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireRole, isAuthorized } from '@/lib/utils/require-role';
 
@@ -15,6 +16,7 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  if (!isEnabled('syncApi')) return notAvailable('syncApi');
   const authResult = await requireRole(request, 'viewer');
   if (!isAuthorized(authResult)) return authResult;
 
@@ -43,6 +45,7 @@ export async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  if (!isEnabled('syncApi')) return notAvailable('syncApi');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 
@@ -94,6 +97,7 @@ export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  if (!isEnabled('syncApi')) return notAvailable('syncApi');
   const authResult = await requireRole(request, 'manager');
   if (!isAuthorized(authResult)) return authResult;
 

@@ -1,5 +1,6 @@
 use crate::core::error::AppError;
 use crate::core::types::FileEntry;
+use crate::metadata_engine::MetadataStore;
 use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -213,6 +214,46 @@ pub async fn copy_files(
     with_fs_failure_record(&ledger, "copy", &source_paths, outcome).await
 }
 
+/// Outcome of copying a selection into one of several destinations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestinationOutcome {
+    pub dest_dir: String,
+    pub result: Option<FileOpResult>,
+    pub error: Option<String>,
+}
+
+/// Copy the same selection into several folders. Each destination is its
+/// own ledger operation (own undo); one failing does not stop the others.
+#[tauri::command]
+pub async fn copy_files_to_many(
+    source_paths: Vec<String>,
+    dest_dirs: Vec<String>,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<Vec<DestinationOutcome>, AppError> {
+    copy_files_to_many_impl(source_paths, dest_dirs, &ledger).await
+}
+
+pub async fn copy_files_to_many_impl(
+    source_paths: Vec<String>,
+    dest_dirs: Vec<String>,
+    ledger: &OperationLedger,
+) -> Result<Vec<DestinationOutcome>, AppError> {
+    if dest_dirs.is_empty() {
+        return Err(AppError::validation("Choose at least one destination folder."));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dest_dir in dest_dirs.into_iter().filter(|d| seen.insert(d.clone())) {
+        let outcome = copy_files_impl(source_paths.clone(), dest_dir.clone(), ledger).await;
+        let outcome = with_fs_failure_record(ledger, "copy", &source_paths, outcome).await;
+        out.push(match outcome {
+            Ok(r) => DestinationOutcome { dest_dir, result: Some(r), error: None },
+            Err(e) => DestinationOutcome { dest_dir, result: None, error: Some(e.user_message()) },
+        });
+    }
+    Ok(out)
+}
+
 /// What a selection would actually touch on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedFiles {
@@ -312,15 +353,17 @@ pub async fn count_affected_files(paths: Vec<String>) -> Result<AffectedFiles, A
 /// Shared by copy (which only needs it on a name collision) and duplicate
 /// (which always renames, since it writes beside the original).
 fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError> {
-    let stem = src
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let ext = src
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
+    let name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
+    next_copy_name(&name, |candidate| dir.join(candidate).exists()).map(|n| dir.join(n))
+}
+
+/// First `"<stem> (copy)"` / `"<stem> (copy N)"` variant of `name` that
+/// `taken` does not claim. The naming of every keep-both copy (local copy,
+/// duplicate, and pane transfers to and from connections).
+pub(crate) fn next_copy_name(name: &str, taken: impl Fn(&str) -> bool) -> Result<String, AppError> {
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
     for counter in 1..=1000 {
         let new_name = if counter == 1 {
@@ -328,9 +371,8 @@ fn next_available_copy_name(dir: &Path, src: &Path) -> Result<PathBuf, AppError>
         } else {
             format!("{stem} (copy {counter}){ext}")
         };
-        let candidate = dir.join(&new_name);
-        if !candidate.exists() {
-            return Ok(candidate);
+        if !taken(&new_name) {
+            return Ok(new_name);
         }
     }
 
@@ -386,6 +428,7 @@ pub async fn copy_files_impl(
             "Check that the destination folder exists.",
         ));
     }
+    super::policy_commands::enforce_copy(&source_paths, &dest_dir)?;
 
     let mut dest_paths = Vec::new();
     let mut copied_sources = Vec::new();
@@ -421,9 +464,12 @@ pub async fn move_files(
     source_paths: Vec<String>,
     dest_dir: String,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     let outcome = move_files_impl(source_paths.clone(), dest_dir, &ledger).await;
-    with_fs_failure_record(&ledger, "move", &source_paths, outcome).await
+    let result = with_fs_failure_record(&ledger, "move", &source_paths, outcome).await?;
+    metadata.follow_fs_op("move", &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 /// Move a single entry into `dest_dir`, returning the path it landed at.
@@ -506,6 +552,7 @@ pub async fn move_files_impl(
         ));
     }
 
+    super::policy_commands::enforce_copy(&source_paths, &dest_dir)?;
     // Measure first: once moved, the sources are gone from their old paths.
     let affected_files = measure_paths(&source_paths);
     let mut dest_paths = Vec::new();
@@ -543,10 +590,13 @@ pub async fn rename_file(
     path: String,
     new_name: String,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     let sources = vec![path.clone()];
     let outcome = rename_file_impl(path, new_name, &ledger).await;
-    with_fs_failure_record(&ledger, "rename", &sources, outcome).await
+    let result = with_fs_failure_record(&ledger, "rename", &sources, outcome).await?;
+    metadata.follow_fs_op("rename", &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 pub async fn rename_file_impl(
@@ -580,6 +630,9 @@ pub async fn rename_file_impl(
             format!("A file named '{new_name}' already exists"),
             "Choose a different name.",
         ));
+    }
+    if !src.is_dir() {
+        super::policy_commands::enforce_path(&target)?;
     }
 
     std::fs::rename(src, &target).map_err(|e| {
@@ -681,12 +734,16 @@ pub async fn delete_files(
     paths: Vec<String>,
     permanent: bool,
     ledger: tauri::State<'_, OperationLedger>,
+    metadata: tauri::State<'_, MetadataStore>,
 ) -> Result<FileOpResult, AppError> {
     // Mirror the kind the impl records on success, so a failed delete lands
     // under the same kind as a successful one in the timeline.
     let kind = if permanent { "delete_permanent" } else { "delete_trash" };
     let outcome = delete_files_impl(paths.clone(), permanent, &ledger).await;
-    with_fs_failure_record(&ledger, kind, &paths, outcome).await
+    let result = with_fs_failure_record(&ledger, kind, &paths, outcome).await?;
+    // Trashed items keep their metadata so an undo restores it intact.
+    metadata.follow_fs_op(kind, &result.source_paths, &result.dest_paths, false).await;
+    Ok(result)
 }
 
 /// Delete a single existing entry, to the OS trash unless `permanent`.
@@ -877,6 +934,7 @@ pub async fn create_file_impl(
         ));
     }
 
+    super::policy_commands::enforce_path(p)?;
     // Ensure parent directory exists
     if let Some(parent) = p.parent() {
         if !parent.exists() {
@@ -909,9 +967,22 @@ pub async fn create_file_impl(
     })
 }
 
-/// Undo a previous file operation by reversing it.
+/// Undo a previous file operation by reversing it; metadata follows moved
+/// and renamed files back.
 #[tauri::command]
 pub async fn undo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+    metadata: tauri::State<'_, MetadataStore>,
+) -> Result<bool, AppError> {
+    let done = undo_file_operation_inner(operation.clone(), source_paths.clone(), dest_paths.clone()).await?;
+    metadata.follow_fs_op(&operation, &source_paths, &dest_paths, true).await;
+    Ok(done)
+}
+
+/// The filesystem part of [`undo_file_operation`].
+pub async fn undo_file_operation_inner(
     operation: String,
     source_paths: Vec<String>,
     dest_paths: Vec<String>,
@@ -946,7 +1017,10 @@ pub async fn undo_file_operation(
             }
         }
         "create_folder" | "create_file" => {
-            // Undo create = delete
+            // Undo create = delete, deepest first: a folder created inside
+            // another must go before it, whatever order the ledger kept.
+            let mut dest_paths = dest_paths;
+            dest_paths.sort_by_key(|p| std::cmp::Reverse(Path::new(p).components().count()));
             for dest in &dest_paths {
                 let p = Path::new(dest);
                 if p.exists() {
@@ -998,6 +1072,18 @@ pub async fn undo_file_operation(
 /// why the redo could not complete.
 #[tauri::command]
 pub async fn redo_file_operation(
+    operation: String,
+    source_paths: Vec<String>,
+    dest_paths: Vec<String>,
+    metadata: tauri::State<'_, MetadataStore>,
+) -> Result<bool, AppError> {
+    let done = redo_file_operation_inner(operation.clone(), source_paths.clone(), dest_paths.clone()).await?;
+    metadata.follow_fs_op(&operation, &source_paths, &dest_paths, false).await;
+    Ok(done)
+}
+
+/// The filesystem part of [`redo_file_operation`].
+pub async fn redo_file_operation_inner(
     operation: String,
     source_paths: Vec<String>,
     dest_paths: Vec<String>,
@@ -1118,10 +1204,15 @@ pub async fn get_file_metadata(path: String) -> Result<FileEntry, AppError> {
 /// - **onedrive**: DELETE `/me/drive/items/{id}` which moves to OneDrive Recycle Bin.
 /// - **dropbox**: `files/delete_v2` which soft-deletes (recoverable for retention period).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cloud_delete_to_trash(
     protocol: String,
     file_id: String,
     connection_id: String,
+    connections: tauri::State<'_, crate::connectors::ConnectionManager>,
+    gdrive: tauri::State<'_, Arc<crate::connectors::GoogleDriveConnector>>,
+    onedrive: tauri::State<'_, Arc<crate::connectors::OneDriveConnector>>,
+    dropbox: tauri::State<'_, Arc<crate::connectors::DropboxConnector>>,
 ) -> Result<(), AppError> {
     tracing::info!(
         "cloud_delete_to_trash: protocol={}, file_id={}, connection_id={}",
@@ -1131,24 +1222,39 @@ pub async fn cloud_delete_to_trash(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: move to trash (permanent=false)
-            let connector = crate::connectors::google_drive::GoogleDriveConnector::new();
-            connector.delete_file(&file_id, false).await
+            cloud_instance(&gdrive, &connections, &connection_id, crate::connectors::GoogleDriveConnector::fresh).await?
+                .delete_file(&file_id, false).await
         }
         "onedrive" => {
             // OneDrive: DELETE moves to recycle bin by default
-            let connector = crate::connectors::onedrive::OneDriveConnector::new();
-            connector.delete_item(&file_id).await
+            cloud_instance(&onedrive, &connections, &connection_id, crate::connectors::OneDriveConnector::fresh).await?
+                .delete_item(&file_id).await
         }
         "dropbox" => {
             // Dropbox: delete_v2 is a soft delete (recoverable)
-            let connector = crate::connectors::dropbox::DropboxConnector::new();
-            connector.delete(&file_id).await
+            cloud_instance(&dropbox, &connections, &connection_id, crate::connectors::DropboxConnector::fresh).await?
+                .delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for trash deletion: {other}"),
             advice: "Supported protocols: google_drive, onedrive, dropbox.".to_string(),
         }),
     }
+}
+
+/// The cloud connector signed in as the saved connection: the shared one
+/// when it already is, else a fresh instance (the shared one, which the
+/// Connections panel browses, is not re-signed as another account). These
+/// commands used to create a never-signed-in connector, so every call
+/// failed with "Not connected".
+async fn cloud_instance<C: crate::connectors::Connector + 'static>(
+    connector: &Arc<C>,
+    connections: &crate::connectors::ConnectionManager,
+    connection_id: &str,
+    fresh: fn(&C) -> C,
+) -> Result<Arc<C>, AppError> {
+    use super::connector_commands::{instance_for, Caller};
+    instance_for(connector.clone(), |c| Some(Arc::new(fresh(c))), connections, connection_id, Caller::User).await
 }
 
 /// Permanently delete a cloud file/folder, bypassing the trash/recycle bin.
@@ -1158,10 +1264,15 @@ pub async fn cloud_delete_to_trash(
 /// - **onedrive**: DELETE + permanentDelete (removes from recycle bin too).
 /// - **dropbox**: `files/permanently_delete` endpoint (immediate permanent removal).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cloud_delete_permanently(
     protocol: String,
     file_id: String,
     connection_id: String,
+    connections: tauri::State<'_, crate::connectors::ConnectionManager>,
+    gdrive: tauri::State<'_, Arc<crate::connectors::GoogleDriveConnector>>,
+    onedrive: tauri::State<'_, Arc<crate::connectors::OneDriveConnector>>,
+    dropbox: tauri::State<'_, Arc<crate::connectors::DropboxConnector>>,
 ) -> Result<(), AppError> {
     tracing::info!(
         "cloud_delete_permanently: protocol={}, file_id={}, connection_id={}",
@@ -1171,18 +1282,18 @@ pub async fn cloud_delete_permanently(
     match protocol.as_str() {
         "google_drive" => {
             // Google Drive: permanent delete (permanent=true)
-            let connector = crate::connectors::google_drive::GoogleDriveConnector::new();
-            connector.delete_file(&file_id, true).await
+            cloud_instance(&gdrive, &connections, &connection_id, crate::connectors::GoogleDriveConnector::fresh).await?
+                .delete_file(&file_id, true).await
         }
         "onedrive" => {
             // OneDrive: delete + purge from recycle bin
-            let connector = crate::connectors::onedrive::OneDriveConnector::new();
-            connector.delete_item_permanently(&file_id).await
+            cloud_instance(&onedrive, &connections, &connection_id, crate::connectors::OneDriveConnector::fresh).await?
+                .delete_item_permanently(&file_id).await
         }
         "dropbox" => {
             // Dropbox: permanent deletion endpoint
-            let connector = crate::connectors::dropbox::DropboxConnector::new();
-            connector.permanently_delete(&file_id).await
+            cloud_instance(&dropbox, &connections, &connection_id, crate::connectors::DropboxConnector::fresh).await?
+                .permanently_delete(&file_id).await
         }
         other => Err(AppError::FileOperation {
             message: format!("Unsupported cloud protocol for permanent deletion: {other}"),
@@ -1281,16 +1392,20 @@ pub async fn resolve_path(
     sftp.realpath(&path).await
 }
 
-/// Open a file with the OS default application.
+/// Open a file or folder with the OS default application.
 #[tauri::command]
 pub async fn open_file_with_default(path: String) -> Result<(), AppError> {
-    let status = {
+    // tokio's process, so waiting for the opener never blocks the async runtime.
+    let status: std::io::Result<std::process::ExitStatus> = {
         #[cfg(target_os = "macos")]
-        { std::process::Command::new("open").arg(&path).status() }
+        { tokio::process::Command::new("open").arg(&path).status().await }
+        // Explorer opens the path itself: unlike `cmd /C start`, nothing in the name
+        // (`&`, `^`, `%`) is interpreted by a shell. It reports exit code 1 even when
+        // it worked, so only a failure to start it counts.
         #[cfg(target_os = "windows")]
-        { std::process::Command::new("cmd").args(["/C", "start", "", &path]).status() }
+        { tokio::process::Command::new("explorer.exe").arg(&path).status().await.map(|_| <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(0)) }
         #[cfg(target_os = "linux")]
-        { std::process::Command::new("xdg-open").arg(&path).status() }
+        { tokio::process::Command::new("xdg-open").arg(&path).status().await }
     };
     match status {
         Ok(s) if s.success() => Ok(()),
@@ -1427,7 +1542,31 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AppError> {
 }
 
 /// Move a file/directory to the OS trash.
-fn move_to_trash(path: &Path) -> Result<(), AppError> {
+/// Move `path` into the trash folder `trash_dir`; returns where it went.
+/// A name already in the trash gets a number (`notes 2.txt`), so trashing
+/// two files of the same name never overwrites the first.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn trash_into(trash_dir: &Path, path: &Path) -> Result<PathBuf, AppError> {
+    let file_name = path.file_name().unwrap_or_default();
+    let mut target = trash_dir.join(file_name);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 2;
+    while std::fs::symlink_metadata(&target).is_ok() {
+        target = trash_dir.join(format!("{stem} {n}{ext}"));
+        n += 1;
+    }
+    std::fs::rename(path, &target).map_err(|e| {
+        AppError::file_op(
+            format!("Failed to move to Trash: {e}"),
+            "Try permanent delete instead.",
+        )
+    })?;
+    Ok(target)
+}
+
+/// Move `path` to the OS trash (permanently deleted on Windows for now).
+pub(crate) fn move_to_trash(path: &Path) -> Result<(), AppError> {
     // Cross-platform trash implementation
     // On macOS: move to ~/.Trash/
     // On Linux: use ~/.local/share/Trash/ (freedesktop spec)
@@ -1448,34 +1587,7 @@ fn move_to_trash(path: &Path) -> Result<(), AppError> {
             })?;
         }
 
-        let file_name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let mut target = trash_dir.join(&file_name);
-
-        // Handle name conflicts in trash
-        if target.exists() {
-            let stem = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let ext = path
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-            let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-            target = trash_dir.join(format!("{stem} {timestamp}{ext}"));
-        }
-
-        std::fs::rename(path, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move to Trash: {e}"),
-                "Try permanent delete instead.",
-            )
-        })?;
+        trash_into(&trash_dir, path)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -1493,15 +1605,7 @@ fn move_to_trash(path: &Path) -> Result<(), AppError> {
             })?;
         }
 
-        let file_name = path.file_name().unwrap_or_default();
-        let target = trash_dir.join(file_name);
-
-        std::fs::rename(path, &target).map_err(|e| {
-            AppError::file_op(
-                format!("Failed to move to Trash: {e}"),
-                "Try permanent delete instead.",
-            )
-        })?;
+        trash_into(&trash_dir, path)?;
     }
 
     #[cfg(target_os = "windows")]
@@ -1629,6 +1733,29 @@ fn is_default_port(protocol: &str, port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: trashing a second file with the same name as one already
+    /// in the trash renamed it over the first, destroying it (Linux and macOS
+    /// both trash through `trash_into`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn trash_keeps_files_that_share_a_name() {
+        let base = tempfile::tempdir().unwrap();
+        let trash = base.path().join("Trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        for (dir, body) in [("one", "first"), ("two", "second")] {
+            let d = base.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("notes.txt"), body).unwrap();
+            super::trash_into(&trash, &d.join("notes.txt")).unwrap();
+        }
+        let mut kept: Vec<String> = std::fs::read_dir(&trash)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["first", "second"]);
+    }
+
     #[test]
     fn cross_device_fallback_moves_file_and_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1922,6 +2049,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filename_policy_blocks_copy_move_rename_and_create() {
+        use ufop_core::policy::{set_active, FilenameRule, PolicySet};
+        let dir = tempdir().unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let folder = dir.path().join("pkg");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("inner.zz-fileops"), "x").unwrap();
+        let ok = dir.path().join("ok.txt");
+        fs::write(&ok, "x").unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        // Unique extension: the active set is process-wide.
+        set_active(PolicySet::new(vec![FilenameRule { blocked_extensions: vec!["zz-fileops".into()], ..FilenameRule::new("t", "") }]).unwrap());
+        let l = test_ledger();
+        let copy = copy_files_impl(vec![s(&folder)], s(&dest), &l).await;
+        let mv = move_files_impl(vec![s(&folder)], s(&dest), &l).await;
+        let ren = rename_file_impl(s(&ok), "ok.zz-fileops".into(), &l).await;
+        let create = create_file_impl(s(&dest.join("new.zz-fileops")), &l).await;
+        let allowed = copy_files_impl(vec![s(&ok)], s(&dest), &l).await;
+        set_active(PolicySet::default());
+        for r in [copy.map(|_| ()), mv.map(|_| ()), ren.map(|_| ()), create.map(|_| ())] {
+            assert!(r.unwrap_err().to_string().contains("Blocked by filename policy"));
+        }
+        assert!(allowed.is_ok());
+        assert!(!dest.join("pkg").exists() && folder.exists() && ok.exists());
+    }
+
+    #[tokio::test]
+    async fn copy_to_many_continues_past_a_bad_destination() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, "x").unwrap();
+        let (d1, d2) = (dir.path().join("d1"), dir.path().join("d2"));
+        fs::create_dir(&d1).unwrap();
+        fs::create_dir(&d2).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let l = test_ledger();
+        let out = copy_files_to_many_impl(
+            vec![s(&src)],
+            vec![s(&d1), s(&dir.path().join("missing")), s(&d2), s(&d1)],
+            &l,
+        )
+        .await
+        .unwrap();
+        // Duplicates collapse; the missing folder fails alone.
+        assert_eq!(out.len(), 3);
+        assert!(out[0].result.is_some() && out[2].result.is_some());
+        assert!(out[1].error.as_deref().unwrap().contains("does not exist"));
+        assert!(d1.join("a.txt").exists() && d2.join("a.txt").exists());
+        assert_ne!(out[0].result.as_ref().unwrap().undo_id, out[2].result.as_ref().unwrap().undo_id);
+        assert!(copy_files_to_many_impl(vec![s(&src)], vec![], &l).await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_copy_files_conflict_resolution() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("file.txt");
@@ -2014,7 +2195,7 @@ mod tests {
         .await
         .unwrap();
 
-        let undo_result = undo_file_operation(
+        let undo_result = undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths.clone(),
@@ -2040,7 +2221,7 @@ mod tests {
         .await
         .unwrap();
 
-        undo_file_operation(
+        undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths,
@@ -2059,7 +2240,7 @@ mod tests {
         let l = test_ledger();
         let result = create_file_impl(file_path.clone(), &l).await.unwrap();
 
-        undo_file_operation(
+        undo_file_operation_inner(
             result.operation,
             result.source_paths,
             result.dest_paths,
@@ -2428,35 +2609,4 @@ mod tests {
         let first = next_available_copy_name(dir.path(), &src).unwrap();
         assert_eq!(first.file_name().unwrap(), "README (copy)");
     }
-}
-
-/// Run a guided local copy or verified move, returning only after data has
-/// reached the destination. Remote providers use the connection/transfer engine.
-#[tauri::command]
-pub async fn run_local_transfer(
-    source: String,
-    destination: String,
-    verify: bool,
-    move_source: bool,
-    ledger: tauri::State<'_, OperationLedger>,
-) -> Result<ufop_core::local_transfer::TransferOutcome, AppError> {
-    let src = source.clone();
-    let dst = destination.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        ufop_core::local_transfer::transfer(
-            Path::new(&src), Path::new(&dst),
-            ufop_core::local_transfer::TransferOptions { verify, move_source, overwrite: false },
-            |_, _| {},
-        )
-    }).await.map_err(|error| AppError::Sync {
-        message: format!("Transfer could not finish: {error}"),
-        advice: "Inspect the destination before retrying.".into(),
-    })??;
-    // This operation does not create a ledger undo action.
-    ledger.record(RecordEvent::new(LedgerEngine::Fs, if move_source { "move" } else { "copy" })
-        .status(LedgerStatus::Ok)
-        .subject(source).target(destination)
-        .summary(format!("Copied {} files, {} skipped", result.files_transferred, result.files_skipped))
-    ).await;
-    Ok(result)
 }

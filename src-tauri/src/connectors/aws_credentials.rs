@@ -9,6 +9,7 @@
 use crate::core::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use sha2::Digest;
 use std::path::PathBuf;
 
 // ── Data Types ──────────────────────────────────────────────────────────────
@@ -28,6 +29,15 @@ pub struct AwsProfile {
     pub role_arn: Option<String>,
     pub source_profile: Option<String>,
     pub credential_source: Option<String>,
+    /// OIDC token file for `AssumeRoleWithWebIdentity` (with `role_arn`).
+    #[serde(default)]
+    pub web_identity_token_file: Option<String>,
+    /// External command printing credentials (recognised, not run).
+    #[serde(default)]
+    pub credential_process: Option<String>,
+    /// Named `[sso-session …]` block (recognised, not resolved).
+    #[serde(default)]
+    pub sso_session: Option<String>,
 }
 
 /// Temporary AWS credentials (from SSO, STS, etc.).
@@ -149,6 +159,9 @@ fn profile_from_section(name: &str, kv: &HashMap<String, String>) -> AwsProfile 
         role_arn: kv.get("role_arn").cloned(),
         source_profile: kv.get("source_profile").cloned(),
         credential_source: kv.get("credential_source").cloned(),
+        web_identity_token_file: kv.get("web_identity_token_file").cloned(),
+        credential_process: kv.get("credential_process").cloned(),
+        sso_session: kv.get("sso_session").cloned(),
     }
 }
 
@@ -159,12 +172,12 @@ fn profile_from_section(name: &str, kv: &HashMap<String, String>) -> AwsProfile 
 /// The credentials file uses `[profile_name]` section headers directly
 /// (no `profile ` prefix, unlike the config file).
 pub fn parse_aws_credentials() -> Vec<AwsProfile> {
-    let path = match credentials_path() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    credentials_path().map(|p| parse_credentials_file(&p)).unwrap_or_default()
+}
 
-    let content = match std::fs::read_to_string(&path) {
+/// Profiles of a credentials-style file (`[name]` sections).
+pub fn parse_credentials_file(path: &std::path::Path) -> Vec<AwsProfile> {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("Could not read {}: {e}", path.display());
@@ -185,12 +198,12 @@ pub fn parse_aws_credentials() -> Vec<AwsProfile> {
 /// This strips the `profile ` prefix so the returned profile names match
 /// those in the credentials file.
 pub fn parse_aws_config() -> Vec<AwsProfile> {
-    let path = match config_path() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    config_path().map(|p| parse_config_file(&p)).unwrap_or_default()
+}
 
-    let content = match std::fs::read_to_string(&path) {
+/// Profiles of a config-style file (`[profile name]` sections).
+pub fn parse_config_file(path: &std::path::Path) -> Vec<AwsProfile> {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("Could not read {}: {e}", path.display());
@@ -218,8 +231,11 @@ pub fn parse_aws_config() -> Vec<AwsProfile> {
 /// Credentials file values take precedence for secret material (access keys),
 /// while config file values provide region and SSO/role configuration.
 pub fn resolve_profile(name: &str) -> Option<AwsProfile> {
-    let creds = parse_aws_credentials();
-    let configs = parse_aws_config();
+    resolve_profile_in(name, &parse_aws_credentials(), &parse_aws_config())
+}
+
+/// [`resolve_profile`] over already-parsed credentials and config files.
+pub fn resolve_profile_in(name: &str, creds: &[AwsProfile], configs: &[AwsProfile]) -> Option<AwsProfile> {
 
     let cred_profile = creds.iter().find(|p| p.name == name);
     let config_profile = configs.iter().find(|p| p.name == name);
@@ -264,6 +280,9 @@ pub fn resolve_profile(name: &str) -> Option<AwsProfile> {
                     .credential_source
                     .clone()
                     .or_else(|| cred.credential_source.clone()),
+                web_identity_token_file: cfg.web_identity_token_file.clone().or_else(|| cred.web_identity_token_file.clone()),
+                credential_process: cfg.credential_process.clone().or_else(|| cred.credential_process.clone()),
+                sso_session: cfg.sso_session.clone().or_else(|| cred.sso_session.clone()),
             })
         }
     }
@@ -293,7 +312,7 @@ pub fn list_all_profile_names() -> Vec<String> {
 async fn register_oidc_client(
     region: &str,
 ) -> Result<(String, String), AppError> {
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!(
         "https://oidc.{region}.amazonaws.com/client/register"
     );
@@ -358,7 +377,7 @@ pub async fn start_sso_auth(
     let (client_id, client_secret) = register_oidc_client(region).await?;
 
     // Step 2: Start device authorization
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!(
         "https://oidc.{region}.amazonaws.com/device_authorization"
     );
@@ -444,7 +463,7 @@ pub async fn poll_sso_token(
     client_secret: &str,
     region: &str,
 ) -> Result<SsoTokenResponse, AppError> {
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!("https://oidc.{region}.amazonaws.com/token");
 
     let body = serde_json::json!({
@@ -542,7 +561,7 @@ pub async fn get_sso_role_credentials(
     role_name: &str,
     region: &str,
 ) -> Result<AwsCredentials, AppError> {
-    let client = reqwest::Client::new();
+    let client = crate::net::client();
     let endpoint = format!(
         "https://portal.sso.{region}.amazonaws.com/federation/credentials?account_id={account_id}&role_name={role_name}"
     );
@@ -638,9 +657,27 @@ pub async fn assume_role_with_web_identity(
     region: &str,
     session_name: Option<&str>,
 ) -> Result<AwsCredentials, AppError> {
-    let session = session_name.unwrap_or("ufop-session");
-    let client = reqwest::Client::new();
-    let endpoint = format!("https://sts.{region}.amazonaws.com/");
+    assume_role_with_web_identity_at(&crate::net::client(), &sts_url(region, None), role_arn, web_identity_token, session_name).await
+}
+
+/// STS endpoint URL: `endpoint` (tests, GovCloud, VPC endpoints) or the
+/// regional `https://sts.<region>.amazonaws.com`, with a trailing `/`.
+pub fn sts_url(region: &str, endpoint: Option<&str>) -> String {
+    match endpoint.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("{}/", e.trim_end_matches('/')),
+        None => format!("https://sts.{}.amazonaws.com/", if region.trim().is_empty() { "us-east-1" } else { region.trim() }),
+    }
+}
+
+/// `AssumeRoleWithWebIdentity` (an unsigned STS call) at `endpoint`.
+pub async fn assume_role_with_web_identity_at(
+    client: &reqwest::Client,
+    endpoint: &str,
+    role_arn: &str,
+    web_identity_token: &str,
+    session_name: Option<&str>,
+) -> Result<AwsCredentials, AppError> {
+    let session = session_name.filter(|s| !s.is_empty()).unwrap_or("ufop-session");
 
     let params = [
         ("Action", "AssumeRoleWithWebIdentity"),
@@ -651,7 +688,7 @@ pub async fn assume_role_with_web_identity(
     ];
 
     let resp = client
-        .post(&endpoint)
+        .post(endpoint)
         .form(&params)
         .send()
         .await
@@ -708,6 +745,106 @@ pub async fn assume_role_with_web_identity(
         secret_access_key,
         session_token,
         expiration,
+    })
+}
+
+/// Base keys an `AssumeRole` call is signed with.
+#[derive(Debug, Clone)]
+pub struct BaseKeys {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+/// Signed `AssumeRole` request: (url, headers, form body). `endpoint`
+/// overrides `https://sts.<region>.amazonaws.com` (tests, GovCloud, VPC).
+pub fn assume_role_request(
+    base: &BaseKeys,
+    role: &crate::core::types::AssumeRoleConfig,
+    region: &str,
+    endpoint: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(String, std::collections::BTreeMap<String, String>, String), AppError> {
+    if !role.role_arn.starts_with("arn:") {
+        return Err(AppError::validation("The role ARN should look like arn:aws:iam::123456789012:role/Name"));
+    }
+    let duration = role.duration_secs.unwrap_or(3600).clamp(900, 43_200).to_string();
+    let session = role.session_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "ufop".into());
+    let mut form = vec![
+        ("Action", "AssumeRole".to_string()),
+        ("Version", "2011-06-15".to_string()),
+        ("RoleArn", role.role_arn.clone()),
+        ("RoleSessionName", session),
+        ("DurationSeconds", duration),
+    ];
+    if let Some(x) = role.external_id.as_deref().filter(|x| !x.is_empty()) {
+        form.push(("ExternalId", x.to_string()));
+    }
+    let body = form
+        .iter()
+        .map(|(k, v)| format!("{k}={}", crate::backup_engine::stores::s3::uri_encode(v, false)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = endpoint
+        .map(|e| e.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("https://sts.{region}.amazonaws.com"));
+    let parsed = reqwest::Url::parse(&url).map_err(|e| AppError::validation(format!("Invalid STS endpoint: {e}")))?;
+    let host = match parsed.port() {
+        Some(p) => format!("{}:{p}", parsed.host_str().unwrap_or_default()),
+        None => parsed.host_str().unwrap_or_default().to_string(),
+    };
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert("content-type".to_string(), "application/x-www-form-urlencoded; charset=utf-8".to_string());
+    headers.insert("host".to_string(), host);
+    headers.insert("x-amz-date".to_string(), now.format("%Y%m%dT%H%M%SZ").to_string());
+    if let Some(t) = &base.session_token {
+        headers.insert("x-amz-security-token".to_string(), t.clone());
+    }
+    let payload_hash = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+    let auth = crate::backup_engine::stores::s3::sign_v4("POST", "/", &[], &headers, &payload_hash, &base.access_key_id, &base.secret_access_key, region, "sts");
+    headers.insert("authorization".to_string(), auth);
+    Ok((format!("{url}/"), headers, body))
+}
+
+/// Temporary credentials for `role`, assumed with `base` (STS AssumeRole,
+/// with the external ID when set).
+pub async fn assume_role(base: &BaseKeys, role: &crate::core::types::AssumeRoleConfig, region: &str, endpoint: Option<&str>) -> Result<AwsCredentials, AppError> {
+    assume_role_with(&crate::net::client(), base, role, region, endpoint).await
+}
+
+/// [`assume_role`] through a given HTTP client.
+pub async fn assume_role_with(client: &reqwest::Client, base: &BaseKeys, role: &crate::core::types::AssumeRoleConfig, region: &str, endpoint: Option<&str>) -> Result<AwsCredentials, AppError> {
+    let (url, headers, body) = assume_role_request(base, role, region, endpoint, chrono::Utc::now())?;
+    let mut req = client.post(&url).body(body);
+    for (k, v) in &headers {
+        if k != "host" {
+            req = req.header(k, v);
+        }
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::connection(format!("STS AssumeRole failed: {e}"), "Check your network connection."))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = extract_xml_tag(&text, "Message").unwrap_or(text.chars().take(300).collect());
+        return Err(AppError::connection(
+            format!("STS AssumeRole failed ({status}): {msg}"),
+            "Check the role ARN, the external ID and that the role trusts these keys.",
+        ));
+    }
+    parse_sts_credentials(&text)
+}
+
+/// `Credentials` of an STS `Assume*` response.
+pub fn parse_sts_credentials(xml: &str) -> Result<AwsCredentials, AppError> {
+    let need = |tag: &str| extract_xml_tag(xml, tag).ok_or_else(|| AppError::connection(format!("Missing {tag} in STS response"), "Unexpected STS response format."));
+    Ok(AwsCredentials {
+        access_key_id: need("AccessKeyId")?,
+        secret_access_key: need("SecretAccessKey")?,
+        session_token: need("SessionToken")?,
+        expiration: extract_xml_tag(xml, "Expiration"),
     })
 }
 

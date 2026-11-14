@@ -115,7 +115,15 @@
     "diskFull": "Nicht gen\u00fcgend Speicherplatz",
     "copyingFiles": "{{count}} Dateien werden kopiert...",
     "movingFiles": "{{count}} Dateien werden verschoben...",
-    "deletingFiles": "{{count}} Dateien werden gel\u00f6scht..."
+    "deletingFiles": "{{count}} Dateien werden gel\u00f6scht...",
+    "folders": "Ordner",
+    "smart": "Intelligent",
+    "copyPath": "Pfad kopieren",
+    "deletePermanently": "Endg\u00fcltig l\u00f6schen",
+    "openWith": "\u00d6ffnen mit...",
+    "extractHere": "Hier entpacken",
+    "openInNewWindow": "In neuem Fenster \u00f6ffnen",
+    "cloudFolders": "Cloud-Ordner"
   },
   "transfer": {
     "title": "\u00dcbertragung",
@@ -268,7 +276,17 @@
     "rollback": "Zur vorherigen Version zur\u00fcckkehren",
     "rollbackConfirm": "Sind Sie sicher, dass Sie zur vorherigen Version zur\u00fcckkehren m\u00f6chten?",
     "rollbackSuccess": "Erfolgreich zur\u00fcckgekehrt. Starten Sie neu, um anzuwenden.",
-    "rollbackFailed": "R\u00fcckkehr fehlgeschlagen: {{error}}"
+    "rollbackFailed": "R\u00fcckkehr fehlgeschlagen: {{error}}",
+    "languageSystem": "Systemstandard ({{name}})",
+    "languageHint": "Men\u00fcs, Seitenleiste, \u00dcberschriften der Einstellungen und das Tray-Men\u00fc verwenden diese Sprache; anderer Text ist noch auf Englisch.",
+    "notifications": "Benachrichtigungen",
+    "privacy": "Datenschutz",
+    "network": "Netzwerk",
+    "logging": "Protokollierung",
+    "startupTray": "Start & Tray",
+    "appLock": "App-Sperre",
+    "reset": "Zur\u00fccksetzen",
+    "accentColor": "Akzentfarbe"
   },
   "onboarding": {
     "welcome": "Willkommen bei der Einheitlichen Dateioperations-Plattform",
@@ -361,5 +379,11 @@
     "rollbackDescription": "Wenn die aktuelle Version Probleme hat, k\u00f6nnen Sie zur vorherigen Version zur\u00fcckkehren.",
     "differentialUpdate": "Differentielles Update wird heruntergeladen...",
     "fullUpdate": "Vollst\u00e4ndiges Update wird heruntergeladen..."
+  },
+  "nav": {
+    "back": "Zur\u00fcck",
+    "forward": "Vorw\u00e4rts",
+    "up": "Zum \u00fcbergeordneten Ordner",
+    "root": "Zum Stammverzeichnis"
   }
 }

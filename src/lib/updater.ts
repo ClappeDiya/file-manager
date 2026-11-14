@@ -13,6 +13,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { errorText } from "@/lib/error-text";
+import { inBlackout, loadManagedSettings, type ManagedUpdates } from "@/lib/managed-settings";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -161,11 +162,15 @@ interface UpdaterState {
   rollbackInfo: RollbackInfo | null;
   /** Previous installed version for rollback */
   previousVersion: string | null;
+  /** Update settings set by the organization's console (not persisted). */
+  managed: ManagedUpdates | null;
 
   // Actions
   checkForUpdates: () => Promise<void>;
   downloadAndInstall: () => Promise<void>;
   setChannel: (channel: UpdateChannel) => void;
+  /** Apply (or clear) the console's update settings. */
+  applyManaged: (managed: ManagedUpdates | null) => void;
   setAutoCheck: (autoCheck: boolean) => void;
   setAutoDownload: (autoDownload: boolean) => void;
   rollback: () => Promise<void>;
@@ -185,6 +190,7 @@ export const useUpdater = create<UpdaterState>()(
       lastChecked: null,
       rollbackInfo: null,
       previousVersion: null,
+      managed: null,
 
       checkForUpdates: async () => {
         const { status } = get();
@@ -228,8 +234,12 @@ export const useUpdater = create<UpdaterState>()(
       },
 
       downloadAndInstall: async () => {
-        const { status, updateInfo } = get();
+        const { status, updateInfo, managed } = get();
         if (status !== "available" || !updateInfo) return;
+        if (inBlackout(managed?.blackout)) {
+          set({ error: `Updates are paused by your organization until ${managed!.blackout!.end}` });
+          return;
+        }
 
         set({
           status: "downloading",
@@ -275,12 +285,26 @@ export const useUpdater = create<UpdaterState>()(
       },
 
       setChannel: (channel: UpdateChannel) => {
+        if (get().managed?.channel) return;
         set({ channel });
         // Invalidate cached API so next check uses new endpoint
         tauriUpdaterApi = null;
       },
 
-      setAutoCheck: (autoCheck: boolean) => set({ autoCheck }),
+      applyManaged: (managed) => {
+        set({ managed });
+        if (managed?.channel && managed.channel !== get().channel) {
+          set({ channel: managed.channel });
+          tauriUpdaterApi = null;
+        }
+        if (managed?.autoCheck !== null && managed?.autoCheck !== undefined) set({ autoCheck: managed.autoCheck });
+      },
+
+      setAutoCheck: (autoCheck: boolean) => {
+        const m = get().managed;
+        if (m?.autoCheck !== null && m?.autoCheck !== undefined) return;
+        set({ autoCheck });
+      },
       setAutoDownload: (autoDownload: boolean) => set({ autoDownload }),
 
       rollback: async () => {
@@ -347,27 +371,32 @@ function getCurrentAppVersion(): string {
  * Call once at app startup.
  */
 export function initAutoUpdateCheck(intervalMs = 4 * 60 * 60 * 1000): () => void {
-  const state = useUpdater.getState();
+  let stopped = false;
+  const refreshManaged = async () => {
+    const m = await loadManagedSettings();
+    if (!stopped) useUpdater.getState().applyManaged(m?.updates ?? null);
+  };
 
-  if (!state.autoCheck) {
-    return () => {};
-  }
-
-  // Check immediately if last check was > interval ago
-  const lastChecked = state.lastChecked ? new Date(state.lastChecked).getTime() : 0;
-  const now = Date.now();
-
-  if (now - lastChecked > intervalMs) {
-    state.checkForUpdates();
-  }
-
-  // Set up periodic check
-  const timer = setInterval(() => {
-    const current = useUpdater.getState();
-    if (current.autoCheck && current.status !== "downloading" && current.status !== "installing") {
-      current.checkForUpdates();
+  // The organization's settings first (they may turn checks off or pick the channel).
+  void refreshManaged().then(() => {
+    const state = useUpdater.getState();
+    const lastChecked = state.lastChecked ? new Date(state.lastChecked).getTime() : 0;
+    if (!stopped && state.autoCheck && Date.now() - lastChecked > intervalMs) {
+      void state.checkForUpdates();
     }
+  });
+
+  const timer = setInterval(() => {
+    void refreshManaged().then(() => {
+      const current = useUpdater.getState();
+      if (current.autoCheck && current.status !== "downloading" && current.status !== "installing") {
+        void current.checkForUpdates();
+      }
+    });
   }, intervalMs);
 
-  return () => clearInterval(timer);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }

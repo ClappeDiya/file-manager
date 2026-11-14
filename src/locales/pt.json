@@ -115,7 +115,15 @@
     "diskFull": "Espa\u00e7o em disco insuficiente",
     "copyingFiles": "Copiando {{count}} arquivos...",
     "movingFiles": "Movendo {{count}} arquivos...",
-    "deletingFiles": "Excluindo {{count}} arquivos..."
+    "deletingFiles": "Excluindo {{count}} arquivos...",
+    "folders": "Pastas",
+    "smart": "Inteligentes",
+    "copyPath": "Copiar caminho",
+    "deletePermanently": "Excluir permanentemente",
+    "openWith": "Abrir com...",
+    "extractHere": "Extrair aqui",
+    "openInNewWindow": "Abrir em nova janela",
+    "cloudFolders": "Pastas na nuvem"
   },
   "transfer": {
     "title": "Transfer\u00eancia",
@@ -268,7 +276,17 @@
     "rollback": "Reverter para Vers\u00e3o Anterior",
     "rollbackConfirm": "Tem certeza de que deseja reverter para a vers\u00e3o anterior?",
     "rollbackSuccess": "Revers\u00e3o bem-sucedida. Reinicie para aplicar.",
-    "rollbackFailed": "Revers\u00e3o falhou: {{error}}"
+    "rollbackFailed": "Revers\u00e3o falhou: {{error}}",
+    "languageSystem": "Padr\u00e3o do sistema ({{name}})",
+    "languageHint": "Os menus, a barra lateral, os t\u00edtulos das configura\u00e7\u00f5es e o menu da bandeja usam este idioma; o restante do texto ainda est\u00e1 em ingl\u00eas.",
+    "notifications": "Notifica\u00e7\u00f5es",
+    "privacy": "Privacidade",
+    "network": "Rede",
+    "logging": "Registro",
+    "startupTray": "Inicializa\u00e7\u00e3o e bandeja",
+    "appLock": "Bloqueio do aplicativo",
+    "reset": "Redefinir",
+    "accentColor": "Cor de destaque"
   },
   "onboarding": {
     "welcome": "Bem-vindo \u00e0 Plataforma Unificada de Opera\u00e7\u00f5es de Arquivos",
@@ -361,5 +379,11 @@
     "rollbackDescription": "Se a vers\u00e3o atual tiver problemas, voc\u00ea pode reverter para a vers\u00e3o anterior.",
     "differentialUpdate": "Baixando atualiza\u00e7\u00e3o diferencial...",
     "fullUpdate": "Baixando atualiza\u00e7\u00e3o completa..."
+  },
+  "nav": {
+    "back": "Voltar",
+    "forward": "Avan\u00e7ar",
+    "up": "Ir para a pasta superior",
+    "root": "Ir para a raiz"
   }
 }

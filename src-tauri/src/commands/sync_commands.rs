@@ -9,6 +9,7 @@ use crate::ledger::{LedgerEngine, LedgerStatus, OperationLedger, RecordEvent};
 use crate::storage::Repository;
 use crate::sync_engine::SyncManager;
 use tauri::State;
+use ufop_core::run_trigger::RunTrigger;
 use uuid::Uuid;
 
 // ── Helper ──
@@ -66,6 +67,10 @@ pub async fn create_sync_pair(
     checksum_enabled: Option<bool>,
     time_offset_secs: Option<i64>,
     options_json: Option<String>,
+    dest_state: Option<String>,
+    checksum_algorithm: Option<String>,
+    run_options_json: Option<String>,
+    option_overrides: Option<Vec<String>>,
     manager: State<'_, SyncManager>,
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
@@ -84,6 +89,7 @@ pub async fn create_sync_pair(
     let filter: SyncFilter = filter_json
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
+    ufop_core::sync::filter::validate(&filter)?;
 
     let copy_options: CopyOptions = match options_json {
         Some(j) => serde_json::from_str(&j).map_err(|e| AppError::Sync {
@@ -92,11 +98,22 @@ pub async fn create_sync_pair(
         })?,
         None => CopyOptions::default(),
     };
-    crate::sync_engine::copier::validate_options(&copy_options)?;
+    crate::sync_engine::copier::validate_for_mode(&copy_options, sync_mode)?;
+    let run_options: ufop_core::sync_types::SyncRunOptions = match run_options_json {
+        Some(j) => serde_json::from_str(&j).map_err(|e| AppError::Sync {
+            message: format!("Invalid run options: {}", e),
+            advice: "Check the pair's run options.".to_string(),
+        })?,
+        None => Default::default(),
+    };
+    ufop_core::sync::executor::validate_run_options(&run_options)?;
 
     let policy = conflict_policy
         .map(|s| SyncConflictPolicy::from_str_lossy(&s))
         .unwrap_or_default();
+    if let Some(own) = &option_overrides {
+        CopyOptions::validate_override_names(own)?;
+    }
 
     let verify = verify_mode
         .map(|s| SyncVerifyMode::from_str_lossy(&s))
@@ -118,6 +135,10 @@ pub async fn create_sync_pair(
         created_at: chrono::Utc::now(),
         time_offset_secs,
         copy_options,
+        dest_state: dest_state.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
+        checksum_algorithm: checksum_algorithm.and_then(|v| serde_json::from_value(serde_json::Value::String(v)).ok()).unwrap_or_default(),
+        run_options,
+        option_overrides,
     };
 
     use crate::core::traits::SyncOperations;
@@ -233,10 +254,69 @@ pub async fn update_sync_pair(
         message: format!("Invalid sync pair data: {}", e),
         advice: "Check the sync pair configuration.".to_string(),
     })?;
-    crate::sync_engine::copier::validate_options(&pair.copy_options)?;
+    crate::sync_engine::copier::validate_for_mode(&pair.copy_options, pair.mode)?;
+    ufop_core::sync::executor::validate_run_options(&pair.run_options)?;
+    ufop_core::sync::filter::validate(&pair.filter)?;
+    if let Some(own) = &pair.option_overrides {
+        CopyOptions::validate_override_names(own)?;
+    }
     let updated = manager.update_pair(pair).await?;
     manager.save_pair_to_db(&repo, &updated).await?;
     Ok(updated)
+}
+
+/// Stored sync runs, newest first (all pairs when `pair_id` is omitted).
+/// `date_from` / `date_to` (RFC 3339 instants) keep the runs that started in that range.
+#[tauri::command]
+pub async fn get_sync_run_history(
+    pair_id: Option<String>,
+    limit: Option<u32>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
+) -> Result<Vec<SyncReport>, AppError> {
+    let id = pair_id.as_deref().map(parse_uuid).transpose()?;
+    let (from, to) = crate::core::date_range::parse_range(date_from.as_deref(), date_to.as_deref())?;
+    manager.run_history_between(&repo, id, limit.unwrap_or(100), from, to).await
+}
+
+/// The files a running sync is working on and has finished, newest first
+/// (bounded; `limit` is capped). `null` when the pair is not syncing.
+#[tauri::command]
+pub async fn get_sync_live_files(
+    pair_id: String,
+    limit: Option<u32>,
+    manager: State<'_, SyncManager>,
+) -> Result<Option<crate::sync_engine::live_files::LiveFiles>, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    Ok(manager.live_files(id, limit.unwrap_or(200) as usize))
+}
+
+/// The files a stored sync run changed (copied, updated, deleted, failed…),
+/// one page at a time.
+#[tauri::command]
+pub async fn get_sync_run_items(
+    run_id: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
+) -> Result<crate::sync_engine::RunItemsPage, AppError> {
+    let id = parse_uuid(&run_id)?;
+    manager
+        .run_items(&repo, id, offset.unwrap_or(0), limit.unwrap_or(500))
+        .await?
+        .ok_or_else(|| AppError::Sync {
+            message: "That run is no longer in the history.".to_string(),
+            advice: "Older runs are removed when the history is trimmed.".to_string(),
+        })
+}
+
+/// Delete stored sync runs older than `days`.
+#[tauri::command]
+pub async fn prune_sync_run_history(days: u32, manager: State<'_, SyncManager>, repo: State<'_, Repository>) -> Result<usize, AppError> {
+    manager.prune_run_history(&repo, days).await
 }
 
 /// Run a sync for a pair.
@@ -247,8 +327,34 @@ pub async fn run_sync(
     ledger: State<'_, OperationLedger>,
     repo: State<'_, Repository>,
 ) -> Result<SyncReport, AppError> {
+    run_sync_pair(&manager, &ledger, &repo, &pair_id).await
+}
+
+/// Run a sync pair and record it like a UI-started run: persist `last_run`
+/// and the report, and emit the ledger event. Shared by the `run_sync`
+/// command, scheduled syncs and automation actions.
+pub async fn run_sync_pair(
+    manager: &SyncManager,
+    ledger: &OperationLedger,
+    repo: &Repository,
+    pair_id: &str,
+) -> Result<SyncReport, AppError> {
+    run_sync_pair_as(manager, ledger, repo, pair_id, RunTrigger::Manual).await
+}
+
+/// [`run_sync_pair`] for a run that something other than a person started
+/// (the scheduler, an automation action, the API): `trigger` is what the run
+/// history shows.
+pub async fn run_sync_pair_as(
+    manager: &SyncManager,
+    ledger: &OperationLedger,
+    repo: &Repository,
+    pair_id: &str,
+    trigger: RunTrigger,
+) -> Result<SyncReport, AppError> {
+    let pair_id = pair_id.to_string();
     let id = parse_uuid(&pair_id)?;
-    let result = manager.execute_sync(id).await;
+    let result = manager.execute_sync_as(id, trigger).await;
 
     // `execute_sync` stamps `last_run` on the in-memory pair. Without this the
     // field would silently revert to its last-saved value on restart — the
@@ -258,10 +364,16 @@ pub async fn run_sync(
         use crate::core::traits::SyncOperations;
         if let Ok(pairs) = manager.list_pairs().await {
             if let Some(pair) = pairs.into_iter().find(|p| p.id == id) {
-                if let Err(e) = manager.save_pair_to_db(&repo, &pair).await {
+                if let Err(e) = manager.save_pair_to_db(repo, &pair).await {
                     tracing::warn!("Failed to persist last_run for sync pair {id}: {e}");
                 }
             }
+        }
+    }
+
+    if let Ok(report) = &result {
+        if let Err(e) = manager.save_report_to_db(repo, report, 500).await {
+            tracing::warn!("Failed to store sync run history for {id}: {e}");
         }
     }
 
@@ -275,7 +387,7 @@ pub async fn run_sync(
                 SyncRunStatus::Running => LedgerStatus::Ok,
             };
             record_sync(
-                &ledger,
+                ledger,
                 "run",
                 status,
                 &pair_id,
@@ -296,7 +408,7 @@ pub async fn run_sync(
         }
         Err(e) => {
             record_sync(
-                &ledger,
+                ledger,
                 "run",
                 LedgerStatus::Failed,
                 &pair_id,
@@ -319,6 +431,89 @@ pub async fn get_sync_health(
 ) -> Result<SyncHealth, AppError> {
     let id = parse_uuid(&pair_id)?;
     Ok(manager.get_health(id).await)
+}
+
+// ── Duplicate, export / import, global defaults ──
+
+/// Copy a pair's definition: "<name> (copy)", a new id, no run history,
+/// and its schedule (or watcher) off until the user turns it on.
+#[tauri::command]
+pub async fn duplicate_sync_pair(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
+) -> Result<SyncPair, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    let copy = manager.duplicate_pair(id).await?;
+    manager.save_pair_to_db(&repo, &copy).await?;
+    record_sync(&ledger, "duplicate_pair", LedgerStatus::Ok, &copy.id.to_string(), format!("duplicate_pair: {pair_id} → {}", copy.name), None, None, None).await;
+    Ok(copy)
+}
+
+/// One pair as versioned JSON (`{"format":"ufop-sync-pair","version":1,…}`).
+#[tauri::command]
+pub async fn export_sync_pair(pair_id: String, manager: State<'_, SyncManager>, repo: State<'_, Repository>) -> Result<String, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    manager.export_pair(&repo, id).await
+}
+
+/// Create a pair from an export. `warnings` lists connections and folders
+/// this computer lacks; such a pair is created disabled.
+#[tauri::command]
+pub async fn import_sync_pair(
+    json: String,
+    manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
+    repo: State<'_, Repository>,
+) -> Result<crate::sync_engine::portable::ImportResult, AppError> {
+    let result = manager.import_pair(&repo, &json).await?;
+    record_sync(&ledger, "import_pair", LedgerStatus::Ok, &result.pair.id.to_string(), format!("import_pair: {}", result.pair.name), None, None, None).await;
+    Ok(result)
+}
+
+/// The global default copy options new pairs follow.
+#[tauri::command]
+pub async fn get_sync_default_options(manager: State<'_, SyncManager>) -> Result<CopyOptions, AppError> {
+    Ok(manager.default_options())
+}
+
+/// Save the global default copy options. Pairs that store only their own
+/// changes pick them up on their next run; older pairs are unaffected.
+#[tauri::command]
+pub async fn set_sync_default_options(
+    options: CopyOptions,
+    manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
+) -> Result<CopyOptions, AppError> {
+    manager.set_default_options(&repo, options).await
+}
+
+// ── Two-way baseline ──
+
+/// Size and age of a two-way pair's sync history (its baseline), or `null`
+/// before its first successful run.
+#[tauri::command]
+pub async fn get_sync_baseline_info(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+) -> Result<Option<crate::sync_engine::BaselineInfo>, AppError> {
+    let id = parse_uuid(&pair_id)?;
+    manager.baseline_info(id).await
+}
+
+/// Forget a two-way pair's sync history: the next run combines both sides
+/// again and deletes nothing.
+#[tauri::command]
+pub async fn reset_sync_baseline(
+    pair_id: String,
+    manager: State<'_, SyncManager>,
+    ledger: State<'_, OperationLedger>,
+) -> Result<(), AppError> {
+    let id = parse_uuid(&pair_id)?;
+    manager.reset_baseline(id).await?;
+    record_sync(&ledger, "reset_baseline", LedgerStatus::Ok, &pair_id, format!("reset_baseline: {pair_id}"), None, None, None).await;
+    Ok(())
 }
 
 // ── T-040: Dry-Run Preview ──
@@ -416,10 +611,18 @@ pub async fn export_sync_report_csv(
     pair_id: String,
     report_id: String,
     manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
 ) -> Result<String, AppError> {
     let pid = parse_uuid(&pair_id)?;
     let rid = parse_uuid(&report_id)?;
-    manager.export_report_csv(pid, rid).await
+    match manager.export_report_csv(pid, rid).await {
+        Ok(s) => Ok(s),
+        // Older runs live only in the stored history.
+        Err(e) => match manager.stored_report(&repo, rid).await? {
+            Some(r) => crate::sync_engine::report::export_report_csv(&r),
+            None => Err(e),
+        },
+    }
 }
 
 /// Export a sync report as JSON.
@@ -428,10 +631,18 @@ pub async fn export_sync_report_json(
     pair_id: String,
     report_id: String,
     manager: State<'_, SyncManager>,
+    repo: State<'_, Repository>,
 ) -> Result<String, AppError> {
     let pid = parse_uuid(&pair_id)?;
     let rid = parse_uuid(&report_id)?;
-    manager.export_report_json(pid, rid).await
+    match manager.export_report_json(pid, rid).await {
+        Ok(s) => Ok(s),
+        // Older runs live only in the stored history.
+        Err(e) => match manager.stored_report(&repo, rid).await? {
+            Some(r) => crate::sync_engine::report::export_report_json(&r),
+            None => Err(e),
+        },
+    }
 }
 
 /// Start filesystem watcher for a sync pair.

@@ -50,6 +50,15 @@ describe("buildComparisonRows", () => {
     expect(deleted.dest?.size).toBe(7);
   });
 
+  it("shows two-way source folder removals on the source side", () => {
+    const rows = buildComparisonRows({ ...preview, dirs_to_remove: [], source_dirs_to_remove: ["theirs"] });
+    const dir = rows.find((r) => r.path === "theirs")!;
+    expect(dir.change).toBe("rmdir");
+    expect(dir.direction).toBe("to_source");
+    expect(dir.source).not.toBeNull();
+    expect(dir.dest).toBeNull();
+  });
+
   it("includes skipped files only on request, and normalises Windows paths", () => {
     expect(buildComparisonRows(preview).some((r) => r.path === "tmp.log")).toBe(false);
     expect(buildComparisonRows(preview, true).some((r) => r.path === "tmp.log")).toBe(true);

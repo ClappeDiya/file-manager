@@ -10,6 +10,7 @@ struct StatusInfo {
     version: String,
     platform: String,
     arch: String,
+    profile: String,
     api_configured: bool,
     api_url: Option<String>,
     authenticated: bool,
@@ -26,6 +27,7 @@ pub async fn execute(
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        profile: config.profile_name().to_string(),
         api_configured: config.api_url.is_some(),
         api_url: config.api_url.clone(),
         authenticated: config.token.is_some(),
@@ -62,6 +64,7 @@ pub async fn execute(
             println!();
             println!("  UFOP CLI v{}", status.version);
             println!("  Platform: {} ({})", status.platform, status.arch);
+            println!("  Profile: {}", status.profile);
             println!();
             println!("  API Server: {}", status.api_url.as_deref().unwrap_or("not configured"));
             println!("  Authenticated: {}", if status.authenticated { "yes" } else { "no" });

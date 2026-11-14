@@ -229,4 +229,16 @@ describe("T-013: getDefaultCommands", () => {
     cmd?.action();
     expect(onQueueCopyTo).toHaveBeenCalled();
   });
+
+  it("exposes the folder compare commands", () => {
+    const onComparePanes = vi.fn();
+    const onCompareFolderWith = vi.fn();
+    const commands = getDefaultCommands({ onComparePanes, onCompareFolderWith });
+    commands.find((c) => c.id === "compare-panes")?.action();
+    commands.find((c) => c.id === "compare-folder-with")?.action();
+    expect(onComparePanes).toHaveBeenCalled();
+    expect(onCompareFolderWith).toHaveBeenCalled();
+    expect(commands.find((c) => c.id === "compare-panes")?.keywords).toContain("diff folders");
+  });
 });
+

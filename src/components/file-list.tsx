@@ -11,6 +11,7 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@ufop/ui-components";
+import { formatBytes } from "@/lib/format-bytes";
 import {
   ArrowUpDown,
   ArrowUp,
@@ -24,6 +25,8 @@ import {
   Film,
   Music,
 } from "lucide-react";
+import { hasThumbnail, useThumbnail } from "@/lib/thumbnails";
+import { isRemotePath } from "@/lib/location";
 import type { ViewMode } from "@/stores/file-manager-store";
 
 // ──────────────────────────────────────────────
@@ -47,11 +50,10 @@ export interface FileEntryData {
 // Utility functions
 // ──────────────────────────────────────────────
 
+/** File size in the units chosen in Settings → Appearance; "--" for 0. */
 export function formatFileSize(bytes: number): string {
   if (bytes === 0) return "--";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+  return formatBytes(bytes);
 }
 
 export function formatDate(dateStr: string | null): string {
@@ -777,6 +779,8 @@ function FileTableView({
     (e: React.KeyboardEvent) => {
       const maxIndex = rows.length - 1;
       let newIndex = focusedIndex;
+      // Alt/⌘+↑ goes to the parent folder (the pane's handler).
+      if (e.key === "ArrowUp" && (e.altKey || e.metaKey)) return;
 
       switch (e.key) {
         case "ArrowDown":
@@ -1170,6 +1174,23 @@ interface FileGridViewProps {
   onActivityDotClick?: (path: string) => void;
 }
 
+/** Grid cell icon: a thumbnail for images, else the folder/file glyph. */
+export function GridIcon({ entry }: { entry: FileEntryData }) {
+  const thumb = useThumbnail(entry.path, entry.name, !entry.is_dir, 96, entry.modified ?? "");
+  const noRemoteThumb = !entry.is_dir && hasThumbnail(entry.name) && isRemotePath(entry.path);
+  return (
+    <div className="flex items-center justify-center h-12 w-12" title={noRemoteThumb ? "No thumbnails for connection files: open the file to view it" : undefined}>
+      {thumb ? (
+        <img src={thumb} alt="" className="max-h-12 max-w-12 object-contain rounded-sm" draggable={false} data-testid="grid-thumbnail" />
+      ) : entry.is_dir ? (
+        <Folder className="h-10 w-10 text-[color:var(--color-primary)]" aria-hidden="true" />
+      ) : (
+        <File className="h-10 w-10 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
+      )}
+    </div>
+  );
+}
+
 function FileGridView({
   files,
   className,
@@ -1231,6 +1252,8 @@ function FileGridView({
       const cols = columnCount;
       const maxIndex = files.length - 1;
       let newIndex = focusedIndex;
+      // Alt/⌘+↑ goes to the parent folder (the pane's handler).
+      if (e.key === "ArrowUp" && (e.altKey || e.metaKey)) return;
 
       switch (e.key) {
         case "ArrowRight":
@@ -1363,13 +1386,7 @@ function FileGridView({
                     }}
                     data-testid={`file-grid-item-${globalIndex}`}
                   >
-                    <div className="flex items-center justify-center h-12 w-12">
-                      {entry.is_dir ? (
-                        <Folder className="h-10 w-10 text-[color:var(--color-primary)]" aria-hidden="true" />
-                      ) : (
-                        <File className="h-10 w-10 text-[color:var(--color-text-secondary)]" aria-hidden="true" />
-                      )}
-                    </div>
+                    <GridIcon entry={entry} />
                     <div className="flex items-center justify-center gap-1 w-full px-1 mt-1">
                       {activityMap?.[entry.path] && (
                         <ActivityDot

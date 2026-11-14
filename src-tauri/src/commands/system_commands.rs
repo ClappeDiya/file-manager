@@ -5,6 +5,13 @@ pub fn greet(name: &str) -> String {
 }
 
 /// Get application version.
+/// Portable mode: on/off, the folder and where credentials are kept
+/// (Settings → About this installation).
+#[tauri::command]
+pub fn get_portable_status(creds: tauri::State<'_, std::sync::Arc<crate::security::CredentialStore>>) -> crate::paths::PortableStatus {
+    crate::paths::status(creds.backend_name())
+}
+
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()

@@ -22,6 +22,8 @@ RUN pnpm install --frozen-lockfile --filter marketing... --prod=false
 # ---------------------------------------------------------------------------
 FROM deps AS build
 COPY CHANGELOG.md CHANGELOG.md
+# The published docs (marketing/src/lib/docs.ts) are rendered and indexed for search at build time.
+COPY docs docs
 COPY packages/design-tokens packages/design-tokens
 COPY packages/ui-components packages/ui-components
 COPY marketing marketing

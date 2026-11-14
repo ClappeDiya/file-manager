@@ -13,22 +13,33 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn create_automation_rule(
-    rule: AutomationRule,
+    mut rule: AutomationRule,
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule.id).await?;
+    mgr.sanitize_incoming(&mut rule).await;
     mgr.save_rule(&repo, &rule).await?;
+    mgr.rearm(&rule).await?;
     tracing::info!("Created automation rule '{}' ({})", rule.name, rule.id);
     Ok(rule)
 }
 
 #[tauri::command]
 pub async fn update_automation_rule(
-    rule: AutomationRule,
+    mut rule: AutomationRule,
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule.id).await?;
+    mgr.sanitize_incoming(&mut rule).await;
+    if let Some(wf) = &rule.workflow {
+        wf.validate().map_err(AppError::validation)?;
+    }
+    mgr.record_revision(&repo, &rule.id).await?;
     mgr.save_rule(&repo, &rule).await?;
+    // Restart the trigger so a changed watch path or cron takes effect.
+    mgr.rearm(&rule).await?;
     tracing::info!("Updated automation rule '{}' ({})", rule.name, rule.id);
     Ok(rule)
 }
@@ -39,6 +50,7 @@ pub async fn delete_automation_rule(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<(), AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     mgr.delete_rule(&repo, &rule_id).await?;
     tracing::info!("Deleted automation rule {}", rule_id);
     Ok(())
@@ -71,6 +83,7 @@ pub async fn enable_automation_rule(
     repo: State<'_, Repository>,
     mgr: State<'_, AutomationManager>,
 ) -> Result<(), AppError> {
+    mgr.ensure_editable(&rule_id).await?;
     mgr.set_enabled(&repo, &rule_id, enabled).await?;
     tracing::info!(
         "Automation rule {} {}",
@@ -90,6 +103,7 @@ pub async fn run_automation_rule(
     Ok(log)
 }
 
+/// Dry run: the files a rule would act on and the steps it would take.
 #[tauri::command]
 pub async fn test_automation_rule(
     rule: AutomationRule,
@@ -97,6 +111,69 @@ pub async fn test_automation_rule(
 ) -> Result<AutomationLog, AppError> {
     let log = mgr.test_rule(&rule).await?;
     Ok(log)
+}
+
+/// Approve the command lines a rule runs. The UI calls this only after
+/// showing the user the exact commands and getting their confirmation.
+#[tauri::command]
+pub async fn approve_automation_command(
+    rule_id: String,
+    repo: State<'_, Repository>,
+    mgr: State<'_, AutomationManager>,
+) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule_id).await?;
+    mgr.approve_commands(&repo, &rule_id).await
+}
+
+/// Duplicate a rule (disabled, without approvals or webhook secret).
+#[tauri::command]
+pub async fn clone_automation_rule(
+    rule_id: String,
+    repo: State<'_, Repository>,
+    mgr: State<'_, AutomationManager>,
+) -> Result<AutomationRule, AppError> {
+    mgr.clone_rule(&repo, &rule_id).await
+}
+
+/// Webhook URL details for a rule.
+#[derive(serde::Serialize)]
+pub struct WebhookInfo {
+    /// Full URL including the secret token (shown once).
+    pub url: String,
+    pub token: String,
+    pub listening: bool,
+}
+
+/// Issue a new webhook secret for a rule and return its URL (the secret is
+/// shown only now; only its hash is kept). Starts the local listener if it
+/// isn't running.
+#[tauri::command]
+pub async fn rotate_automation_webhook(
+    rule_id: String,
+    repo: State<'_, Repository>,
+    mgr: State<'_, AutomationManager>,
+) -> Result<WebhookInfo, AppError> {
+    mgr.ensure_editable(&rule_id).await?;
+    let token = mgr.rotate_webhook_secret(&repo, &rule_id).await?;
+    let addr = match mgr.webhook_addr() {
+        Some(a) => a,
+        None => mgr
+            .start_webhook_listener(webhook_bind_addr(&repo).await)
+            .await
+            .map_err(|e| AppError::state(format!("Cannot start the webhook listener: {e}"), "Another program may be using the port; change it in Settings."))?,
+    };
+    Ok(WebhookInfo { url: format!("http://{addr}/hooks/{rule_id}?token={token}"), token, listening: true })
+}
+
+/// Where the webhook listener binds: `automation_webhook_addr` config
+/// (e.g. `0.0.0.0:47321` to accept other machines), default loopback.
+pub async fn webhook_bind_addr(repo: &Repository) -> std::net::SocketAddr {
+    repo.get_config("automation_webhook_addr")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim_matches('"').parse().ok())
+        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], crate::automation_engine::webhook::DEFAULT_PORT)))
 }
 
 // ── Logs ──
@@ -280,4 +357,41 @@ pub async fn retry_failed_event(
         log.files_affected.len()
     );
     Ok(log)
+}
+
+/// Earlier versions of a rule (newest first).
+#[tauri::command]
+pub async fn automation_rule_revisions(rule_id: String, repo: State<'_, Repository>, mgr: State<'_, AutomationManager>) -> Result<Vec<crate::automation_engine::RuleRevision>, AppError> {
+    mgr.list_revisions(&repo, &rule_id).await
+}
+
+/// Put an earlier version of a rule back.
+#[tauri::command]
+pub async fn automation_restore_revision(rule_id: String, revision: i64, repo: State<'_, Repository>, mgr: State<'_, AutomationManager>) -> Result<AutomationRule, AppError> {
+    mgr.ensure_editable(&rule_id).await?;
+    let rule = mgr.restore_revision(&repo, &rule_id, revision).await?;
+    mgr.rearm(&rule).await?;
+    Ok(rule)
+}
+
+/// The workflow equivalent of a rule's actions (v1 → v2 conversion).
+#[tauri::command]
+pub async fn automation_convert_to_workflow(rule: AutomationRule) -> Result<crate::automation_engine::workflow::Workflow, AppError> {
+    Ok(rule.workflow.clone().unwrap_or_else(|| crate::automation_engine::workflow::Workflow::from_rule(&rule)))
+}
+
+/// How risky each action is (Low, Medium or High) and why, in the order
+/// given: the editor's per-step badges. Saving a rule with a High step asks
+/// the user to confirm first.
+#[tauri::command]
+pub async fn automation_action_risks(actions: Vec<crate::automation_engine::RuleAction>) -> Result<Vec<crate::automation_engine::risk::StepRisk>, AppError> {
+    Ok(actions.iter().map(crate::automation_engine::risk::action_risk).collect())
+}
+
+/// The steps of a rule that need an explicit yes before it is saved (High
+/// risk), named as the editor names them. Asked for on every save, in
+/// Standard and Advanced alike.
+#[tauri::command]
+pub async fn automation_rule_confirmations(rule: AutomationRule) -> Result<Vec<crate::automation_engine::risk::HighRiskStep>, AppError> {
+    Ok(crate::automation_engine::risk::needs_confirmation(&rule))
 }

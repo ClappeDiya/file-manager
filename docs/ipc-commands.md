@@ -13,9 +13,10 @@ from the React/TypeScript frontend via
 Each command is registered in `src-tauri/src/lib.rs`'s `invoke_handler`
 macro; if you add a new one here, register it there too.
 
-## `ai_commands` (18 commands)
+## `ai_commands` (20 commands)
 
 - `ai_accept_suggestion`
+- `ai_activity_report`
 - `ai_chat`
 - `ai_check_confirmation_needed`
 - `ai_clear_chat`
@@ -29,10 +30,19 @@ macro; if you add a new one here, register it there too.
 - `ai_get_feature_toggles`
 - `ai_get_ollama_model`
 - `ai_get_suggestions`
+- `ai_help`
 - `ai_parse_natural_language`
 - `ai_probe_ollama`
 - `ai_set_feature_toggles`
 - `ai_set_ollama_model`
+
+## `app_lock_commands` (5 commands)
+
+- `app_lock_activity`
+- `app_lock_now`
+- `app_lock_set_settings`
+- `app_lock_status`
+- `app_lock_unlock`
 
 ## `archive_commands` (4 commands)
 
@@ -41,9 +51,23 @@ macro; if you add a new one here, register it there too.
 - `archive_extract`
 - `archive_info`
 
-## `automation_commands` (16 commands)
+## `audit_commands` (4 commands)
 
+- `create_audit_anchor`
+- `export_audit_log`
+- `get_audit_log_status`
+- `verify_audit_log`
+
+## `automation_commands` (24 commands)
+
+- `approve_automation_command`
+- `automation_action_risks`
+- `automation_convert_to_workflow`
+- `automation_restore_revision`
+- `automation_rule_confirmations`
+- `automation_rule_revisions`
 - `clear_automation_logs`
+- `clone_automation_rule`
 - `create_automation_rule`
 - `delete_automation_rule`
 - `enable_automation_rule`
@@ -56,6 +80,7 @@ macro; if you add a new one here, register it there too.
 - `quickflow_suggestion_dismiss`
 - `quickflow_suggestions_list`
 - `retry_failed_event`
+- `rotate_automation_webhook`
 - `run_automation_rule`
 - `test_automation_rule`
 - `update_automation_rule`
@@ -69,18 +94,156 @@ macro; if you add a new one here, register it there too.
 - `resolve_aws_profile`
 - `start_sso_auth`
 
-## `batch_rename_commands` (3 commands)
+## `backup_commands` (111 commands)
+
+- `backup_adopt_repository`
+- `backup_apply_template`
+- `backup_bench`
+- `backup_break_lock`
+- `backup_browse_remote`
+- `backup_bug_report`
+- `backup_cache_stats`
+- `backup_cancel`
+- `backup_capabilities`
+- `backup_change_passphrase`
+- `backup_cleanup_databases`
+- `backup_clear_cache`
+- `backup_close_drive`
+- `backup_cloud_providers`
+- `backup_compare`
+- `backup_crypt_file`
+- `backup_database_inventory`
+- `backup_decrypt_volume`
+- `backup_delete_destination`
+- `backup_delete_job`
+- `backup_delete_notification_profile`
+- `backup_delete_template`
+- `backup_diagnose`
+- `backup_direct_restore`
+- `backup_discover_remote_config`
+- `backup_effective_caps`
+- `backup_effective_job`
+- `backup_effective_settings`
+- `backup_estimate`
+- `backup_execute`
+- `backup_export_cli`
+- `backup_export_config`
+- `backup_export_file`
+- `backup_export_is_encrypted`
+- `backup_export_templates`
+- `backup_generate_passphrase`
+- `backup_get_cache_settings`
+- `backup_get_desktop_settings`
+- `backup_get_global_defaults`
+- `backup_get_job`
+- `backup_get_notification_profile`
+- `backup_get_secret_settings`
+- `backup_get_template`
+- `backup_hardening_report`
+- `backup_has_destination_secret`
+- `backup_import_config`
+- `backup_import_templates`
+- `backup_job_placeholders`
+- `backup_list_destinations`
+- `backup_list_drives`
+- `backup_list_files`
+- `backup_list_jobs`
+- `backup_list_notification_profiles`
+- `backup_list_sources`
+- `backup_list_templates`
+- `backup_list_versions`
+- `backup_lock_status`
+- `backup_open_drive`
+- `backup_open_point_in_time`
+- `backup_passphrase_strength`
+- `backup_pause`
+- `backup_photos_libraries`
+- `backup_photos_library_info`
+- `backup_place_legal_hold`
+- `backup_preview_file`
+- `backup_preview_notification`
+- `backup_preview_retention`
+- `backup_preview_sources`
+- `backup_prune_history`
+- `backup_read_file`
+- `backup_recovery_convert`
+- `backup_recovery_download`
+- `backup_recovery_index`
+- `backup_recovery_list`
+- `backup_recovery_restore`
+- `backup_release_legal_hold`
+- `backup_remote_delete`
+- `backup_remote_get`
+- `backup_remote_list`
+- `backup_remote_put`
+- `backup_replica_history`
+- `backup_resolve_version`
+- `backup_resume`
+- `backup_run`
+- `backup_run_all`
+- `backup_run_history`
+- `backup_save_destination`
+- `backup_save_job`
+- `backup_save_notification_profile`
+- `backup_save_template`
+- `backup_schedule_preview`
+- `backup_search`
+- `backup_set_cache_settings`
+- `backup_set_database_encryption`
+- `backup_set_desktop_settings`
+- `backup_set_destination_secret`
+- `backup_set_global_defaults`
+- `backup_set_secret_settings`
+- `backup_set_version_metadata`
+- `backup_start_operation`
+- `backup_status`
+- `backup_test_destination`
+- `backup_test_destination_compat`
+- `backup_test_notification`
+- `backup_test_notification_profile`
+- `backup_test_secret_providers`
+- `backup_webhook_preset`
+- `desktop_metrics_configure`
+- `desktop_metrics_status`
+- `duplicate_backup_job`
+- `ediscovery_export`
+
+## `batch_rename_commands` (4 commands)
 
 - `batch_rename_apply`
 - `batch_rename_preview`
 - `batch_rename_undo`
+- `naming_preview`
+
+## `chat_control_commands` (3 commands)
+
+- `chat_control_get`
+- `chat_control_save`
+- `chat_control_status`
+
+## `compare_commands` (5 commands)
+
+- `compare_apply`
+- `compare_cancel`
+- `compare_folders`
+- `compare_plan_action`
+- `compare_release`
+
+## `compat_commands` (5 commands)
+
+- `compat_fix_names`
+- `compat_list_renames`
+- `compat_profiles`
+- `compat_restore_names`
+- `compat_scan_folder`
 
 ## `confirmation_commands` (1 command)
 
 - `request_destructive_confirmation`
 
-## `connection_commands` (17 commands)
+## `connection_commands` (20 commands)
 
+- `clear_connection_credentials_rejected`
 - `create_connection_group`
 - `delete_connection`
 - `delete_connection_group`
@@ -90,22 +253,42 @@ macro; if you add a new one here, register it there too.
 - `import_connections`
 - `import_from_third_party`
 - `list_connection_groups`
+- `list_connection_status`
 - `list_connections`
 - `list_ssh_agents`
 - `list_ssh_config_hosts`
 - `resolve_ssh_config`
 - `save_connection`
 - `search_connections`
+- `set_connection_starred`
 - `set_global_proxy`
 - `test_connection`
 
-## `connector_commands` (5 commands)
+## `connector_commands` (17 commands)
 
+- `connection_presets`
 - `connector_connect`
 - `connector_disconnect`
+- `connector_download`
+- `connector_fetch_preview`
+- `connector_folder_size`
+- `connector_folder_size_cancel`
 - `connector_is_connected`
 - `connector_list_protocols`
 - `connector_list_remote`
+- `connector_make_directory`
+- `connector_quota`
+- `connector_remove`
+- `connector_rename`
+- `connector_stat`
+- `connector_upload`
+- `rclone_list_remotes`
+
+## `convert_commands` (3 commands)
+
+- `convert_capabilities`
+- `convert_documents`
+- `convert_images`
 
 ## `custom_commands` (6 commands)
 
@@ -115,6 +298,15 @@ macro; if you add a new one here, register it there too.
 - `generate_script`
 - `list_custom_commands`
 - `save_custom_command`
+
+## `desktop_commands` (6 commands)
+
+- `detect_cloud_folders`
+- `get_startup_settings`
+- `open_new_window`
+- `reset_settings`
+- `set_startup_settings`
+- `set_ui_language`
 
 ## `drive_commands` (6 commands)
 
@@ -139,7 +331,27 @@ macro; if you add a new one here, register it there too.
 - `start_file_watch`
 - `stop_file_watch`
 
-## `encryption_commands` (19 commands)
+## `editor_draft_commands` (4 commands)
+
+- `editor_draft_discard`
+- `editor_draft_list`
+- `editor_draft_load`
+- `editor_draft_save`
+
+## `embedded_server_commands` (10 commands)
+
+- `embedded_server_save_settings`
+- `embedded_server_set_password`
+- `embedded_server_start`
+- `embedded_server_status`
+- `embedded_server_stop`
+- `open_server_in_browser`
+- `server_profile_remove`
+- `server_profile_save`
+- `server_profile_test`
+- `server_profiles_list`
+
+## `encryption_commands` (20 commands)
 
 - `add_encryption_policy`
 - `change_vault_password`
@@ -157,15 +369,22 @@ macro; if you add a new one here, register it there too.
 - `list_vaults`
 - `lock_vault`
 - `remove_encryption_policy`
+- `tls_fetch_fingerprint`
 - `unlock_vault`
 - `vault_decrypt_file`
 - `vault_encrypt_file`
 
-## `file_ops_commands` (25 commands)
+## `feedback_commands` (2 commands)
+
+- `feedback_destination`
+- `feedback_submit`
+
+## `file_ops_commands` (26 commands)
 
 - `cloud_delete_permanently`
 - `cloud_delete_to_trash`
 - `copy_files`
+- `copy_files_to_many`
 - `copy_path`
 - `copy_relative_path`
 - `copy_remote_path`
@@ -189,14 +408,53 @@ macro; if you add a new one here, register it there too.
 - `set_permissions`
 - `undo_file_operation`
 
-## `fs_commands` (4 commands)
+## `filter_commands` (5 commands)
+
+- `delete_user_filter_preset`
+- `get_filter_groups`
+- `list_user_filter_presets`
+- `parse_filter_rules`
+- `save_user_filter_preset`
+
+## `fleet_agent_commands` (13 commands)
+
+- `fleet_agent_cancel_claim`
+- `fleet_agent_connect_cancel`
+- `fleet_agent_connect_finish`
+- `fleet_agent_connect_start`
+- `fleet_agent_get_limits`
+- `fleet_agent_poll_claim`
+- `fleet_agent_register`
+- `fleet_agent_set_enabled`
+- `fleet_agent_set_limits`
+- `fleet_agent_start_claim`
+- `fleet_agent_status`
+- `fleet_agent_sync_now`
+- `fleet_agent_unregister`
+
+## `fs_commands` (6 commands)
 
 - `list_directory`
+- `pick_files`
 - `pick_folder`
+- `pick_save_file`
 - `read_text_file_full`
 - `write_text_file_full`
 
-## `integrity_commands` (16 commands)
+## `gpg_commands` (10 commands)
+
+- `gpg_decrypt_files`
+- `gpg_encrypt_files`
+- `gpg_export_public`
+- `gpg_generate_key`
+- `gpg_import_keys`
+- `gpg_list_keys`
+- `gpg_recrypt_files`
+- `gpg_sign_files`
+- `gpg_status`
+- `gpg_verify`
+
+## `integrity_commands` (25 commands)
 
 - `integrity_checksum`
 - `integrity_create_smart_folder`
@@ -207,13 +465,22 @@ macro; if you add a new one here, register it there too.
 - `integrity_get_file_info`
 - `integrity_list_smart_folders`
 - `integrity_list_tags`
+- `integrity_metadata_keys`
 - `integrity_remove_label`
+- `integrity_remove_metadata`
 - `integrity_resolve_duplicates`
 - `integrity_run_smart_folder`
+- `integrity_search_metadata`
 - `integrity_set_label`
+- `integrity_set_metadata`
 - `integrity_tag_file`
 - `integrity_untag_file`
 - `integrity_verify`
+- `metadata_check_compliance`
+- `metadata_delete_schema`
+- `metadata_list_schemas`
+- `metadata_save_schema`
+- `metadata_schema_for`
 
 ## `ledger_commands` (10 commands)
 
@@ -232,17 +499,22 @@ macro; if you add a new one here, register it there too.
 
 - `get_file_lineage`
 
-## `log_commands` (9 commands)
+## `log_commands` (14 commands)
 
 - `add_trusted_host_ca`
 - `check_gssapi_available`
+- `diagnostics_create`
+- `diagnostics_send`
 - `export_logs_json`
 - `export_logs_to_file`
 - `get_log_directory`
 - `get_log_level`
+- `get_log_retention`
 - `list_trusted_host_cas`
+- `query_logs`
 - `remove_trusted_host_ca`
 - `set_log_level`
+- `set_log_retention`
 
 ## `master_password_commands` (9 commands)
 
@@ -256,15 +528,25 @@ macro; if you add a new one here, register it there too.
 - `set_master_password`
 - `verify_master_password`
 
-## `mount_commands` (7 commands)
+## `mount_commands` (17 commands)
 
 - `check_mount_capability`
 - `delete_mount_config`
+- `free_drive_letters`
 - `get_mount_status`
 - `list_mounts`
+- `mount_cache_usage`
+- `mount_clear_cache`
+- `mount_pin_offline`
+- `mount_policy`
 - `mount_remote`
+- `mount_saved_config`
+- `open_mount_point`
 - `save_mount_config`
+- `saved_mount_options`
+- `unmount_all_mounts`
 - `unmount_remote`
+- `update_mount_config`
 
 ## `narrator_commands` (1 command)
 
@@ -284,9 +566,30 @@ macro; if you add a new one here, register it there too.
 - `send_notification`
 - `set_notification_prefs`
 
-## `peer_commands` (29 commands)
+## `oauth_commands` (12 commands)
+
+- `dropbox_list_namespaces`
+- `gdrive_list_shared_drives`
+- `oauth_await`
+- `oauth_begin`
+- `oauth_cancel`
+- `oauth_complete`
+- `oauth_import_grant`
+- `oauth_provider_info`
+- `oauth_sign_out`
+- `oauth_status`
+- `onedrive_list_site_libraries`
+- `onedrive_search_sites`
+
+## `operations_commands` (2 commands)
+
+- `operations_cancel`
+- `operations_snapshot`
+
+## `peer_commands` (33 commands)
 
 - `peer_cancel_transfer`
+- `peer_clear_finished`
 - `peer_connect_manual`
 - `peer_get_peer`
 - `peer_get_transfer_progress`
@@ -296,6 +599,7 @@ macro; if you add a new one here, register it there too.
 - `peer_list_pending_requests`
 - `peer_list_saved`
 - `peer_list_transfers`
+- `peer_local_info`
 - `peer_remove_saved`
 - `peer_request_transfer`
 - `peer_respond_transfer`
@@ -303,7 +607,9 @@ macro; if you add a new one here, register it there too.
 - `peer_set_display_name`
 - `peer_set_trust`
 - `peer_start_discovery`
+- `peer_start_listener`
 - `peer_stop_discovery`
+- `peer_stop_listener`
 - `server_transfer_cancel`
 - `server_transfer_capability_matrix`
 - `server_transfer_cleanup`
@@ -316,10 +622,43 @@ macro; if you add a new one here, register it there too.
 - `server_transfer_retry`
 - `server_transfer_start`
 
-## `preview_commands` (2 commands)
+## `policy_commands` (3 commands)
+
+- `filename_policies_list`
+- `filename_policies_save`
+- `filename_policy_check`
+
+## `preview_commands` (3 commands)
 
 - `preview_file`
 - `preview_get_exif`
+- `preview_office_render`
+
+## `proxy_commands` (4 commands)
+
+- `managed_settings_get`
+- `proxy_get`
+- `proxy_set`
+- `proxy_test`
+
+## `rclone_commands` (16 commands)
+
+- `rclone_config_cancel`
+- `rclone_config_continue`
+- `rclone_config_oauth`
+- `rclone_crypt_info`
+- `rclone_cryptdecode`
+- `rclone_detect`
+- `rclone_install_managed`
+- `rclone_providers`
+- `rclone_remote_create`
+- `rclone_remote_delete`
+- `rclone_remote_get`
+- `rclone_remote_test`
+- `rclone_remote_update`
+- `rclone_settings_get`
+- `rclone_settings_set`
+- `rclone_status`
 
 ## `s3_commands` (18 commands)
 
@@ -347,6 +686,27 @@ macro; if you add a new one here, register it there too.
 - `safety_assess_intent`
 - `safety_confirm_intent`
 
+## `schedule_commands` (9 commands)
+
+- `calendar_delete`
+- `calendar_import_ics`
+- `calendar_save`
+- `calendars_list`
+- `schedule_delete`
+- `schedule_preview`
+- `schedule_save`
+- `schedules_list`
+- `upcoming_runs`
+
+## `search_commands` (6 commands)
+
+- `search_files_query`
+- `search_index_add`
+- `search_index_cancel`
+- `search_index_refresh`
+- `search_index_remove`
+- `search_index_roots`
+
 ## `settings_commands` (11 commands)
 
 - `export_all_settings`
@@ -361,6 +721,12 @@ macro; if you add a new one here, register it there too.
 - `sync_settings_from_dir`
 - `sync_settings_to_dir`
 
+## `share_commands` (3 commands)
+
+- `connector_create_share_link`
+- `sharing_policy_get`
+- `sharing_policy_set`
+
 ## `space_commands` (9 commands)
 
 - `activate_space`
@@ -373,9 +739,11 @@ macro; if you add a new one here, register it there too.
 - `list_spaces`
 - `update_space`
 
-## `ssh_key_commands` (2 commands)
+## `ssh_key_commands` (4 commands)
 
+- `forget_known_host`
 - `generate_ssh_key`
+- `list_known_hosts`
 - `list_ssh_keys`
 
 ## `state_commands` (6 commands)
@@ -387,40 +755,52 @@ macro; if you add a new one here, register it there too.
 - `save_workspace_state`
 - `set_config`
 
-## `sync_commands` (24 commands)
+## `sync_commands` (35 commands)
 
 - `cancel_sync`
 - `create_sync_pair`
 - `delete_sync_pair`
 - `detect_time_offset`
+- `duplicate_sync_pair`
+- `export_sync_pair`
 - `export_sync_preview_csv`
 - `export_sync_report_csv`
 - `export_sync_report_json`
 - `get_quarantine_entries`
+- `get_sync_baseline_info`
 - `get_sync_conflicts`
+- `get_sync_default_options`
 - `get_sync_filter_presets`
 - `get_sync_health`
+- `get_sync_live_files`
 - `get_sync_progress`
 - `get_sync_reports`
+- `get_sync_run_history`
+- `get_sync_run_items`
+- `import_sync_pair`
 - `list_sync_pairs`
 - `parse_robocopy_command`
+- `prune_sync_run_history`
+- `reset_sync_baseline`
 - `resolve_sync_conflict`
 - `robocopy_command_preview`
 - `rollback_sync`
 - `run_sync`
+- `set_sync_default_options`
 - `start_sync_watcher`
 - `stop_sync_watcher`
 - `sync_dry_run`
 - `update_sync_pair`
 - `validate_sync_cron`
 
-## `system_commands` (3 commands)
+## `system_commands` (4 commands)
 
 - `get_app_version`
 - `get_platform_info`
+- `get_portable_status`
 - `greet`
 
-## `terminal_commands` (10 commands)
+## `terminal_commands` (12 commands)
 
 - `terminal_close_session`
 - `terminal_create_local`
@@ -428,22 +808,32 @@ macro; if you add a new one here, register it there too.
 - `terminal_escape_path`
 - `terminal_get_default_shell`
 - `terminal_get_layout`
+- `terminal_help_commands`
 - `terminal_list_sessions`
+- `terminal_read_scrollback`
 - `terminal_resize`
 - `terminal_set_layout`
 - `terminal_write`
 
-## `transfer_commands` (35 commands)
+## `thumbnail_commands` (2 commands)
+
+- `thumbnail_cache_clear`
+- `thumbnail_get`
+
+## `transfer_commands` (40 commands)
 
 - `cancel_transfer`
 - `check_conflict`
 - `cleanup_transfer_history`
 - `complete_transfer`
 - `compute_checksum`
+- `enqueue_location_transfer`
 - `enqueue_transfer`
 - `export_transfer_history`
 - `fail_transfer`
+- `get_bandwidth_schedule`
 - `get_completion_hooks`
+- `get_failed_transfer_retention`
 - `get_throttle_config`
 - `get_transfer`
 - `get_transfer_config`
@@ -457,10 +847,12 @@ macro; if you add a new one here, register it there too.
 - `retry_all_failed`
 - `retry_transfer`
 - `search_transfer_history`
+- `set_bandwidth_schedule`
 - `set_checksum_algorithm`
 - `set_completion_hooks`
 - `set_conflict_policy`
 - `set_connection_throttle`
+- `set_failed_transfer_retention`
 - `set_global_throttle`
 - `set_retry_policy`
 - `set_transfer_config`
@@ -494,4 +886,4 @@ macro; if you add a new one here, register it there too.
 
 ---
 
-**Surface:** 365 commands across 38 modules.
+**Surface:** 688 commands across 61 modules.

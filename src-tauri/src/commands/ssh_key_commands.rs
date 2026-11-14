@@ -121,29 +121,27 @@ pub async fn generate_ssh_key(
         // No passphrase — pass empty string via -N (safe, no secret to leak)
         cmd.arg("-N").arg("");
     } else {
-        // Create a temporary askpass script that echoes the passphrase
-        let askpass_dir = std::env::temp_dir();
-        let askpass_path = askpass_dir.join(format!("ufop_askpass_{}.sh", std::process::id()));
-        // Write script: #!/bin/sh\necho '<escaped_pass>'
+        // A temporary askpass script that echoes the passphrase, created
+        // exclusively and owner-only in this user's private temp folder (a
+        // fixed name in a shared /tmp could be read or pre-planted by
+        // another user of the machine).
         let escaped_pass = pass.replace('\'', "'\\''");
-        std::fs::write(&askpass_path, format!("#!/bin/sh\necho '{escaped_pass}'"))
+        let askpass_path = ufop_core::session::user_temp_dir()
+            .and_then(|dir| ufop_core::session::private_file(&dir, &format!("askpass-{}.sh", uuid::Uuid::new_v4().simple()), format!("#!/bin/sh\necho '{escaped_pass}'\n").as_bytes(), 0o700))
             .map_err(|e| AppError::Sync {
                 message: format!("Failed to create askpass helper: {e}"),
                 advice: "Check temp directory permissions.".to_string(),
             })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| AppError::Sync {
-                    message: format!("Failed to set askpass permissions: {e}"),
-                    advice: "Check temp directory permissions.".to_string(),
-                })?;
-        }
-        cmd.arg("-N").arg(""); // Trigger passphrase prompt
+        // No -N: ssh-keygen asks for the new passphrase (and its confirmation)
+        // through SSH_ASKPASS, so it never appears on the command line.
+        // (`-N ""` here used to set an empty passphrase.)
         cmd.env("SSH_ASKPASS", &askpass_path);
         cmd.env("SSH_ASKPASS_REQUIRE", "force");
-        cmd.env("DISPLAY", ":0"); // Required to trigger SSH_ASKPASS
+        // Older OpenSSH needs some DISPLAY to use SSH_ASKPASS; never replace the
+        // session's own (":0" may be another user's desktop on a shared host).
+        if std::env::var_os("DISPLAY").is_none() {
+            cmd.env("DISPLAY", ":0");
+        }
 
         // ssh-keygen needs no controlling terminal to use SSH_ASKPASS
         cmd.stdin(std::process::Stdio::null());
@@ -301,3 +299,57 @@ pub struct SshKeyInfo {
     pub public_key_path: String,
     pub algorithm: String,
 }
+
+// ── Trusted host keys ──
+
+/// SSH host keys the app trusts (accepted on first use). Keys trusted in
+/// `~/.ssh/known_hosts` are honoured too but not listed here.
+#[tauri::command]
+pub async fn list_known_hosts() -> Result<Vec<crate::connectors::known_hosts::KnownHostEntry>, AppError> {
+    Ok(crate::connectors::known_hosts::KnownHostsStore::shared().list().await)
+}
+
+/// Forget the trusted keys of a host so its new key can be accepted after a
+/// legitimate change (server rebuilt or re-keyed). Returns how many keys
+/// were removed.
+#[tauri::command]
+pub async fn forget_known_host(host: String, port: u16) -> Result<usize, AppError> {
+    crate::connectors::known_hosts::KnownHostsStore::shared()
+        .forget(&host, port)
+        .await
+        .map_err(|e| AppError::file_op(format!("Could not update the host-key store: {e}"), "Check that the app's data folder is writable."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keygen_available() -> bool {
+        std::process::Command::new("ssh-keygen").arg("-?").output().is_ok()
+    }
+
+    /// Regression: with a passphrase the key was still made with `-N ""`
+    /// (an empty passphrase), and the askpass helper sat under a fixed name
+    /// in the shared temp folder.
+    #[tokio::test]
+    async fn passphrase_protects_the_key_and_leaves_no_helper_behind() {
+        if !keygen_available() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let key = d.path().join("id_test");
+        generate_ssh_key(None, Some("correct horse 'battery'".into()), Some(key.to_string_lossy().into()), Some("t".into())).await.unwrap();
+        // Without the passphrase the private key does not load; with it, it does.
+        let try_load = |pass: &str| std::process::Command::new("ssh-keygen").args(["-y", "-P", pass, "-f"]).arg(&key).output().unwrap().status.success();
+        assert!(!try_load(""), "the key must not open without its passphrase");
+        assert!(try_load("correct horse 'battery'"));
+        let helpers: Vec<_> = std::fs::read_dir(ufop_core::session::user_temp_dir().unwrap()).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("askpass-")).collect();
+        assert!(helpers.is_empty(), "askpass helper removed");
+
+        // Without a passphrase: an unencrypted key, as asked.
+        let plain = d.path().join("id_plain");
+        generate_ssh_key(None, None, Some(plain.to_string_lossy().into()), None).await.unwrap();
+        assert!(std::process::Command::new("ssh-keygen").args(["-y", "-P", "", "-f"]).arg(&plain).output().unwrap().status.success());
+    }
+}
+

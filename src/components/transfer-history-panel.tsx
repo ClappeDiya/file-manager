@@ -2,14 +2,20 @@
  * Transfer History Panel (T-018 Frontend)
  *
  * Features:
- * - Searchable transfer history by path, date, status, connection
- * - Export as CSV/JSON
+ * - Searchable transfer history by path, date range (Today … Custom), status
+ * - Export as CSV/JSON (the same filters)
+ * - Open the source / destination folder of a transfer
  * - Display checksum verification status
  * - 90-day retention with cleanup
  */
 import { useState, useCallback, useEffect } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
+import { HistoryRangeChips } from "@/components/history-range-chips";
+import { FailedRetentionSettings } from "@/components/failed-retention-settings";
+import { ALL_TIME, formatLocalTime, rangeArgs, type HistoryRange } from "@/lib/history-range";
+import { canOpen, localTarget, openTarget } from "@/lib/open-location";
+import { isRemotePath } from "@/lib/transfer-direction";
 
 interface TransferHistoryRecord {
   id: string;
@@ -41,12 +47,10 @@ function formatDuration(ms: number | null): string {
   return `${mins}m ${secs}s`;
 }
 
-function formatDate(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString();
-  } catch {
-    return iso;
-  }
+/** The folder a transfer path lives in (the path itself when it is a folder name). */
+function folderOf(path: string): string {
+  const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return cut > 0 ? path.slice(0, cut) : path;
 }
 
 function fileName(path: string): string {
@@ -59,6 +63,10 @@ export function TransferHistoryPanel() {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const [range, setRange] = useState<HistoryRange>(ALL_TIME);
+  const [openError, setOpenError] = useState<string | null>(null);
+
+  const reveal = async (path: string) => setOpenError(await openTarget(localTarget(path)));
 
   const search = useCallback(async () => {
     setLoading(true);
@@ -71,6 +79,7 @@ export function TransferHistoryPanel() {
           connectionId: null,
           limit: 100,
           offset: 0,
+          ...rangeArgs(range),
         }
       );
       setRecords(result);
@@ -79,7 +88,7 @@ export function TransferHistoryPanel() {
     } finally {
       setLoading(false);
     }
-  }, [searchQuery, statusFilter]);
+  }, [searchQuery, statusFilter, range]);
 
   useEffect(() => {
     search();
@@ -92,6 +101,7 @@ export function TransferHistoryPanel() {
           format,
           pathContains: searchQuery || null,
           status: statusFilter || null,
+          ...rangeArgs(range),
         });
 
         const mimeType =
@@ -108,7 +118,7 @@ export function TransferHistoryPanel() {
         console.error("Failed to export:", err);
       }
     },
-    [searchQuery, statusFilter]
+    [searchQuery, statusFilter, range]
   );
 
   const handleCleanup = useCallback(async () => {
@@ -180,6 +190,16 @@ export function TransferHistoryPanel() {
         </select>
       </div>
 
+      <div className="px-3 py-2 border-b border-gray-200 dark:border-gray-700">
+        <HistoryRangeChips value={range} onChange={setRange} />
+        <FailedRetentionSettings />
+        {openError && (
+          <div className="mt-1 text-[11px] text-red-600" role="alert">
+            {openError}
+          </div>
+        )}
+      </div>
+
       {/* History records */}
       <div className="flex-1 overflow-y-auto">
         {loading ? (
@@ -188,7 +208,7 @@ export function TransferHistoryPanel() {
           </div>
         ) : records.length === 0 ? (
           <div className="flex items-center justify-center h-24 text-sm text-gray-400">
-            No transfer history
+            {range.preset === "all" && !searchQuery && !statusFilter ? "No transfer history" : "No transfers match"}
           </div>
         ) : (
           <table className="w-full text-xs" role="table">
@@ -201,6 +221,7 @@ export function TransferHistoryPanel() {
                 <th className="text-right px-2 py-1.5 font-medium">Speed</th>
                 <th className="text-left px-2 py-1.5 font-medium">Checksum</th>
                 <th className="text-left px-2 py-1.5 font-medium">Date</th>
+                <th className="text-left px-2 py-1.5 font-medium">Open</th>
               </tr>
             </thead>
             <tbody>
@@ -262,7 +283,29 @@ export function TransferHistoryPanel() {
                     )}
                   </td>
                   <td className="px-2 py-1.5 whitespace-nowrap">
-                    {formatDate(record.started_at)}
+                    {formatLocalTime(record.started_at)}
+                  </td>
+                  <td className="px-2 py-1.5 whitespace-nowrap">
+                    <button
+                      type="button"
+                      onClick={() => void reveal(folderOf(record.source_path))}
+                      disabled={isRemotePath(record.source_path) || !canOpen(localTarget(record.source_path))}
+                      className="text-[11px] px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-40"
+                      aria-label={`Open source of ${fileName(record.source_path)}`}
+                      title={record.source_path}
+                    >
+                      Source
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void reveal(folderOf(record.dest_path))}
+                      disabled={isRemotePath(record.dest_path) || !canOpen(localTarget(record.dest_path))}
+                      className="text-[11px] px-1.5 py-0.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-40"
+                      aria-label={`Open destination of ${fileName(record.dest_path)}`}
+                      title={record.dest_path}
+                    >
+                      Destination
+                    </button>
                   </td>
                 </tr>
               ))}

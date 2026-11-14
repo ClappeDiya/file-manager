@@ -78,7 +78,7 @@ list_mode = (sys.argv[1] == "true")
 USER_FACING_PREFIXES = (
     "VITE_", "NEXT_PUBLIC_", "NEXTAUTH_", "ADMIN_", "GITHUB_", "GOOGLE_",
     "DROPBOX_", "ONEDRIVE_", "B2_", "AI_", "TAURI_", "DATABASE_URL",
-    "GOOGLE_DRIVE_", "TELEMETRY_",
+    "GOOGLE_DRIVE_", "TELEMETRY_", "STRIPE_", "BILLING_",
 )
 # OS-builtin / build-tool vars to NEVER flag.
 OS_BUILTIN = {

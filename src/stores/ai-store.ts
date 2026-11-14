@@ -112,7 +112,7 @@ interface AiState {
 
   // UI state
   panelOpen: boolean;
-  activeTab: "chat" | "suggestions" | "audit";
+  activeTab: "chat" | "help" | "report" | "suggestions" | "audit";
   error: string | null;
 
   // Actions
@@ -141,7 +141,7 @@ interface AiState {
   // UI actions
   setPanelOpen: (open: boolean) => void;
   togglePanel: () => void;
-  setActiveTab: (tab: "chat" | "suggestions" | "audit") => void;
+  setActiveTab: (tab: "chat" | "help" | "report" | "suggestions" | "audit") => void;
   clearError: () => void;
   clearParsedJob: () => void;
 }
@@ -453,7 +453,7 @@ export const useAiStore = create<AiState>()(
       // UI actions
       setPanelOpen: (open: boolean) => set({ panelOpen: open }),
       togglePanel: () => set((state) => ({ panelOpen: !state.panelOpen })),
-      setActiveTab: (tab: "chat" | "suggestions" | "audit") => set({ activeTab: tab }),
+      setActiveTab: (tab: "chat" | "help" | "report" | "suggestions" | "audit") => set({ activeTab: tab }),
       clearError: () => set({ error: null }),
       clearParsedJob: () => set({ currentParsedJob: null }),
     }),

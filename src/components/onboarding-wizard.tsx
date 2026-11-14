@@ -16,6 +16,8 @@
  */
 import { useState, useCallback } from "react";
 import { useUIStore, type OnboardingStep, type UserStyle } from "@/stores/ui-store";
+import { LanguagePicker } from "./appearance-settings";
+import { useT } from "@/lib/i18n";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
 import {
@@ -32,6 +34,7 @@ import {
   Sparkles,
   RefreshCw,
   Send,
+  Globe,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -207,6 +210,7 @@ export function OnboardingWizard({ onComplete, onOpenGuidedFlow }: OnboardingWiz
 // ──────────────────────────────────────────────
 
 function WelcomeStep() {
+  const t = useT();
   return (
     <div className="flex flex-col items-center text-center">
       <div className="h-16 w-16 rounded-2xl bg-[var(--color-primary)]/10 flex items-center justify-center mb-6">
@@ -233,6 +237,11 @@ function WelcomeStep() {
           Secure transfers
         </div>
       </div>
+      <label className="flex items-center gap-2 mt-6 text-sm text-[color:var(--color-text-secondary)]" data-testid="onboarding-language">
+        <Globe className="h-4 w-4" aria-hidden="true" />
+        {t("settings.language")}
+        <LanguagePicker />
+      </label>
     </div>
   );
 }

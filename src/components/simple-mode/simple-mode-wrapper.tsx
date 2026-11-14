@@ -13,6 +13,8 @@
  * Mode switch is instant -- no restart required.
  */
 import { useState } from "react";
+import { SimpleSearchView } from "./simple-search-view";
+import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
@@ -105,7 +107,14 @@ export function SimpleModeWrapper({
           />
         );
       case "search":
-        return searchView || fileManager;
+        return searchView || (
+          <SimpleSearchView
+            onOpen={(path, isDir) => {
+              useFileManagerStore.getState().revealPath(useFileManagerStore.getState().activePaneIndex, path, isDir);
+              setActiveSection("files");
+            }}
+          />
+        );
       case "favorites":
         return favoritesView || (
           <SimplePlaceholder
@@ -175,11 +184,11 @@ export function SimpleModeWrapper({
         {sidebarOpen && (
           <aside
             className="border-r border-[var(--color-border)] shrink-0 overflow-hidden"
-            style={{ width: sidebarWidth }}
-            role="navigation"
-            aria-label="Main navigation"
+            style={{ width: activeSection === "files" ? 64 : sidebarWidth }}
+            aria-label="Application sections"
           >
             <SimpleSidebar
+              compact={activeSection === "files"}
               activeSection={activeSection}
               onSectionChange={setActiveSection}
             />

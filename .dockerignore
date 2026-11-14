@@ -1,0 +1,9 @@
+**/node_modules
+**/target
+dist
+.git
+*.docx
+*.pdf
+marketing/**
+!marketing/package.json
+releases-proxy

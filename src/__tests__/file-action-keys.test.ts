@@ -22,7 +22,7 @@
  * the tests can pass plain objects.
  */
 import { describe, it, expect } from "vitest";
-import { resolveFileActionKey, resolveNewFolderKey } from "../lib/file-action-keys";
+import { resolveFileActionKey, resolveNewFolderKey, resolveParentFolderKey } from "../lib/file-action-keys";
 
 type Gesture = Parameters<typeof resolveFileActionKey>[0];
 
@@ -122,5 +122,23 @@ describe("resolveNewFolderKey — ⌘⇧N New Folder", () => {
   it("rejects Alt variants and unrelated keys", () => {
     expect(resolveNewFolderKey(key({ key: "N", metaKey: true, shiftKey: true, altKey: true }), false)).toBe(false);
     expect(resolveNewFolderKey(key({ key: "M", metaKey: true, shiftKey: true }), false)).toBe(false);
+  });
+});
+
+describe("resolveParentFolderKey — go to the parent folder", () => {
+  it("binds Alt+↑, ⌘+↑ and bare Backspace", () => {
+    expect(resolveParentFolderKey(key({ key: "ArrowUp", altKey: true }), false)).toBe(true);
+    expect(resolveParentFolderKey(key({ key: "ArrowUp", metaKey: true }), false)).toBe(true);
+    expect(resolveParentFolderKey(key({ key: "Backspace" }), false)).toBe(true);
+  });
+
+  it("leaves typing, selection moves and the trash shortcut alone", () => {
+    expect(resolveParentFolderKey(key({ key: "Backspace" }), true)).toBe(false);
+    expect(resolveParentFolderKey(key({ key: "ArrowUp", altKey: true }), true)).toBe(false);
+    expect(resolveParentFolderKey(key({ key: "ArrowUp" }), false)).toBe(false);
+    expect(resolveParentFolderKey(key({ key: "ArrowUp", shiftKey: true, altKey: true }), false)).toBe(false);
+    expect(resolveParentFolderKey(key({ key: "ArrowUp", ctrlKey: true }), false)).toBe(false);
+    expect(resolveParentFolderKey(key({ key: "Backspace", metaKey: true }), false)).toBe(false);
+    expect(resolveParentFolderKey(key({ key: "Backspace", ctrlKey: true }), false)).toBe(false);
   });
 });
