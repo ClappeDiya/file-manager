@@ -26,7 +26,7 @@ const faq = [
   },
   {
     q: 'When does Business launch?',
-    a: 'Q3 2026. The waitlist is for early-adopter pricing and to surface design feedback before we lock the v1 surface. We will not auto-charge you — joining the waitlist costs nothing.',
+    a: 'The launch date is being confirmed. The waitlist is for early-adopter pricing and to surface design feedback before we lock the v1 surface. We will not auto-charge you — joining the waitlist costs nothing.',
   },
   {
     q: 'What about offline use?',

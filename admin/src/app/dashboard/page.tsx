@@ -1,5 +1,6 @@
 'use client';
 
+import { useRouter } from 'next/navigation';
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   Users, Monitor, Shield, CheckSquare, ScrollText,
@@ -19,6 +20,7 @@ import { useToastStore } from '@/lib/stores/toast-store';
 import { useTranslate } from '@/lib/i18n';
 
 export default function DashboardPage() {
+  const router = useRouter();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [devices, setDevices] = useState<DeviceHealth[]>([]);
@@ -102,7 +104,8 @@ export default function DashboardPage() {
       <div>
         <PageHeader title="Dashboard" description="Overview of your organization's file operations" />
         <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p className="text-sm text-error">Error: {error}</p>
+          <p role="alert" className="text-sm text-error">{error}</p>
+          <Button onClick={handleRefresh} loading={refreshing}>Retry</Button>
         </div>
       </div>
     );
@@ -149,14 +152,14 @@ export default function DashboardPage() {
         <StatCard
           title="Pending Approvals"
           value={pendingApprovals}
-          subtitle="Requires attention"
+          subtitle={pendingApprovals ? "Requires attention" : "No pending reviews"}
           icon={CheckSquare}
           variant={pendingApprovals > 0 ? 'warning' : 'success'}
         />
         <StatCard
           title="Online Devices"
           value={`${onlineDevices}/${devices.length}`}
-          subtitle={nonCompliantDevices > 0 ? `${nonCompliantDevices} non-compliant` : 'All compliant'}
+          subtitle={devices.length === 0 ? 'No devices enrolled' : nonCompliantDevices > 0 ? `${nonCompliantDevices} non-compliant` : 'All compliant'}
           icon={Monitor}
           variant={nonCompliantDevices > 0 ? 'warning' : 'success'}
         />
@@ -178,7 +181,7 @@ export default function DashboardPage() {
               <CheckSquare size={18} />
               Pending Approvals
             </CardTitle>
-            <Button variant="ghost" size="sm">
+            <Button variant="ghost" size="sm" onClick={() => router.push("/approvals")}>
               View all <ArrowUpRight size={14} />
             </Button>
           </CardHeader>
@@ -222,7 +225,7 @@ export default function DashboardPage() {
               <ScrollText size={18} />
               Recent Activity
             </CardTitle>
-            <Button variant="ghost" size="sm">
+            <Button variant="ghost" size="sm" onClick={() => router.push("/audit")}>
               View all <ArrowUpRight size={14} />
             </Button>
           </CardHeader>
@@ -274,7 +277,7 @@ export default function DashboardPage() {
               <Monitor size={18} />
               Device Health
             </CardTitle>
-            <Button variant="ghost" size="sm">
+            <Button variant="ghost" size="sm" onClick={() => router.push("/devices")}>
               View fleet <ArrowUpRight size={14} />
             </Button>
           </CardHeader>
@@ -325,7 +328,7 @@ export default function DashboardPage() {
               <Shield size={18} />
               Active Policies
             </CardTitle>
-            <Button variant="ghost" size="sm">
+            <Button variant="ghost" size="sm" onClick={() => router.push("/policies")}>
               Manage <ArrowUpRight size={14} />
             </Button>
           </CardHeader>

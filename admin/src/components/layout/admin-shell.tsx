@@ -1,5 +1,6 @@
 'use client';
 
+import { usePathname, useRouter } from 'next/navigation';
 import React, { useEffect } from 'react';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { useAdminStore } from '@/lib/stores/admin-store';
@@ -18,6 +19,12 @@ export function AdminShell({ children }: AdminShellProps) {
   const applyTheme = useAdminStore((s) => s.applyTheme);
   const theme = useAdminStore((s) => s.theme);
   const t = useTranslate();
+  const pathname = usePathname();
+  const router = useRouter();
+  const publicPage = pathname === '/login';
+  useEffect(() => {
+    if (!isValidating && !isAuthenticated && !publicPage) router.replace('/login');
+  }, [isAuthenticated, isValidating, publicPage, router]);
 
   useEffect(() => {
     validateSession();
@@ -42,6 +49,8 @@ export function AdminShell({ children }: AdminShellProps) {
       </div>
     );
   }
+
+  if (!isAuthenticated && !publicPage) return null;
 
   if (!isAuthenticated) {
     return (

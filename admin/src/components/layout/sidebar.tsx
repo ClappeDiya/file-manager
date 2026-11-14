@@ -75,8 +75,8 @@ export function Sidebar() {
         className={cn(
           'fixed top-0 left-0 z-50 h-full bg-sidebar-bg border-r border-sidebar-border flex flex-col transition-all duration-slow',
           sidebarCollapsed ? 'w-16' : 'w-64',
-          'lg:relative',
-          sidebarMobileOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
+          'hidden lg:flex lg:relative',
+          sidebarMobileOpen ? '!flex translate-x-0' : '-translate-x-full lg:translate-x-0'
         )}
       >
         {/* Logo area */}

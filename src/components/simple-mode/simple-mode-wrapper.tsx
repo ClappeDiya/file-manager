@@ -105,14 +105,7 @@ export function SimpleModeWrapper({
           />
         );
       case "search":
-        return searchView || (
-          <SimplePlaceholder
-            title="Search"
-            description="Find files and folders across all your connected locations."
-            actionLabel="Search Files"
-            onAction={() => {}}
-          />
-        );
+        return searchView || fileManager;
       case "favorites":
         return favoritesView || (
           <SimplePlaceholder
@@ -194,7 +187,7 @@ export function SimpleModeWrapper({
         )}
 
         {/* Content area */}
-        <main className="flex-1 overflow-hidden">
+        <main id="simple-main-content" tabIndex={-1} className="flex-1 min-w-0 overflow-auto">
           {renderSection()}
         </main>
       </div>

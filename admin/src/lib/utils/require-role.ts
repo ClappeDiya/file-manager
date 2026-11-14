@@ -32,9 +32,16 @@ export async function requireRole(
   try {
     const secret = new TextEncoder().encode(jwtSecret);
     const { payload } = await jwtVerify(sessionToken, secret);
-    const userRole = (payload.role as UserRole) || 'viewer';
+    const role = String(payload.role || '');
+    const roles: Record<string, UserRole> = {
+      org_owner: 'admin', org_admin: 'admin', security_admin: 'manager',
+      approver: 'viewer', operator: 'viewer', read_only_auditor: 'viewer', user: 'viewer',
+      admin: 'admin', manager: 'manager', viewer: 'viewer',
+    };
+    const userRole = Object.hasOwn(roles, role) ? roles[role] : undefined;
+    if (!userRole) return NextResponse.json({ error: 'Forbidden: unknown role' }, { status: 403 });
 
-    if (ROLE_HIERARCHY[userRole] < ROLE_HIERARCHY[minimumRole]) {
+    if (!Object.hasOwn(ROLE_HIERARCHY, userRole) || ROLE_HIERARCHY[userRole] < ROLE_HIERARCHY[minimumRole]) {
       return NextResponse.json({ error: 'Forbidden: insufficient role' }, { status: 403 });
     }
 

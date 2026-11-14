@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { jwtVerify } from 'jose';
+import { dataStore } from '@/lib/data-store';
 import { cookies } from 'next/headers';
 
 /** GET /api/auth/session - Validate session and return user */
@@ -27,13 +28,12 @@ export async function GET() {
     const secret = new TextEncoder().encode(jwtSecret);
     const { payload } = await jwtVerify(sessionToken, secret);
 
-    return NextResponse.json({
-      user: {
-        email: payload.sub || '',
-        name: String(payload.name || ''),
-        role: String(payload.role || 'viewer'),
-      },
-    });
+    const user = dataStore.users.find(candidate => candidate.email === payload.sub && candidate.isActive);
+    if (!user || payload.userId && payload.userId !== user.id) {
+      return NextResponse.json({ error: 'Session user is unavailable' }, { status: 401 });
+    }
+    return NextResponse.json({ user });
+
   } catch {
     return NextResponse.json(
       { error: 'Session expired or invalid' },

@@ -36,7 +36,6 @@ export default function ConnectorsPage() {
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [newName, setNewName] = useState('');
   const [newType, setNewType] = useState('s3');
-  const [testingId, setTestingId] = useState<string | null>(null);
 
   const handleAdd = () => {
     if (!newName) return;
@@ -52,16 +51,6 @@ export default function ConnectorsPage() {
     setNewType('s3');
   };
 
-  const handleTest = (id: string) => {
-    setTestingId(id);
-    setTimeout(() => {
-      setConnectors(prev => prev.map(c =>
-        c.id === id ? { ...c, status: 'connected' as const, lastTestedAt: new Date().toISOString() } : c
-      ));
-      setTestingId(null);
-    }, 2000);
-  };
-
   const handleRemove = (id: string) => {
     setConnectors(prev => prev.filter(c => c.id !== id));
   };
@@ -70,10 +59,10 @@ export default function ConnectorsPage() {
     <div>
       <PageHeader
         title="Connectors"
-        description="Manage storage connectors and integrations"
+        description="Draft connector configurations. Configure and test live connections in the desktop app."
         actions={
           <Button size="sm" onClick={() => setShowAddDialog(true)}>
-            <Plus size={14} /> Add Connector
+            <Plus size={14} /> Add Draft
           </Button>
         }
       />
@@ -83,7 +72,7 @@ export default function ConnectorsPage() {
           icon={Plug}
           title="No connectors configured"
           description="Add a storage connector to start managing file operations across platforms."
-          action={<Button onClick={() => setShowAddDialog(true)}><Plus size={14} /> Add Connector</Button>}
+          action={<Button onClick={() => setShowAddDialog(true)}><Plus size={14} /> Add Draft</Button>}
         />
       ) : (
         <div className="grid gap-4">
@@ -100,7 +89,7 @@ export default function ConnectorsPage() {
                       connector.status === 'connected' ? 'success' :
                       connector.status === 'error' ? 'error' : 'default'
                     }>
-                      {connector.status}
+                      {connector.status === "disconnected" ? "Draft · untested" : connector.status}
                     </Badge>
                   </div>
                   <p className="text-xs text-foreground-tertiary mt-0.5">
@@ -112,8 +101,8 @@ export default function ConnectorsPage() {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => handleTest(connector.id)}
-                    loading={testingId === connector.id}
+                    disabled
+                    title="Connection testing is available in the desktop app"
                   >
                     <TestTube size={14} /> Test
                   </Button>
@@ -132,7 +121,7 @@ export default function ConnectorsPage() {
 
       <Dialog open={showAddDialog} onClose={() => setShowAddDialog(false)}>
         <DialogHeader>
-          <DialogTitle>Add Connector</DialogTitle>
+          <DialogTitle>Add Draft</DialogTitle>
           <DialogDescription>Configure a new storage connector</DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
@@ -141,7 +130,7 @@ export default function ConnectorsPage() {
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => setShowAddDialog(false)}>Cancel</Button>
-          <Button onClick={handleAdd}>Add Connector</Button>
+          <Button onClick={handleAdd}>Add Draft</Button>
         </DialogFooter>
       </Dialog>
     </div>

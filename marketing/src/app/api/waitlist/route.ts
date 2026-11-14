@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server';
 
 // Minimal waitlist endpoint. Stores submissions via a webhook to an external
 // service (Resend, Formspree, Loops, etc.) configured via WAITLIST_WEBHOOK_URL.
-// Until that env var is set the route returns 202 and logs to stdout, so the
-// form on /pricing still works end-to-end during development.
+// Without a configured destination the route returns 503, so the
+// form keeps user input and offers a recovery path.
 
 export const runtime = 'nodejs';
 
@@ -50,7 +50,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Could not record your submission.' }, { status: 502 });
     }
   } else {
-    console.log('Waitlist submission (no webhook configured):', payload);
+    return NextResponse.json({ error: "Signup is temporarily unavailable. Please contact sales@clappe.com." }, { status: 503 });
   }
 
   return NextResponse.json({ ok: true }, { status: 202 });

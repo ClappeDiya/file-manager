@@ -1,3 +1,5 @@
+import { Dialog, DialogContent, DialogTitle } from "@ufop/ui-components";
+import { ConnectionPanel } from "@/components/connection-panel";
 /**
  * Guided Flow Router (T-056)
  *
@@ -159,7 +161,20 @@ export function GuidedFlowRouter() {
   const activeFlow = useUIStore((s) => s.activeGuidedFlow);
 
   if (!activeFlow) return null;
+  if (["connect-onedrive", "connect-gdrive", "connect-dropbox", "connect-gcs", "connect-smb", "connect-sftp"].includes(activeFlow)) {
+    return (
+      <Dialog open onOpenChange={(open) => { if (!open) useUIStore.getState().setActiveGuidedFlow(null); }}>
+        <DialogContent size="xl" aria-label="Connect a location" className="max-h-[90vh] overflow-y-auto">
+          <DialogTitle>Connect a location</DialogTitle>
+          <button className="my-3 rounded-md border px-4 py-2" onClick={() => useUIStore.getState().setActiveGuidedFlow(null)}>Close connections</button>
+          <ConnectionPanel />
+        </DialogContent>
+      </Dialog>
+    );
+  }
 
+  if (["copy-to-external", "old-to-new-drive"].includes(activeFlow)) return <StartTransferWizard />;
+  if (activeFlow === "connect-local-sync") return <CreateSyncWizard />;
   switch (activeFlow) {
     case "connect-onedrive":
       return <ConnectOneDriveWizard />;

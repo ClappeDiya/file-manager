@@ -9,6 +9,7 @@ type Platform = 'macos' | 'windows' | 'linux' | 'unknown';
 function detectPlatform(): Platform {
   if (typeof navigator === 'undefined') return 'unknown';
   const ua = navigator.userAgent.toLowerCase();
+  if (/iphone|ipad|ipod|android/.test(ua) || navigator.maxTouchPoints > 1 && ua.includes('mac')) return 'unknown';
   if (ua.includes('mac')) return 'macos';
   if (ua.includes('win')) return 'windows';
   if (ua.includes('linux') || ua.includes('x11')) return 'linux';
@@ -19,7 +20,7 @@ const platformLabels: Record<Platform, string> = {
   macos: 'macOS',
   windows: 'Windows',
   linux: 'Linux',
-  unknown: 'your platform',
+  unknown: 'desktop',
 };
 
 export function DownloadCta({ size = 'lg' }: { size?: 'md' | 'lg' }) {
@@ -39,7 +40,7 @@ export function DownloadCta({ size = 'lg' }: { size?: 'md' | 'lg' }) {
         className={`inline-flex items-center gap-2 rounded-md bg-primary text-primary-foreground font-medium hover:bg-primary-hover transition-colors ${sizeClasses}`}
       >
         <Icon size={18} />
-        Download for {platformLabels[platform]}
+        View {platformLabels[platform]} downloads
       </Link>
       <Link
         href="/pricing"

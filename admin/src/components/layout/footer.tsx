@@ -8,9 +8,8 @@ export function Footer() {
   const t = useTranslate();
   const year = new Date().getFullYear();
   const items = [
-    { key: 'privacy', href: '/privacy' },
-    { key: 'terms', href: '/terms' },
-    { key: 'status', href: '/status' },
+    { key: 'privacy', href: 'https://filemanager.clappe.com/legal/privacy' },
+    { key: 'terms', href: 'https://filemanager.clappe.com/legal/terms' },
     { key: 'support', href: '/support' },
   ] as const;
   return (

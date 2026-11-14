@@ -86,16 +86,16 @@ export default function HomePage() {
       <section className="marketing-section pt-0">
         <div className="container-page">
           <div className="rounded-2xl bg-primary text-primary-foreground p-12 text-center">
-            <h2 className="text-3xl md:text-4xl font-bold tracking-tight">Get going in 30 seconds.</h2>
+            <h2 className="text-3xl md:text-4xl font-bold tracking-tight">Find your desktop build.</h2>
             <p className="mt-3 text-primary-foreground/90 max-w-xl mx-auto">
-              Install signed, auto-updating builds for your OS. No account required. Free forever for individuals.
+              Check current availability for your desktop. No account required for individual use.
             </p>
             <div className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-3">
               <Link
                 href="/download"
                 className="inline-flex items-center gap-2 px-6 py-3 rounded-md bg-background text-foreground font-medium hover:bg-background-secondary transition-colors"
               >
-                Download free
+                View downloads
               </Link>
               <Link
                 href="/docs"

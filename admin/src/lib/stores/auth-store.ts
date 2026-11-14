@@ -27,7 +27,7 @@ export const useAuthStore = create<AuthState>()(
       user: null,
       isAuthenticated: false,
       isLoading: false,
-      isValidating: false,
+      isValidating: true,
       error: null,
 
       setUser: (user) => {
@@ -66,7 +66,7 @@ export const useAuthStore = create<AuthState>()(
       logout: () => {
         set({ user: null, isAuthenticated: false, error: null });
         // Clear the server-side session cookie
-        fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+        fetch('/api/auth/logout', { method: 'POST' }).catch(() => {}).finally(() => window.location.replace('/login'));
       },
 
       checkPermission: (permission: Permission) => {

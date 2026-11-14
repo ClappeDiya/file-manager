@@ -346,7 +346,7 @@ export default function WorkspacesPage() {
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => setShowShareDialog(false)}>Cancel</Button>
-          <Button onClick={() => setShowShareDialog(false)}>
+          <Button disabled title="Resource sharing is not connected to a permission service">
             <Share2 size={14} /> Share
           </Button>
         </DialogFooter>

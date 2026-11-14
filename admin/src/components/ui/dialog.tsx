@@ -1,7 +1,7 @@
-'use client';
+"use client";
 
-import React, { useEffect, useRef } from 'react';
-import { cn } from '@/lib/utils/cn';
+import React, { useEffect, useRef } from "react";
+import { cn } from "@/lib/utils/cn";
 
 interface DialogProps {
   open: boolean;
@@ -10,11 +10,17 @@ interface DialogProps {
   className?: string;
 }
 
+const DialogTitleId = React.createContext<string | undefined>(undefined);
+
 const FOCUSABLE_SELECTOR =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 export function Dialog({ open, onClose, children, className }: DialogProps) {
+  const titleId = React.useId();
   const panelRef = useRef<HTMLDivElement>(null);
+
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -25,12 +31,12 @@ export function Dialog({ open, onClose, children, className }: DialogProps) {
     focusables?.[0]?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        closeRef.current();
         return;
       }
-      if (event.key !== 'Tab' || !panel) return;
+      if (event.key !== "Tab" || !panel) return;
       const items = panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
       if (items.length === 0) {
         event.preventDefault();
@@ -47,50 +53,82 @@ export function Dialog({ open, onClose, children, className }: DialogProps) {
         first.focus();
       }
     };
-    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener("keydown", onKeyDown);
     return () => {
-      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener("keydown", onKeyDown);
       previouslyFocused?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div
-        className="fixed inset-0 bg-black/50"
-        onClick={onClose}
-        aria-hidden="true"
-      />
-      <div
-        ref={panelRef}
-        className={cn(
-          'relative z-50 w-full max-w-lg bg-background-elevated rounded-xl border border-border shadow-xl p-6 mx-4',
-          'animate-in fade-in-0 zoom-in-95',
-          className
-        )}
-        role="dialog"
-        aria-modal="true"
-      >
-        {children}
+    <DialogTitleId.Provider value={titleId}>
+      <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div
+          className="fixed inset-0 bg-black/50"
+          onClick={onClose}
+          aria-hidden="true"
+        />
+        <div
+          ref={panelRef}
+          className={cn(
+            "relative z-50 w-full max-w-lg bg-background-elevated rounded-xl border border-border shadow-xl p-6 mx-4 max-h-[90dvh] overflow-y-auto",
+            "animate-in fade-in-0 zoom-in-95",
+            className,
+          )}
+          aria-labelledby={titleId}
+          role="dialog"
+          aria-modal="true"
+        >
+          {children}
+        </div>
       </div>
-    </div>
+    </DialogTitleId.Provider>
   );
 }
 
-export function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('mb-4', className)} {...props} />;
+export function DialogHeader({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) {
+  return <div className={cn("mb-4", className)} {...props} />;
 }
 
-export function DialogTitle({ className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
-  return <h2 className={cn('text-lg font-semibold text-foreground', className)} {...props} />;
+export function DialogTitle({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLHeadingElement>) {
+  const titleId = React.useContext(DialogTitleId);
+  return (
+    <h2
+      id={titleId}
+      className={cn("text-lg font-semibold text-foreground", className)}
+      {...props}
+    />
+  );
 }
 
-export function DialogDescription({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
-  return <p className={cn('text-sm text-foreground-secondary mt-1', className)} {...props} />;
+export function DialogDescription({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLParagraphElement>) {
+  return (
+    <p
+      className={cn("text-sm text-foreground-secondary mt-1", className)}
+      {...props}
+    />
+  );
 }
 
-export function DialogFooter({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn('flex items-center justify-end gap-2 mt-6', className)} {...props} />;
+export function DialogFooter({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div
+      className={cn("flex items-center justify-end gap-2 mt-6", className)}
+      {...props}
+    />
+  );
 }

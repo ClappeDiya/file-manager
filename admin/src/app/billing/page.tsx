@@ -74,7 +74,7 @@ export default function BillingPage() {
             {plan.current ? (
               <Button variant="outline" className="w-full" disabled>Current Plan</Button>
             ) : (
-              <Button variant={plan.name === 'Enterprise' ? 'primary' : 'outline'} className="w-full">
+              <Button onClick={() => { window.location.href = "mailto:sales@clappe.com"; }} variant={plan.name === 'Enterprise' ? 'primary' : 'outline'} className="w-full">
                 {plan.name === 'Enterprise' ? 'Contact Sales' : 'Upgrade'}
               </Button>
             )}

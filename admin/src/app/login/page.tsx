@@ -9,7 +9,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter }
 
 export default function LoginPage() {
   const router = useRouter();
-  const { isAuthenticated, isLoading, error, setError, setUser } = useAuthStore();
+  const { isAuthenticated, isLoading, error, setError } = useAuthStore();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -45,17 +45,11 @@ export default function LoginPage() {
         return;
       }
 
-      // Set user from the API response into the auth store
-      setUser({
-        id: 'usr_session',
-        email: data.user.email,
-        name: data.user.name,
-        role: data.user.role === 'admin' ? 'org_owner' : 'user',
-        permissions: [],
-        organizationId: 'org_001',
-        createdAt: new Date().toISOString(),
-        isActive: true,
-      });
+      // Hydrate the verified session identity before entering the console
+      await useAuthStore.getState().validateSession();
+      if (!useAuthStore.getState().isAuthenticated) {
+        throw new Error('Could not validate your session');
+      }
     } catch {
       setError('Network error. Please try again.');
       setSubmitting(false);
@@ -80,7 +74,7 @@ export default function LoginPage() {
         </div>
 
         <Card>
-          <CardHeader>
+          <CardHeader className="flex-col items-start gap-1">
             <CardTitle>Sign in</CardTitle>
             <CardDescription>Enter your credentials to access the admin console</CardDescription>
           </CardHeader>
