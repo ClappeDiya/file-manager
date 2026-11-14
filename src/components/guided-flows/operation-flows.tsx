@@ -10,6 +10,9 @@
  * Each wizard provides step-by-step guidance with validation
  * and contextual help.
  */
+import { runLocalTransfer, type TransferOutcome } from "@/lib/guided-transfer";
+import { tauriInvoke } from "@/hooks/use-tauri";
+import { TransferResult } from "./transfer-result";
 import { useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
@@ -36,7 +39,8 @@ export function StartTransferWizard() {
   const [sourcePath, setSourcePath] = useState("");
   const [destPath, setDestPath] = useState("");
   const [transferMode, setTransferMode] = useState<"copy" | "move">("copy");
-  const [verifyAfter, setVerifyAfter] = useState(false);
+  const [verifyAfter, setVerifyAfter] = useState(true);
+  const [result, setResult] = useState<TransferOutcome | null>(null);
 
   const steps: WizardStepDef[] = [
     {
@@ -48,7 +52,7 @@ export function StartTransferWizard() {
     {
       id: "destination",
       label: "Where to Send",
-      helpText: "Choose the destination folder. This can be a local folder, external drive, or connected server.",
+      helpText: "Choose the destination folder. Use a local folder, external drive, or mounted network folder.",
       validate: () => (destPath ? null : "Please choose a destination."),
     },
     {
@@ -70,17 +74,20 @@ export function StartTransferWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        if (result) { setActiveGuidedFlow(null); return; }
+        const outcome = await runLocalTransfer(sourcePath, destPath, verifyAfter, transferMode === "move");
+        setResult(outcome);
         addActivity({
           type: "transfer",
-          summary: `Started ${transferMode === "copy" ? "copying" : "moving"} files from "${sourcePath}" to "${destPath}".`,
+          summary: `${outcome.files_transferred} files ${transferMode === "move" ? "moved" : "copied"} to "${destPath}". ${outcome.files_skipped} skipped.`,
           paths: [sourcePath, destPath],
-          undoable: transferMode === "move",
+          undoable: false,
         });
-        setActiveGuidedFlow(null);
       }}
       onCancel={() => setActiveGuidedFlow(null)}
-      completeLabel="Start Transfer"
+      completed={!!result}
+      completeLabel={result ? "Done" : "Start Transfer"}
     >
       {step === 0 && (
         <div>
@@ -88,7 +95,7 @@ export function StartTransferWizard() {
             What would you like to transfer?
           </h3>
           <p className="text-sm text-[color:var(--color-text-secondary)] mb-4">
-            Enter the path to the files or folder you want to send.
+            Enter a file or folder path. A folder’s contents are copied into the destination.
           </p>
           <label className="block">
             <span className="text-xs font-medium text-[color:var(--color-text)]">Source</span>
@@ -123,7 +130,7 @@ export function StartTransferWizard() {
             Where should the files go?
           </h3>
           <p className="text-sm text-[color:var(--color-text-secondary)] mb-4">
-            Choose the destination. This can be any connected location.
+            Choose the destination. Use a folder on this computer or a mounted drive.
           </p>
           <label className="block">
             <span className="text-xs font-medium text-[color:var(--color-text)]">Destination</span>
@@ -187,8 +194,8 @@ export function StartTransferWizard() {
               <div className="flex items-start gap-2">
                 <AlertTriangle className="h-4 w-4 text-[color:var(--color-warning)] shrink-0 mt-0.5" aria-hidden="true" />
                 <p className="text-xs text-[color:var(--color-text-secondary)]">
-                  Move will remove the original files after they're transferred.
-                  You can undo this from the Activity feed.
+                  Move verifies destination files before removing the originals.
+                  Check the destination before using the moved files.
                 </p>
               </div>
             </div>
@@ -211,7 +218,8 @@ export function StartTransferWizard() {
         </div>
       )}
 
-      {step === 3 && (
+      {result && <TransferResult result={result} moved={transferMode === "move"} />}
+      {step === 3 && !result && (
         <div className="space-y-4">
           <h3 className="text-base font-semibold text-[color:var(--color-text)] mb-2">
             Ready to transfer
@@ -285,12 +293,17 @@ export function CreateSyncWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        const pair = await tauriInvoke<{ id: string }>("create_sync_pair", {
+          name: name.trim(), sourcePath: sourcePath.trim(), destPath: destPath.trim(),
+          mode: "two_way", trigger: schedule === "realtime" ? "watch" : schedule === "manual" ? "manual" : "scheduled",
+          cronExpr: schedule === "hourly" ? "0 0 * * * *" : schedule === "daily" ? "0 0 0 * * *" : null,
+          verifyMode: "full", checksumEnabled: true,
+        });
+        if (schedule === "realtime") await tauriInvoke("start_sync_watcher", { pairId: pair.id });
         addActivity({
-          type: "sync",
-          summary: `Created sync pair "${name}" between "${sourcePath}" and "${destPath}" (${schedule}).`,
-          paths: [sourcePath, destPath],
-          undoable: false,
+          type: "sync", summary: `Saved sync pair "${name}" (${pair.id}).`,
+          paths: [sourcePath, destPath], undoable: false,
         });
         setActiveGuidedFlow(null);
       }}
@@ -354,12 +367,14 @@ export function CreateSyncWizard() {
           <div className="space-y-2">
             {[
               { id: "manual" as const, label: "Manual", desc: "Only sync when you click the Sync button" },
-              { id: "hourly" as const, label: "Every hour", desc: "Check for changes every hour" },
-              { id: "daily" as const, label: "Once a day", desc: "Sync once daily at a scheduled time" },
-              { id: "realtime" as const, label: "Real-time", desc: "Sync changes as they happen (uses more resources)" },
+              { id: "hourly" as const, label: "Every hour", desc: "Automatic execution is unavailable" },
+              { id: "daily" as const, label: "Once a day", desc: "Automatic execution is unavailable" },
+              { id: "realtime" as const, label: "Real-time", desc: "Automatic execution is unavailable" },
             ].map((s) => (
               <button
                 key={s.id}
+                disabled={s.id !== "manual"}
+                title={s.id !== "manual" ? "Automatic execution is unavailable" : undefined}
                 className={cn(
                   "flex items-start gap-3 w-full p-4 rounded-lg border transition-all text-left",
                   schedule === s.id

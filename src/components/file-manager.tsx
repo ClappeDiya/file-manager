@@ -3,6 +3,7 @@ import {
   useFileManagerStore,
   type ViewMode,
 } from "@/stores/file-manager-store";
+import { operationError } from "@/lib/guided-transfer";
 import { formatBytes } from "@/lib/format-bytes";
 import { useUIStore } from "@/stores/ui-store";
 import { useAiStore, type AiExecutionResult } from "@/stores/ai-store";
@@ -2448,7 +2449,7 @@ export function FileManager() {
 
       {/* Main content area */}
       <div id="main-content" tabIndex={-1} className="flex flex-1 overflow-hidden">
-        {sidebarOpen && (
+        {sidebarOpen && appMode !== "simple" && (
           <aside
             className="border-r border-[var(--color-border)] shrink-0 overflow-hidden"
             style={{ width: sidebarWidth }}
@@ -3235,8 +3236,8 @@ function FilePane({
       }
     } catch (err) {
       console.error("Failed to list directory:", err);
-      setError(String(err));
-      setFiles(generateDemoFiles(path));
+      setError(operationError(err));
+      setFiles([]);
       // Path Recall — ask the ledger whether it has any history for
       // this path so we can show the user where it went. Fail-soft:
       // any error during the lineage fetch is silently swallowed,
@@ -4629,9 +4630,10 @@ function FilePane({
         <div className="h-0.5 bg-[var(--color-primary)] animate-pulse" />
       )}
 
-      {error && !isTauriAvailable() && (
+      {error && (
         <div className="px-3 py-1.5 text-[length:var(--font-size-xs)] text-[color:var(--color-error)] bg-[var(--color-error)]/10 border-b border-[var(--color-border)]">
-          {error}
+          <span role="alert">{error}</span>
+          <button type="button" className="ml-3 underline" onClick={() => void loadDirectory(currentPath)}>Retry</button>
         </div>
       )}
 

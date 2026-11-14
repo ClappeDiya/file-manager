@@ -12,6 +12,8 @@
  * - Backup Folder
  * - Migrate Computers
  */
+import { runLocalTransfer, type TransferOutcome } from "@/lib/guided-transfer";
+import { TransferResult } from "./transfer-result";
 import { useState } from "react";
 import { useUIStore } from "@/stores/ui-store";
 import { WizardShell, type WizardStepDef } from "./wizard-shell";
@@ -602,6 +604,8 @@ export function BackupFolderWizard() {
   const [backupDest, setBackupDest] = useState("");
   const [schedule, setSchedule] = useState<"once" | "daily" | "weekly">("once");
 
+  const [result, setResult] = useState<TransferOutcome | null>(null);
+
   const steps: WizardStepDef[] = [
     { id: "source", label: "Source", validate: () => (sourcePath ? null : "Please choose a folder to back up.") },
     { id: "dest", label: "Backup Location", validate: () => (backupDest ? null : "Please choose a backup destination.") },
@@ -616,17 +620,18 @@ export function BackupFolderWizard() {
       steps={steps}
       currentStep={step}
       onStepChange={setStep}
-      onComplete={() => {
+      onComplete={async () => {
+        if (result) { setActiveGuidedFlow(null); return; }
+        const outcome = await runLocalTransfer(sourcePath, backupDest, true);
+        setResult(outcome);
         addActivity({
-          type: "copy",
-          summary: `Started backup of "${sourcePath}" to "${backupDest}" (${schedule}).`,
-          paths: [sourcePath, backupDest],
-          undoable: false,
+          type: "copy", summary: `Backup copied ${outcome.files_transferred} files to "${backupDest}". ${outcome.files_skipped} skipped.`,
+          paths: [sourcePath, backupDest], undoable: false,
         });
-        setActiveGuidedFlow(null);
       }}
       onCancel={() => setActiveGuidedFlow(null)}
-      completeLabel="Start Backup"
+      completed={!!result}
+      completeLabel={result ? "Done" : "Start Backup"}
     >
       {step === 0 && (
         <div>
@@ -652,22 +657,23 @@ export function BackupFolderWizard() {
           <div className="space-y-2">
             {[
               { id: "once" as const, label: "Just once", desc: "Create a single backup now" },
-              { id: "daily" as const, label: "Daily", desc: "Back up every day" },
-              { id: "weekly" as const, label: "Weekly", desc: "Back up once a week" },
+              { id: "daily" as const, label: "Daily", desc: "Scheduled execution is unavailable" },
+              { id: "weekly" as const, label: "Weekly", desc: "Scheduled execution is unavailable" },
             ].map((s) => (
-              <button key={s.id} className={cn("flex items-start gap-3 w-full p-4 rounded-lg border transition-all text-left", schedule === s.id ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5" : "border-[var(--color-border)]")} onClick={() => setSchedule(s.id)}>
+              <button key={s.id} disabled={s.id !== "once"} aria-label={s.id === "once" ? s.label : `${s.label} (unavailable)`} className={cn("flex items-start gap-3 w-full p-4 rounded-lg border transition-all text-left", schedule === s.id ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5" : "border-[var(--color-border)]")} onClick={() => setSchedule(s.id)}>
                 <div><span className="text-sm font-medium text-[color:var(--color-text)] block">{s.label}</span><span className="text-xs text-[color:var(--color-text-secondary)] block mt-0.5">{s.desc}</span></div>
               </button>
             ))}
           </div>
         </div>
       )}
-      {step === 3 && (
+      {result && <TransferResult result={result} />}
+      {step === 3 && !result && (
         <div className="flex flex-col items-center text-center py-6">
           <Shield className="h-12 w-12 text-[color:var(--color-primary)] mb-4" aria-hidden="true" />
           <h3 className="text-lg font-semibold text-[color:var(--color-text)] mb-2">Ready to back up</h3>
           <p className="text-sm text-[color:var(--color-text-secondary)] max-w-sm">
-            "{sourcePath}" will be backed up to "{backupDest}". Schedule: {schedule}. Your original files will not be modified.
+            "{sourcePath}" will be backed up to "{backupDest}". Schedule: {schedule}. Existing destination files are kept and reported as skipped. Every copied file is verified.
           </p>
         </div>
       )}

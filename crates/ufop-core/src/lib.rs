@@ -6,3 +6,5 @@
 pub mod error;
 pub mod sync;
 pub mod sync_types;
+
+pub mod local_transfer;

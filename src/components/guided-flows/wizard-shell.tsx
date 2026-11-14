@@ -9,7 +9,7 @@
  * - Validation per step
  * - Consistent styling
  */
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { cn } from "@ufop/ui-components";
 import { Button } from "@ufop/ui-components";
 import {
@@ -46,7 +46,7 @@ interface WizardShellProps {
   /** Callback to change step */
   onStepChange: (index: number) => void;
   /** Callback when wizard completes (last step Next) */
-  onComplete: () => void;
+  onComplete: () => void | Promise<void>;
   /** Callback when wizard is cancelled */
   onCancel: () => void;
   /** Whether the wizard is processing (shows spinner on Next) */
@@ -57,6 +57,7 @@ interface WizardShellProps {
   nextLabel?: string;
   /** Override the complete button label */
   completeLabel?: string;
+  completed?: boolean;
 }
 
 // ──────────────────────────────────────────────
@@ -75,15 +76,48 @@ export function WizardShell({
   children,
   nextLabel,
   completeLabel,
+  completed = false,
 }: WizardShellProps) {
   const [showHelp, setShowHelp] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+
+  const [submitting, setSubmitting] = useState(false);
+  const panel = useRef<HTMLDivElement>(null);
+  const busy = useRef(false);
+  const cancelRef = useRef(onCancel);
+  cancelRef.current = onCancel;
+  loading = loading || submitting;
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const element = panel.current;
+    element?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy.current) {
+        event.preventDefault();
+        cancelRef.current();
+      }
+      if (event.key !== "Tab" || !element) return;
+      const items = [...element.querySelectorAll<HTMLElement>(
+        'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]',
+      )];
+      const first = items[0], last = items[items.length - 1];
+      if (!first) { event.preventDefault(); return; }
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === element)) {
+        event.preventDefault(); last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !element.contains(document.activeElement))) {
+        event.preventDefault(); first.focus();
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => { document.removeEventListener("keydown", keydown); previous?.focus(); };
+  }, []);
 
   const isLastStep = currentStep === steps.length - 1;
   const isFirstStep = currentStep === 0;
   const currentStepDef = steps[currentStep];
 
-  const handleNext = useCallback(() => {
+  const handleNext = useCallback(async () => {
+    if (busy.current || loading) return;
     // Run validation if defined
     if (currentStepDef?.validate) {
       const error = currentStepDef.validate();
@@ -95,11 +129,17 @@ export function WizardShell({
     setValidationError(null);
 
     if (isLastStep) {
-      onComplete();
+      busy.current = true;
+      setSubmitting(true);
+      try { await onComplete(); }
+      catch (error) {
+        const { operationError } = await import("@/lib/guided-transfer");
+        setValidationError(operationError(error));
+      } finally { busy.current = false; setSubmitting(false); }
     } else {
       onStepChange(currentStep + 1);
     }
-  }, [currentStep, currentStepDef, isLastStep, onComplete, onStepChange]);
+  }, [currentStep, currentStepDef, isLastStep, onComplete, onStepChange, loading]);
 
   const handleBack = useCallback(() => {
     setValidationError(null);
@@ -111,6 +151,9 @@ export function WizardShell({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      ref={panel}
+      tabIndex={-1}
+      aria-busy={loading}
       role="dialog"
       aria-modal="true"
       aria-label={title}
@@ -144,7 +187,8 @@ export function WizardShell({
               variant="ghost"
               size="icon"
               onClick={onCancel}
-              aria-label="Cancel wizard"
+              disabled={loading}
+              aria-label={completed ? "Close wizard" : "Cancel wizard"}
             >
               <X className="h-4 w-4" aria-hidden="true" />
             </Button>
@@ -228,7 +272,7 @@ export function WizardShell({
         {/* Footer with navigation */}
         <div className="flex items-center justify-between px-6 py-4 border-t border-[var(--color-border)]">
           <div>
-            {!isFirstStep && (
+            {!isFirstStep && !completed && (
               <Button variant="ghost" onClick={handleBack} disabled={loading}>
                 <ArrowLeft className="h-4 w-4 mr-2" aria-hidden="true" />
                 Back
@@ -236,9 +280,9 @@ export function WizardShell({
             )}
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" onClick={onCancel} disabled={loading}>
+            {!completed && <Button variant="ghost" onClick={onCancel} disabled={loading}>
               Cancel
-            </Button>
+            </Button>}
             <Button variant="default" onClick={handleNext} disabled={loading}>
               {loading ? (
                 <>

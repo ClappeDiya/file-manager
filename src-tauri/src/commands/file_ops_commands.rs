@@ -2429,3 +2429,34 @@ mod tests {
         assert_eq!(first.file_name().unwrap(), "README (copy)");
     }
 }
+
+/// Run a guided local copy or verified move, returning only after data has
+/// reached the destination. Remote providers use the connection/transfer engine.
+#[tauri::command]
+pub async fn run_local_transfer(
+    source: String,
+    destination: String,
+    verify: bool,
+    move_source: bool,
+    ledger: tauri::State<'_, OperationLedger>,
+) -> Result<ufop_core::local_transfer::TransferOutcome, AppError> {
+    let src = source.clone();
+    let dst = destination.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        ufop_core::local_transfer::transfer(
+            Path::new(&src), Path::new(&dst),
+            ufop_core::local_transfer::TransferOptions { verify, move_source, overwrite: false },
+            |_, _| {},
+        )
+    }).await.map_err(|error| AppError::Sync {
+        message: format!("Transfer could not finish: {error}"),
+        advice: "Inspect the destination before retrying.".into(),
+    })??;
+    // This operation does not create a ledger undo action.
+    ledger.record(RecordEvent::new(LedgerEngine::Fs, if move_source { "move" } else { "copy" })
+        .status(LedgerStatus::Ok)
+        .subject(source).target(destination)
+        .summary(format!("Copied {} files, {} skipped", result.files_transferred, result.files_skipped))
+    ).await;
+    Ok(result)
+}

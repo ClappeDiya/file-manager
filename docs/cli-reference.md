@@ -142,46 +142,40 @@ ufop connection remove my-server
 
 ### `ufop transfer`
 
-Transfer files between locations.
+Copy local files and folder contents. Human, JSON and YAML output execute the same
+operation. `--verify` compares copied bytes with the source before reporting
+verification. Existing files in a directory transfer are skipped unless
+`--overwrite` is selected. A skipped file produces partial status and exit code 1.
 
 ```bash
-# Local to local
-ufop transfer /path/to/source /path/to/dest
-
-# Local to remote
-ufop transfer ./data sftp://server/backup/data
-
-# Remote to local
-ufop transfer s3://my-bucket/archive.zip ./downloads/
-
-# With options
-ufop transfer /src /dst --overwrite --verify --parallel 8
-
-# Dry run
+ufop transfer /path/to/source /path/to/dest --verify
+ufop --json transfer /src /dst --overwrite --verify
+ufop --yaml transfer /src /dst --verify
 ufop transfer /src /dst --dry-run
-
-# With bandwidth limit
-ufop transfer /large-file s3://bucket/file --limit 10M
-
-# Resume interrupted transfer
-ufop transfer /src /dst --resume
 ```
 
-**Arguments:**
+Remote URI transfers return an error. Use a connected location in the desktop
+transfer queue. Resuming and bandwidth limits are available through `ufop copy`.
 
-| Argument | Description |
-|----------|-------------|
-| `<SRC>` | Source path or URI |
-| `<DEST>` | Destination path or URI |
+| Flag | Behavior |
+|------|----------|
+| `--overwrite` | Replace destination files after staging each copy |
+| `--verify` | Compare actual source and destination bytes |
+| `--resume` | Returns an error directing you to `ufop copy /Z` |
+| `--parallel <N>` | Retained for compatibility, local transfer runs serially |
 
-**Options:**
+### `ufop copy`
 
-| Flag | Description |
-|------|-------------|
-| `--overwrite` | Overwrite existing files at destination |
-| `--resume` | Resume an interrupted transfer |
-| `--verify` | Verify checksums after transfer |
-| `--parallel <N>` | Number of parallel streams (default: 4) |
+Run the shared Robocopy-compatible engine. Preview with `/L`, resume with `/Z`
+and limit bandwidth with the global `--limit` option.
+
+```bash
+ufop copy /src /dst /E /L
+ufop --limit 10M copy /src /dst /E /Z
+```
+
+This command uses Robocopy exit codes. Codes below 8 describe successful work or
+differences. Code 1 means files were copied. Codes 8 and above indicate failures.
 
 ---
 
