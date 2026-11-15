@@ -26,15 +26,13 @@ export default function PrivacyPage() {
       <h2 className="text-xl font-bold text-foreground mt-8">What our website collects</h2>
       <p>
         Our website uses server logs for operation and abuse prevention. These can include your IP address,
-        browser information, requested page and response status. The production website also uses first-party
-        Matomo analytics, served from /mtm/, to measure page visits and link clicks. Where enabled, Matomo
-        cookies can recognize returning browsers and group visits into sessions. Website measurement is
-        separate from the desktop application's settings.
+        browser information, requested page and response status. This website build does not load analytics
+        scripts or analytics cookies. Website operational logs are separate from the desktop application's settings.
       </p>
       <p>
         If you submit the waitlist form, we use the details you provide to contact you about Business availability.
         Contact privacy@clappe.com to request access or deletion, or to ask about the current retention settings
-        for website logs, analytics and waitlist records.
+        for website logs and waitlist records.
       </p>
 
       <h2 className="text-xl font-bold text-foreground mt-8">Your credentials</h2>

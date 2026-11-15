@@ -66,6 +66,7 @@ export function SimpleModeWrapper({
   const [settingsRequest, setSettingsRequest] = useState(0);
   const contentRef = useRef<HTMLElement>(null);
   useEffect(() => {
+    contentRef.current?.scrollTo?.({ top: 0, left: 0 });
     const frame = requestAnimationFrame(() => {
       if (!document.querySelector('[role="dialog"], [role="alertdialog"]'))
         contentRef.current?.focus();
@@ -311,7 +312,6 @@ export function SimpleModeWrapper({
         {/* Content area */}
         <main
           ref={contentRef}
-          inert={(narrow && showSidebar) || undefined}
           id="main-content"
           tabIndex={-1}
           className="flex-1 min-w-0 overflow-auto"
@@ -320,9 +320,7 @@ export function SimpleModeWrapper({
         </main>
       </div>
 
-      <div inert={(narrow && showSidebar) || undefined}>
-        {transferWorkspace}
-      </div>
+      <div>{transferWorkspace}</div>
     </div>
   );
 }

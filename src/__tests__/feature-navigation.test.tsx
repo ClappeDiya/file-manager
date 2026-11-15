@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  within,
+  waitFor,
+} from "@testing-library/react";
 import { AllFeatures } from "@/components/simple-mode/all-features";
 import { SimpleModeWrapper } from "@/components/simple-mode/simple-mode-wrapper";
 import { PLATFORM_FEATURES } from "@/components/simple-mode/feature-catalog";
@@ -161,5 +167,58 @@ it("opens every catalog settings link at a real expanded section", async () => {
         { expanded: true },
       ),
     ).toBeVisible();
+  }
+});
+
+it("re-enables the page after closing mobile navigation", async () => {
+  const originalMedia = window.matchMedia;
+  const originalInert = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "inert",
+  );
+  // jsdom does not reflect inert. Match real-browser behavior to reproduce the
+  // conflict between declarative inert and the focus trap’s cleanup.
+  Object.defineProperty(HTMLElement.prototype, "inert", {
+    configurable: true,
+    get() {
+      return this.hasAttribute("inert");
+    },
+    set(value) {
+      this.toggleAttribute("inert", Boolean(value));
+    },
+  });
+  window.matchMedia = vi.fn().mockImplementation((query) => ({
+    matches: query === "(max-width: 639px)",
+    media: query,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+    onchange: null,
+  }));
+  const view = render(
+    <SimpleModeWrapper fileManager={<div>Files workspace</div>} />,
+  );
+  try {
+    fireEvent.click(screen.getByRole("button", { name: "Show sidebar" }));
+    expect(screen.getByRole("main", { hidden: true })).toHaveAttribute("inert");
+    fireEvent.click(screen.getByRole("button", { name: "Customize sidebar" }));
+    await waitFor(() =>
+      expect(screen.getByRole("main")).not.toHaveAttribute("inert"),
+    );
+    fireEvent.click(screen.getByRole("radio", { name: /Advanced/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Apply sidebar layout" }),
+    );
+    expect(useUIStore.getState().appMode).toBe("advanced");
+  } finally {
+    view.unmount();
+    window.matchMedia = originalMedia;
+    if (originalInert)
+      Object.defineProperty(HTMLElement.prototype, "inert", originalInert);
+    else
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>)
+        .inert;
   }
 });
