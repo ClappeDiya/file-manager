@@ -51,13 +51,13 @@ fn not_allowed() -> Response {
     r
 }
 
-fn challenge() -> Response {
+fn challenge() -> Box<Response> {
     let mut r = plain(StatusCode::UNAUTHORIZED, "Sign in with the server password or an API token.");
     r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"ufop WebDAV\", charset=\"UTF-8\""));
-    r
+    Box::new(r)
 }
 
-async fn authenticate(st: &ServerState, headers: &HeaderMap) -> Result<(), Response> {
+async fn authenticate(st: &ServerState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
     let mut user = String::new();
     let secret = if let Some(b) = auth.strip_prefix("Basic ") {
@@ -94,7 +94,7 @@ async fn authenticate(st: &ServerState, headers: &HeaderMap) -> Result<(), Respo
     let login = if known { st.auth.login_remembered_as(&user, &secret).await } else { st.auth.login_remembered(&secret).await };
     match login {
         Ok(Some(true)) => Ok(()),
-        Ok(None) => Err(plain(StatusCode::TOO_MANY_REQUESTS, "Too many sign-in attempts; try again shortly.")),
+        Ok(None) => Err(Box::new(plain(StatusCode::TOO_MANY_REQUESTS, "Too many sign-in attempts; try again shortly."))),
         _ => Err(challenge()),
     }
 }
@@ -263,7 +263,7 @@ async fn handle(State(st): State<ServerState>, ConnectInfo(peer): ConnectInfo<So
         return r;
     }
     if let Err(r) = authenticate(&st, &headers).await {
-        return r;
+        return *r;
     }
     let roots = match Roots::new(&st.cfg.dav_roots) {
         Ok(r) => r,

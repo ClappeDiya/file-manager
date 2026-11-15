@@ -124,7 +124,7 @@ export default function CredentialsPage() {
                 <TableHead className="hidden md:table-cell">Reference</TableHead>
                 <TableHead className="hidden md:table-cell">Updated</TableHead>
                 <TableHead>Version</TableHead>
-                <TableHead />
+                <TableHead><span className="sr-only">Actions</span></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>

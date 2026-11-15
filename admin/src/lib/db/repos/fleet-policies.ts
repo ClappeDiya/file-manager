@@ -1,3 +1,4 @@
+import { assertCredentialUnused, workspaceDeliveries, workspaceCredentialVersions } from './provisioning';
 /**
  * Fleet backup policies and central credentials.
  *
@@ -239,6 +240,8 @@ export function policyApplies(p: FleetPolicy, m: Machine): boolean {
 export function policySetVersion(m: Machine): string {
   const policies = policiesFor(m);
   const parts = policies.map((p) => `${p.id}:${p.version}`);
+  for (const w of workspaceDeliveries(m)) parts.push(`workspace:${w.id}:${w.version}`);
+  for (const c of workspaceCredentialVersions(m)) parts.push(`workspace-cred:${c.id}:${c.version}`);
   for (const c of credentialVersionsFor(policies)) parts.push(`cred:${c.id}:${c.version}`);
   const settings = managedSettingsForAgent(m.orgId);
   if (settings) parts.push(`settings:${settings.version}`);
@@ -316,6 +319,7 @@ export function rotateCredential(orgId: string, id: string, secret: string, by =
 }
 
 export function deleteCredential(orgId: string, id: string): boolean {
+  assertCredentialUnused(orgId, id);
   const used = listFleetPolicies(orgId).filter((p) => p.credentialIds.includes(id));
   if (used.length) throw new OrgError(`Used by policy "${used[0].name}"`, 409);
   return db().prepare('DELETE FROM central_credentials WHERE org_id = ? AND id = ?').run(orgId, id).changes > 0;

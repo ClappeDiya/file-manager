@@ -5,11 +5,11 @@
  * of React mounting, plus a minimal render assertion that guards
  * the "no shortcut rows when there are no shortcut commands" path.
  */
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render,screen } from "@testing-library/react";
+import { describe,expect,it } from "vitest";
+import type { CommandItem } from '../components/command-palette-helpers';
 import { KeyboardCheatSheet } from "../components/keyboard-cheat-sheet";
 import { groupShortcutCommandsByCategory } from "../lib/keyboard-shortcut-groups";
-import type { CommandItem } from "../components/command-palette";
 
 function cmd(
   id: string,

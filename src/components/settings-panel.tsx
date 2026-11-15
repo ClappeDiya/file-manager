@@ -9,7 +9,7 @@
  * Accessible from toolbar/menu. Uses progressive disclosure with
  * collapsible sections to avoid cognitive overload.
  */
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useId } from "react";
 import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useAiStore } from "@/stores/ai-store";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
@@ -92,6 +92,7 @@ function Section({
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen || focus);
+  const contentId = useId();
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!focus) return;
@@ -103,13 +104,15 @@ function Section({
       <button
         type="button"
         onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        aria-controls={open ? contentId : undefined}
         className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-left hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors"
       >
         <span>{title}</span>
         <span className="text-gray-400 text-xs">{open ? "collapse" : "expand"}</span>
       </button>
       {open && (
-        <div className="px-4 pb-4 border-t border-gray-200 dark:border-gray-700">
+        <div id={contentId} className="px-4 pb-4 border-t border-gray-200 dark:border-gray-700">
           {children}
         </div>
       )}

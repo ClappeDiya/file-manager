@@ -164,6 +164,12 @@ pub trait AgentHost: Send + Sync + 'static {
     fn apply_managed_settings(&self, _settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async { Ok(()) })
     }
+    /// Install the complete workspace snapshot; an unsupported host must never acknowledge it.
+    fn apply_workspaces(&self, workspaces: Vec<super::WorkspaceDelivery>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            if workspaces.is_empty() { Ok(()) } else { Err(AppError::state("Workspace delivery is not supported by this client", "Use an enrolled desktop client.")) }
+        })
+    }
     fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
         Box::pin(async { Err(AppError::state("Diagnostics are not available on this client", "Collect logs on the machine instead.")) })
     }
@@ -421,6 +427,7 @@ impl<H: AgentHost> Agent<H> {
                 tracing::warn!("Could not remove the managed job of policy {id}: {}", e.user_message());
             }
         }
+        self.host.apply_workspaces(Vec::new()).await?;
         for cred in &c.central_credentials {
             let _ = self.host.store_credential(cred.clone(), None).await;
         }
@@ -647,9 +654,31 @@ impl<H: AgentHost> Agent<H> {
                 }
             }
         }
+        // Install on every fetched snapshot, including an empty snapshot (revocation).
+        // A credential storage failure prevents a false workspace acknowledgement.
+        let workspace_result = if bundle.workspaces.len() > 500 {
+            Err(AppError::validation("Too many workspaces"))
+        } else {
+            bundle.workspaces.iter().try_for_each(|w| w.validate().map_err(AppError::validation))
+        };
+        let workspace_result = match workspace_result {
+            Ok(()) if bundle.workspaces.iter().flat_map(|w| &w.connections).filter_map(|c| c.credential_id.as_ref()).any(|id| !delivered.contains(id)) => Err(AppError::state("A workspace credential was not stored", "Retry console synchronization.")),
+            Ok(()) => self.host.apply_workspaces(bundle.workspaces.clone()).await,
+            Err(e) => Err(e),
+        };
         // The console sees the settings version next to the policies.
         let mut reported = applied.clone();
         reported.extend(credential_versions);
+        match workspace_result {
+            Ok(()) => for w in &bundle.workspaces { reported.insert(format!("workspace:{}", w.id), w.version); },
+            Err(e) => {
+                // Empty snapshots revoke the last grant. Keep an error key even
+                // then, so a failed revocation is retried without a console edit.
+                errors.insert("workspace:reconciliation".into(), e.user_message());
+                for w in &bundle.workspaces { errors.insert(format!("workspace:{}", w.id), e.user_message()); }
+            },
+        }
+
         if settings_version > 0 {
             reported.insert(MANAGED_SETTINGS_KEY.into(), settings_version);
         }
@@ -686,6 +715,12 @@ impl<H: AgentHost> Agent<H> {
         let hb = match r {
             Ok(hb) => hb,
             Err(e) => {
+                if matches!(&e, ConsoleError::Unauthorized(_)) {
+                    // A revoked machine cannot fetch an empty snapshot; remove its managed connections locally.
+                    if let Err(cleanup) = self.host.apply_workspaces(Vec::new()).await {
+                        tracing::warn!("Could not remove revoked workspace grants: {}", cleanup.user_message());
+                    }
+                }
                 self.update(|c| {
                     c.last_error = Some(e.to_string());
                     match &e {
@@ -711,7 +746,7 @@ impl<H: AgentHost> Agent<H> {
         // Before the commands, so they see the current managed jobs. Central
         // credentials live only in the secure store; after a restart a host
         // without one (the CLI) needs them again, so sync once per run.
-        if hb.policies_changed || !self.policies_fetched.load(Ordering::SeqCst) {
+        if hb.policies_changed || !self.policies_fetched.load(Ordering::SeqCst) || !c.policy_errors.is_empty() {
             if let Err(e) = self.sync_policies(&client, &token).await {
                 self.update(|c| c.last_error = Some(e.user_message()));
             }

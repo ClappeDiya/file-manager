@@ -7,6 +7,8 @@
  */
 import { create } from "zustand";
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
+import { listen } from "@tauri-apps/api/event";
+import { isTauriAvailable } from "@/hooks/use-tauri";
 import { CONNECTIONS_CHANGED_EVENT } from "@/lib/oauth";
 
 /** The fields of `ConnectionProfile` (core/types.rs) the panes need. */
@@ -74,4 +76,11 @@ if (typeof window !== "undefined") {
   window.addEventListener(CONNECTIONS_CHANGED_EVENT, () => {
     if (useConnectionsStore.getState().loaded) void useConnectionsStore.getState().load();
   });
+}
+
+// The native installer refreshes every connection consumer through the same event.
+if (typeof window !== "undefined" && isTauriAvailable()) {
+  void listen("managed-workspaces-changed", () => {
+    window.dispatchEvent(new Event(CONNECTIONS_CHANGED_EVENT));
+  }).catch((error: unknown) => console.error("Workspace updates could not be observed", error));
 }

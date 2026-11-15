@@ -31,7 +31,7 @@ export function WaitlistForm() {
       setEmail('');
       setCompany('');
       setSeats('');
-    } catch (err) {
+    } catch {
       setStatus('error');
       setError('Could not save your signup. Check your connection and try again, or contact sales@clappe.com.');
     }

@@ -73,7 +73,6 @@ hex = "0.4"
 bytes = "1"
 mdns-sd = "0.13"
 percent-encoding = "2"
-async-trait = "0.1"
 # T-034..T-038: Unicode normalization and compatibility engine
 unicode-normalization = "0.1"
 # T-039..T-042: Sync engine - filesystem watcher, scheduling, glob matching

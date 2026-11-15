@@ -18,7 +18,6 @@ import {
   X,
   ChevronLeft,
   ChevronRight,
-  Settings,
   Server,
   HardDrive,
   Link2,

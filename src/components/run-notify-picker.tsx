@@ -5,10 +5,10 @@
  * mutes small successful runs. The profile list and the missing-profile
  * check are shared with the backup job editor's picker.
  */
-import { useState } from "react";
-import { useProfileChoices } from "@/components/backup/backup-notification-profiles";
+import { useProfileChoices } from '@/components/backup/backup-notification-profiles-helpers';
+import { RUN_RESULTS,bytesToMb,mbToBytes,type RunNotify,type RunResult } from "@/lib/run-notify";
 import { channelLabel } from "@/stores/backup-notify";
-import { RUN_RESULTS, bytesToMb, mbToBytes, type RunNotify, type RunResult } from "@/lib/run-notify";
+import { useState } from "react";
 
 const field = "mt-1 block w-full px-2 py-1 text-xs border rounded bg-transparent dark:bg-zinc-800 dark:border-zinc-600";
 const labelCls = "block text-xs text-zinc-600 dark:text-zinc-400";

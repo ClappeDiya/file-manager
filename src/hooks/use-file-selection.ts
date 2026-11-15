@@ -1,6 +1,6 @@
-import { useCallback, useRef } from "react";
+import type { FileEntryData } from '@/components/file-list-helpers';
 import { useFileManagerStore } from "@/stores/file-manager-store";
-import type { FileEntryData } from "@/components/file-list";
+import { useCallback,useRef } from "react";
 
 /** Stable empty array to avoid re-render loops with React 19 + Zustand */
 const EMPTY_PATHS: string[] = [];

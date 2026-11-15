@@ -21,6 +21,7 @@ pub mod log_query;
 pub mod logging;
 pub mod diagnostics;
 pub mod managed_settings;
+pub mod managed_workspaces;
 pub mod net;
 pub mod notify_hub;
 pub mod search_engine;
@@ -149,7 +150,7 @@ async fn initialize_app_state() -> Result<AppState, crate::core::error::AppError
 
     // Failed jobs are restored too (still failed); keep only what the saved limits allow.
     transfer_engine::retention::enforce_at_startup(&repo).await;
-    transfer_engine::retention::persist_failures(&transfer_mgr, repo.clone());
+    transfer_engine::retention::persist_terminal_states(&transfer_mgr, repo.clone());
     let queued_jobs = StorageOperations::load_transfer_queue(&repo).await?;
     if !queued_jobs.is_empty() {
         tracing::info!(
@@ -498,7 +499,7 @@ pub fn run() {
                 rt2.block_on(async {
                     transfer_mgr.init_journal(repo.pool().clone()).await;
                     transfer_mgr.set_history(transfer_history.clone()).await;
-                    transfer_engine::retention::persist_failures(&transfer_mgr, repo.clone());
+                    transfer_engine::retention::persist_terminal_states(&transfer_mgr, repo.clone());
                     vault_mgr.set_pool(repo.pool().clone()).await;
                 });
                 let ledger = OperationLedger::new(repo.pool().clone());
@@ -678,6 +679,27 @@ pub fn run() {
                     let org = h.state::<fleet_agent::FleetAgent>().status().organization;
                     let targets = managed_settings::Targets { repo: &h.state::<Repository>(), creds: &h.state::<std::sync::Arc<CredentialStore>>(), ai: &h.state::<AiAssistant>(), backups: &h.state::<BackupManager>(), mounts: &h.state::<MountManager>(), automation: &h.state::<AutomationManager>() };
                     managed_settings::apply(targets, &org, settings).await
+                })
+            }));
+            let workspace_handle = app.handle().clone();
+            setup_agent.host().set_workspace_handler(std::sync::Arc::new(move |workspaces| {
+                let h = workspace_handle.clone();
+                Box::pin(async move {
+                    let repo = h.state::<Repository>();
+                    let previous = repo.get_config("fleet.workspace-snapshot").await?;
+                    if previous.as_deref() != Some(&serde_json::to_string(&workspaces)?) {
+                        for id in managed_workspaces::owned(&repo).await? {
+                            if let Some(profile) = repo.get_connection(id).await? {
+                                if let Some(connector) = h.state::<ConnectorRegistry>().get_by_protocol(profile.protocol) {
+                                    if connectors::connected_as(connector.as_ref(), Some(id)) { connector.disconnect().await?; }
+                                }
+                            }
+                        }
+                    }
+                    managed_workspaces::apply(&repo, workspaces).await?;
+                    use tauri::Emitter;
+                    let _ = h.emit("managed-workspaces-changed", ());
+                    Ok(())
                 })
             }));
             fleet_agent::spawn(setup_agent.clone(), "unified-file-ops");

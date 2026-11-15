@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { getDefaultCommands } from "@/components/command-palette";
+import { getDefaultCommands } from '@/components/command-palette-helpers';
+import { describe,expect,it,vi } from "vitest";
 
 describe("command palette × rclone", () => {
   it("opens the rclone remote manager and the rclone settings", () => {

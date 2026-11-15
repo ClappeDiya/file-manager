@@ -1,14 +1,14 @@
 /** WS-I row 74: the in-app log viewer (Advanced). */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor,within } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
+import { getDefaultCommands } from '@/components/command-palette-helpers';
 import { LogViewer } from "@/components/log-viewer";
 import { LogViewerDialog } from "@/components/log-viewer-dialog";
-import { getDefaultCommands } from "@/components/command-palette";
-import { clockTime, fetchTail, localToIso, logQuery, mergeTail, NO_FILTERS, recordText, type LogPage, type LogRecord } from "@/lib/log-viewer";
+import { clockTime,fetchTail,localToIso,logQuery,mergeTail,NO_FILTERS,recordText,type LogPage,type LogRecord } from "@/lib/log-viewer";
 import { useLogViewer } from "@/stores/log-viewer-store";
 import { useUIStore } from "@/stores/ui-store";
 

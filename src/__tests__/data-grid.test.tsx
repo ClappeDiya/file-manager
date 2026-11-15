@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { DataGrid } from '@/components/data-grid';
+import { generateDemoFiles } from '@/components/data-grid-helpers';
+import { render,screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { DataGrid, generateDemoFiles } from "@/components/data-grid";
+import { describe,expect,it } from "vitest";
 
 describe("DataGrid (TanStack Table)", () => {
   const demoFiles = generateDemoFiles(25);

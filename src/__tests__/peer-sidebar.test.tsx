@@ -1,15 +1,15 @@
 /** Nearby computers panel: sends the chosen files, shows real transfer
  *  progress, answers requests (Downloads or "Save here"), and polls the
  *  backend at a steady rate instead of on every render. */
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { afterEach,beforeAll,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { PeerSidebar, type PeerDeviceData, type PeerTransferProgress, type PeerTransferRequestData } from "@/components/peer-sidebar";
-import { getFileContextMenuItems } from "@/components/context-menu";
-import { getDefaultCommands } from "@/components/command-palette";
+import { getDefaultCommands } from '@/components/command-palette-helpers';
+import { getFileContextMenuItems } from '@/components/context-menu-helpers';
+import { PeerSidebar,type PeerDeviceData,type PeerTransferProgress,type PeerTransferRequestData } from "@/components/peer-sidebar";
 
 const peer: PeerDeviceData = {
   id: "p1",

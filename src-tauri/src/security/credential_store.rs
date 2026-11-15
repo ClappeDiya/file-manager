@@ -369,6 +369,11 @@ impl CredentialStore {
     }
 
     /// Check if the OS keychain is available.
+    /// Whether secrets survive a restart in an encrypted store (OS keychain or portable vault).
+    pub fn is_persistent(&self) -> bool {
+        self.keychain_available || self.file_vault.is_some()
+    }
+
     pub fn is_keychain_available(&self) -> bool {
         self.keychain_available
     }

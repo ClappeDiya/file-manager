@@ -527,7 +527,7 @@ fn create_7z_with_stdin_password(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     use std::io::Write;
     let count = sources.len();
-    let mut args = vec!["a".to_string(), format!("-p"), output.to_string()];
+    let mut args = vec!["a".to_string(), "-p".to_string(), output.to_string()];
     args.extend(sources.iter().cloned());
 
     let mut child = std::process::Command::new("7z")

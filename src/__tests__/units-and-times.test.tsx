@@ -2,16 +2,16 @@
  * K123: app-wide size units (binary / decimal) through formatBytes, and the
  * backup timestamp display (local / UTC) through formatDate.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
-import { migrateUIState, useUIStore } from "@/stores/ui-store";
-import { formatBytes, getDefaultByteUnits } from "@/lib/format-bytes";
-import { formatFileSize } from "@/components/file-list";
-import { formatFileSize as formatLocalized } from "@/lib/i18n";
-import { formatBackupTime } from "@/lib/backup-time";
-import { formatDate } from "@/lib/backup-helpers";
-import { human } from "@/lib/mount-options";
 import { AppearanceSettings } from "@/components/appearance-settings";
+import { formatFileSize } from '@/components/file-list-helpers';
+import { formatDate } from "@/lib/backup-helpers";
+import { formatBackupTime } from "@/lib/backup-time";
+import { formatBytes,getDefaultByteUnits } from "@/lib/format-bytes";
+import { formatFileSize as formatLocalized } from "@/lib/i18n";
+import { human } from "@/lib/mount-options";
+import { migrateUIState,useUIStore } from "@/stores/ui-store";
+import { fireEvent,render,screen } from "@testing-library/react";
+import { afterEach,beforeEach,describe,expect,it } from "vitest";
 
 beforeEach(() => localStorage.clear());
 afterEach(() => {

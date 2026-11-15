@@ -3,17 +3,18 @@
  * each backup, on their own interval, or on demand. Each replica can be
  * restored from on its own (Restore from folder).
  */
-import { useEffect, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
+import { inputCls } from "@/lib/backup-helpers";
+import { runDuration } from "@/lib/backup-time";
 import { errorText } from "@/lib/error-text";
 import { formatBytes } from "@/lib/format-bytes";
 import { formatLocalTime } from "@/lib/history-range";
-import { runDuration } from "@/lib/backup-time";
 import { triggerLabel } from "@/lib/run-trigger";
-import { inputCls } from "@/lib/backup-helpers";
-import type { BackupDestination, Replica, ReplicaRun, ReplicaSchedule, SavedDestination } from "@/stores/backup-store";
-import { Btn, Check, Field, PathInput, Section } from "./backup-ui";
-import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
+import type { BackupDestination,Replica,ReplicaRun,ReplicaSchedule,SavedDestination } from "@/stores/backup-store";
+import { useEffect,useState } from "react";
+import { CloudDestinationForm } from './backup-cloud-destination';
+import { newCloudConfig } from './backup-cloud-destination-helpers';
+import { Btn,Check,Field,PathInput,Section } from "./backup-ui";
 
 interface Conn {
   id: string;

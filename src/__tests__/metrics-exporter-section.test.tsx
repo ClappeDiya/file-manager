@@ -1,12 +1,13 @@
 /** Desktop Prometheus exporter settings: off by default, save, token handling, errors, Advanced gate. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { MetricsExporterSection, portProblem, type MetricsStatus, type MetricsSettingsUpdate } from "@/components/metrics-exporter-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { MetricsExporterSection,type MetricsSettingsUpdate,type MetricsStatus } from '@/components/metrics-exporter-section';
+import { portProblem } from '@/components/metrics-exporter-section-helpers';
 import { useUIStore } from "@/stores/ui-store";
 
 const off: MetricsStatus = { enabled: false, port: 9464, token_set: false, listening: false, url: null, error: null };

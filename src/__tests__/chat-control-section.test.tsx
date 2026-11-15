@@ -1,12 +1,13 @@
 /** Chat-bot remote control settings: off by default, allow-lists, token handling, errors, Advanced gate. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { ChatControlSection, parseIds, type ChatControlSettings, type ChatControlView } from "@/components/chat-control-section";
 import { AdvancedOnly } from "@/components/backup/advanced-only";
+import { ChatControlSection,type ChatControlSettings,type ChatControlView } from '@/components/chat-control-section';
+import { parseIds } from '@/components/chat-control-section-helpers';
 import { useUIStore } from "@/stores/ui-store";
 
 const idle = { connected: false, handled: 0, last_error: null };

@@ -101,27 +101,27 @@ impl Hub {
     async fn submit(&self, gateway: &str, op: Op, upload: Option<Body>) -> (Result<Reply, Response>, Option<Body>) {
         let mut upload = upload;
         let r = self.submit_inner(gateway, op, &mut upload).await;
-        (r, upload)
+        (r.map_err(|r| *r), upload)
     }
 
-    async fn submit_inner(&self, gateway: &str, op: Op, upload: &mut Option<Body>) -> Result<Reply, Response> {
+    async fn submit_inner(&self, gateway: &str, op: Op, upload: &mut Option<Body>) -> Result<Reply, Box<Response>> {
         let needs_write = matches!(op, Op::Upload { .. });
         let id = uuid::Uuid::new_v4().simple().to_string();
         let (tx, rx) = oneshot::channel();
         {
             let mut s = self.lock();
             let Some(g) = s.gateways.get_mut(gateway) else {
-                return Err(fail(StatusCode::NOT_FOUND, &format!("No gateway named {gateway} has connected"), "Start `ufop gateway serve` on the machine with the files."));
+                return Err(Box::new(fail(StatusCode::NOT_FOUND, &format!("No gateway named {gateway} has connected"), "Start `ufop gateway serve` on the machine with the files.")));
             };
             let nodes: Vec<&Node> = g.nodes.values().filter(|n| online(n)).collect();
             if nodes.is_empty() {
-                return Err(fail(StatusCode::SERVICE_UNAVAILABLE, &format!("No node of gateway {gateway} is online"), "Check that the gateway agent is running and can reach this server."));
+                return Err(Box::new(fail(StatusCode::SERVICE_UNAVAILABLE, &format!("No node of gateway {gateway} is online"), "Check that the gateway agent is running and can reach this server.")));
             }
             if needs_write && !nodes.iter().any(|n| n.hello.writable) {
-                return Err(fail(StatusCode::FORBIDDEN, &format!("Gateway {gateway} is read-only"), "Start the agent with --writable to accept uploads."));
+                return Err(Box::new(fail(StatusCode::FORBIDDEN, &format!("Gateway {gateway} is read-only"), "Start the agent with --writable to accept uploads.")));
             }
             if g.queue.len() >= MAX_QUEUE {
-                return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "The gateway is busy", "Try again shortly."));
+                return Err(Box::new(fail(StatusCode::SERVICE_UNAVAILABLE, "The gateway is busy", "Try again shortly.")));
             }
             g.queue.push_back(Job { id: id.clone(), op });
             // Every waiting node looks; the first that can take the job does.
@@ -136,7 +136,7 @@ impl Hub {
         }
         match r {
             Ok(Ok(reply)) => Ok(reply),
-            _ => Err(fail(StatusCode::GATEWAY_TIMEOUT, &format!("Gateway {gateway} did not answer"), "The node may have stopped; try again.")),
+            _ => Err(Box::new(fail(StatusCode::GATEWAY_TIMEOUT, &format!("Gateway {gateway} did not answer"), "The node may have stopped; try again."))),
         }
     }
 

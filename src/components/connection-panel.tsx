@@ -16,31 +16,31 @@
  * - rclone remote manager (create/edit/test/delete, "Add as connection");
  *   crypt banner with "Open underlying remote" and name decoding (Advanced)
  */
-import { useState, useCallback, useEffect, useMemo, useRef } from "react";
-import { ShareLinkDialog } from "@/components/share-link-dialog";
-import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
-import { tauriInvoke } from "@/hooks/use-tauri";
-import { formatBytes } from "@/lib/format-bytes";
-import { pickFiles, pickFolder } from "@/lib/folder-picker";
-import { promptText, confirmText } from "@/lib/prompt-dialog";
-import { errorText } from "@/lib/error-text";
-import { isMountable } from "@/lib/mount-options";
-import { useMountsUi } from "@/stores/mounts-ui-store";
-import { PRESET_FIELD_LABELS, fillPreset, type ProviderPreset } from "@/lib/provider-presets";
-import { PasswordInput } from "@/components/password-input";
+import { CloudScopeFields,type CloudExtras,type OAuthSettings } from "@/components/cloud-connection-fields";
 import { OAuthSignIn } from "@/components/oauth-sign-in";
-import { CloudScopeFields, type CloudExtras, type OAuthSettings } from "@/components/cloud-connection-fields";
-import { CONNECTIONS_CHANGED_EVENT, OAUTH_PROTOCOLS, googleDownloadName, isSignedIn, signOut } from "@/lib/oauth";
-import { useUIStore } from "@/stores/ui-store";
-import { useConnectionsStore } from "@/stores/connections-store";
-import { remoteLocation } from "@/lib/location";
-import { useRcloneUi } from "@/stores/rclone-ui-store";
-import { useCompareStore } from "@/stores/compare-store";
-import { useFileManagerStore } from "@/stores/file-manager-store";
-import { useConnectionBrowse } from "@/stores/connection-browse-store";
+import { PasswordInput } from "@/components/password-input";
+import { CryptBanner,CryptNamesDialog } from "@/components/rclone/rclone-crypt";
 import { RcloneRemoteManager } from "@/components/rclone/rclone-remote-manager";
-import { CryptBanner, CryptNamesDialog } from "@/components/rclone/rclone-crypt";
-import { RCLONE_REMOTES_CHANGED_EVENT, rcloneCryptInfo, type RcloneCryptInfo } from "@/lib/rclone";
+import { ShareLinkDialog } from "@/components/share-link-dialog";
+import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
+import { pickFiles,pickFolder } from "@/lib/folder-picker";
+import { formatBytes } from "@/lib/format-bytes";
+import { remoteLocation } from "@/lib/location";
+import { isMountable } from "@/lib/mount-options";
+import { CONNECTIONS_CHANGED_EVENT,OAUTH_PROTOCOLS,googleDownloadName,isSignedIn,signOut } from "@/lib/oauth";
+import { confirmText,promptText } from "@/lib/prompt-dialog";
+import { PRESET_FIELD_LABELS,fillPreset,type ProviderPreset } from "@/lib/provider-presets";
+import { RCLONE_REMOTES_CHANGED_EVENT,rcloneCryptInfo,type RcloneCryptInfo } from "@/lib/rclone";
+import { useCompareStore } from "@/stores/compare-store";
+import { useConnectionBrowse } from "@/stores/connection-browse-store";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { useFileManagerStore } from "@/stores/file-manager-store";
+import { useMountsUi } from "@/stores/mounts-ui-store";
+import { useRcloneUi } from "@/stores/rclone-ui-store";
+import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
+import { useUIStore } from "@/stores/ui-store";
+import { useCallback,useEffect,useMemo,useRef,useState } from "react";
 
 // ── Types (mirrors Rust types) ──
 
@@ -110,6 +110,7 @@ interface SmbSettings {
 }
 
 interface ConnectionExtras extends CloudExtras {
+  managed_by?: string | null;
   assume_role: AssumeRoleConfig | null;
   rclone_remote: string | null;
   preset: string | null;
@@ -392,8 +393,8 @@ function SshKeyGenSection({
       });
       setResult(res);
       onKeyGenerated(res.private_key_path, showPassphrase && passphrase ? passphrase : null);
-    } catch (e: any) {
-      setGenError(e?.message || "Key generation failed");
+    } catch (e: unknown) {
+      setGenError(errorText(e, "Key generation failed"));
     } finally {
       setGenerating(false);
     }
@@ -430,7 +431,7 @@ function SshKeyGenSection({
         <>
           <div>
             <label className="block text-xs font-medium mb-1">Algorithm</label>
-            <select
+            <select aria-label="Algorithm"
               value={algorithm}
               onChange={(e) => setAlgorithm(e.target.value)}
               className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
@@ -495,7 +496,7 @@ function SshKeyGenSection({
             <label className="block text-xs font-medium mb-1 text-gray-500 dark:text-gray-400">
               Public key (add to server&apos;s authorized_keys):
             </label>
-            <textarea
+            <textarea aria-label="Public key (add to server&apos;s authorized_keys):"
               readOnly
               value={result.public_key_content}
               rows={2}
@@ -576,11 +577,6 @@ function ConnectionForm({
 
   // Charset
   const [charset, setCharset] = useState(initialData?.charset || "utf-8");
-
-  // FTP data type (Binary/ASCII/Auto)
-  const [ftpDataType, setFtpDataType] = useState(
-    (initialData as any)?.ftp_data_type || "binary"
-  );
 
   // Upload-time permission defaults
   const [defaultFileMode, setDefaultFileMode] = useState(
@@ -777,8 +773,6 @@ function ConnectionForm({
       defaultRemoteDir: defaultRemoteDir || null,
       // Charset
       charset: isFtpProtocol ? charset || null : null,
-      // FTP data type
-      ftpDataType: isFtpProtocol ? ftpDataType : null,
       // Upload-time permission defaults (SFTP/FTP only)
       defaultFileMode: isSshProtocol || isFtpProtocol ? defaultFileMode || null : null,
       defaultDirMode: isSshProtocol || isFtpProtocol ? defaultDirMode || null : null,
@@ -822,7 +816,7 @@ function ConnectionForm({
     <form onSubmit={handleSubmit} className="space-y-3 p-3">
       <div>
         <label className="block text-xs font-medium mb-1">Name</label>
-        <input
+        <input aria-label="Name"
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -833,7 +827,7 @@ function ConnectionForm({
       <div className="grid grid-cols-2 gap-2">
         <div>
           <label className="block text-xs font-medium mb-1">Protocol</label>
-          <select
+          <select aria-label="Protocol"
             value={protocol}
             onChange={(e) => {
               setProtocol(e.target.value);
@@ -852,7 +846,7 @@ function ConnectionForm({
         {!isOAuth && !isB2 && (
         <div>
           <label className="block text-xs font-medium mb-1">Port</label>
-          <input
+          <input aria-label="Port"
             type="number"
             value={port}
             onChange={(e) => setPort(e.target.value)}
@@ -1007,7 +1001,7 @@ function ConnectionForm({
       {protocol === "s3" && awsProfiles.length > 0 && (
         <div>
           <label className="block text-xs font-medium mb-1">AWS Profile</label>
-          <select
+          <select aria-label="AWS Profile"
             value={selectedAwsProfile}
             onChange={(e) => handleAwsProfileSelect(e.target.value)}
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
@@ -1272,7 +1266,7 @@ function ConnectionForm({
       )}
       <div>
         <label className="block text-xs font-medium mb-1">Remote Path</label>
-        <input
+        <input aria-label="Remote Path"
           type="text"
           value={remotePath}
           onChange={(e) => setRemotePath(e.target.value)}
@@ -1282,7 +1276,7 @@ function ConnectionForm({
       {groups.length > 0 && (
         <div>
           <label className="block text-xs font-medium mb-1">Group</label>
-          <select
+          <select aria-label="Group"
             value={groupId}
             onChange={(e) => setGroupId(e.target.value)}
             className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
@@ -1323,7 +1317,7 @@ function ConnectionForm({
                 <label className="block text-xs font-medium mb-1">
                   Proxy Type
                 </label>
-                <select
+                <select aria-label="Proxy Type"
                   value={proxyType}
                   onChange={(e) => setProxyType(e.target.value)}
                   className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
@@ -1340,7 +1334,7 @@ function ConnectionForm({
                       <label className="block text-xs font-medium mb-1">
                         Proxy Host
                       </label>
-                      <input
+                      <input aria-label="Proxy Host"
                         type="text"
                         value={proxyHost}
                         onChange={(e) => setProxyHost(e.target.value)}
@@ -1352,7 +1346,7 @@ function ConnectionForm({
                       <label className="block text-xs font-medium mb-1">
                         Port
                       </label>
-                      <input
+                      <input aria-label="Port"
                         type="number"
                         value={proxyPort}
                         onChange={(e) => setProxyPort(e.target.value)}
@@ -1366,7 +1360,7 @@ function ConnectionForm({
                       <label className="block text-xs font-medium mb-1">
                         Proxy Username
                       </label>
-                      <input
+                      <input aria-label="Proxy Username"
                         type="text"
                         value={proxyUsername}
                         onChange={(e) => setProxyUsername(e.target.value)}
@@ -1399,7 +1393,7 @@ function ConnectionForm({
                 <label className="block text-xs font-medium mb-1">
                   Default Local Directory
                 </label>
-                <input
+                <input aria-label="Default Local Directory"
                   type="text"
                   value={defaultLocalDir}
                   onChange={(e) => setDefaultLocalDir(e.target.value)}
@@ -1411,7 +1405,7 @@ function ConnectionForm({
                 <label className="block text-xs font-medium mb-1">
                   Default Remote Directory
                 </label>
-                <input
+                <input aria-label="Default Remote Directory"
                   type="text"
                   value={defaultRemoteDir}
                   onChange={(e) => setDefaultRemoteDir(e.target.value)}
@@ -1435,7 +1429,7 @@ function ConnectionForm({
                     <label className="block text-xs font-medium mb-1">
                       File Mode
                     </label>
-                    <input
+                    <input aria-label="File Mode"
                       type="text"
                       value={defaultFileMode}
                       onChange={(e) => setDefaultFileMode(e.target.value)}
@@ -1448,7 +1442,7 @@ function ConnectionForm({
                     <label className="block text-xs font-medium mb-1">
                       Directory Mode
                     </label>
-                    <input
+                    <input aria-label="Directory Mode"
                       type="text"
                       value={defaultDirMode}
                       onChange={(e) => setDefaultDirMode(e.target.value)}
@@ -1468,7 +1462,7 @@ function ConnectionForm({
                   Character Set
                 </label>
                 <div>
-                  <select
+                  <select aria-label="Character Set"
                     value={charset}
                     onChange={(e) => setCharset(e.target.value)}
                     className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
@@ -1486,28 +1480,6 @@ function ConnectionForm({
               </div>
             )}
 
-            {/* ── Transfer Data Type (FTP/FTPS only) ── */}
-            {isFtpProtocol && (
-              <div className="space-y-2">
-                <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  Transfer Type
-                </label>
-                <div>
-                  <select
-                    value={ftpDataType}
-                    onChange={(e) => setFtpDataType(e.target.value)}
-                    className="w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
-                  >
-                    <option value="binary">Binary (default)</option>
-                    <option value="ascii">ASCII</option>
-                    <option value="auto">Auto (text extensions use ASCII)</option>
-                  </select>
-                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-                    Binary is correct for most files. ASCII converts line endings for text files across platforms.
-                  </p>
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -1570,6 +1542,7 @@ function ConnectionItem({
   signedIn?: boolean | null;
   onSignOut?: (conn: ConnectionProfile) => void;
 }) {
+  const managed = !!connection.extras?.managed_by;
   const starred = !!status?.starred;
   const isOAuth = OAUTH_PROTOCOLS.has(connection.protocol);
   const rejected = !!status?.credentials_rejected_at;
@@ -1607,6 +1580,7 @@ function ConnectionItem({
           <span className="text-xs text-gray-400 dark:text-gray-500 uppercase">
             {connection.protocol}
           </span>
+          {managed && <span className="text-xs text-gray-500">Managed</span>}
           {testResult && (
             <span
               className={`text-xs ${testResult.reachable ? "text-green-500" : "text-red-500"}`}
@@ -1700,7 +1674,8 @@ function ConnectionItem({
           onClick={() => onEdit(connection)}
           className="text-xs px-2 py-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
           type="button"
-          title="Edit"
+          disabled={managed}
+          title={managed ? "Managed by your organization; edit in the console" : "Edit"}
         >
           Edit
         </button>
@@ -1708,7 +1683,8 @@ function ConnectionItem({
           onClick={() => onDelete(connection.id)}
           className="text-xs px-2 py-1 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-red-600 dark:text-red-400"
           type="button"
-          title="Delete"
+          disabled={managed}
+          title={managed ? "Managed by your organization; revoke its grant in the console" : "Delete"}
         >
           Del
         </button>

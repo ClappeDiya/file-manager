@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import { CommandPalette, getDefaultCommands, type CommandItem } from "@/components/command-palette";
+import { CommandPalette } from '@/components/command-palette';
+import { getDefaultCommands,type CommandItem } from '@/components/command-palette-helpers';
 import { MRU_STORAGE_KEY } from "@/lib/command-mru";
+import { fireEvent,render,screen } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 describe("T-013: CommandPalette", () => {
   // Iter 24: the palette persists command-usage frecency to

@@ -16,45 +16,46 @@
  * transfer engine / connectors, recorded in the ledger (Undo for new
  * copies), and only the entries it touched are re-compared.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowLeft, ArrowRight, ChevronDown, ChevronRight, Trash2, X } from "lucide-react";
-import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
+import { isTauriAvailable,tauriInvoke,tauriInvokeSafe } from "@/hooks/use-tauri";
+import { isWindowsPlatform,type CompareMode } from "@/lib/copy-options";
 import { errorText } from "@/lib/error-text";
+import {
+COMPARE_PROGRESS_EVENT,
+COMPARE_STATUSES,
+DEFAULT_COMPARE_OPTIONS,
+STATUS_LABEL,
+ancestorsOf,
+buildTree,
+largestDifference,
+mergeOutcome,
+nextDifferencePath,
+parsePatterns,
+rangeBetween,
+selectionRoots,
+sideLabel,
+totalsCount,
+visibleRows,
+type ApplyOutcome,
+type CompareAction,
+type CompareActionPlan,
+type CompareOptions,
+type CompareProgress,
+type CompareResult,
+type CompareSort,
+type CompareStatus,
+type TreeNode,
+} from "@/lib/folder-compare";
 import { formatBytes } from "@/lib/format-bytes";
 import { assessBeforeExecute } from "@/lib/safety";
-import { isWindowsPlatform, type CompareMode } from "@/lib/copy-options";
-import {
-  COMPARE_PROGRESS_EVENT,
-  COMPARE_STATUSES,
-  DEFAULT_COMPARE_OPTIONS,
-  STATUS_LABEL,
-  ancestorsOf,
-  buildTree,
-  largestDifference,
-  mergeOutcome,
-  nextDifferencePath,
-  parsePatterns,
-  rangeBetween,
-  selectionRoots,
-  sideLabel,
-  totalsCount,
-  visibleRows,
-  type ApplyOutcome,
-  type CompareAction,
-  type CompareActionPlan,
-  type CompareOptions,
-  type CompareProgress,
-  type CompareResult,
-  type CompareSort,
-  type CompareStatus,
-  type TreeNode,
-} from "@/lib/folder-compare";
-import { useCompareStore, type CompareRequest } from "@/stores/compare-store";
 import type { FilterRule } from "@/stores/backup-store";
-import { FilterPresetPicker, FilterRulesEditor, FilterRulesSummary, ImportRulesButton, appendRules, useFilterGroups } from "./filter-rules-editor";
+import { useCompareStore,type CompareRequest } from "@/stores/compare-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { ArrowLeft,ArrowRight,ChevronDown,ChevronRight,Trash2,X } from "lucide-react";
+import { useCallback,useEffect,useMemo,useRef,useState } from "react";
+import { FilterPresetPicker,FilterRulesEditor,FilterRulesSummary,ImportRulesButton } from './filter-rules-editor';
+import { appendRules,useFilterGroups } from './filter-rules-editor-helpers';
 
 const ROW_HEIGHT = 26;
 

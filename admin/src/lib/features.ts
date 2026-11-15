@@ -19,10 +19,10 @@ export const FEATURES = {
   billing: true,
   /** Outbound webhook subscriptions with delivery. */
   webhooks: true,
-  /** Org-level connector definitions (use Fleet → Credentials meanwhile). */
-  connectors: false,
+  /** Organization connector provisioning with credential references and desktop grants. */
+  connectors: true,
   /** Persisted grants and delivery of shared workspaces to clients. */
-  sharedWorkspaces: false,
+  sharedWorkspaces: true,
   /** Server-side sync-pair and transfer management. */
   syncApi: false,
   transferApi: false,

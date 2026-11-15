@@ -332,10 +332,12 @@ pub(crate) async fn instance_for<C: Connector + ?Sized>(
     caller: Caller,
 ) -> Result<std::sync::Arc<C>, AppError> {
     let id = parse_connection_id(cid)?;
+    // Resolve the current grant before reusing a live protocol session. A revoked
+    // workspace must not keep working just because its socket is still open.
+    let profile = manager.get_connection(id).await?.ok_or_else(|| AppError::not_found(format!("Saved connection {cid} not found")))?;
     if crate::connectors::connected_as(connector.as_ref(), Some(id)) {
         return Ok(connector);
     }
-    let profile = manager.get_connection(id).await?.ok_or_else(|| AppError::not_found(format!("Saved connection {cid} not found")))?;
     let secrets = match caller {
         Caller::User => manager.get_secrets(id).await?,
         Caller::Background => manager.background_secrets(id, &profile.name).await?,
@@ -825,6 +827,18 @@ mod tests {
                 Ok(64)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn a_live_socket_cannot_bypass_a_revoked_saved_connection() {
+        let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+        let manager = ConnectionManager::new(repo.clone(), std::sync::Arc::new(CredentialStore { cache: Default::default(), keychain_available: false, file_vault: None }));
+        let p = crate::connectors::live_tests::profile(ConnectionProtocol::Sftp, "files.example.org", None, "u", "/");
+        repo.save_connection(&p).await.unwrap();
+        let connector = std::sync::Arc::new(Endless);
+        assert!(instance_for(connector.clone(), |_| None, &manager, &p.id.to_string(), Caller::User).await.is_ok());
+        repo.delete_connection(p.id).await.unwrap();
+        assert!(instance_for(connector, |_| None, &manager, &p.id.to_string(), Caller::User).await.is_err());
     }
 
     /// Regression: the preview cap held only for a listed size, so files

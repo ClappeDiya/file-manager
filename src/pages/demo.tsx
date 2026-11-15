@@ -1,11 +1,12 @@
+import { AccessibleList,ListItem } from "@/components/accessible-list";
+import { DataGrid } from '@/components/data-grid';
+import { generateDemoFiles } from '@/components/data-grid-helpers';
+import { ThemeSwitcher } from "@/components/theme-switcher";
+import { VirtualList } from "@/components/virtual-list";
+import { Badge,Button,Separator,Tabs,TabsContent,TabsList,TabsTrigger } from "@ufop/ui-components";
+import { ArrowLeft } from "lucide-react";
 import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { DataGrid, generateDemoFiles } from "@/components/data-grid";
-import { VirtualList } from "@/components/virtual-list";
-import { AccessibleList, ListItem } from "@/components/accessible-list";
-import { ThemeSwitcher } from "@/components/theme-switcher";
-import { Button, Badge, Separator, Tabs, TabsList, TabsTrigger, TabsContent } from "@ufop/ui-components";
-import { ArrowLeft } from "lucide-react";
 
 /**
  * Demo page showcasing TanStack Table, TanStack Virtual, and React Aria components.

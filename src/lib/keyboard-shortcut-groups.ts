@@ -12,7 +12,7 @@
  * flows through this helper — zero per-shortcut wiring on the
  * cheat sheet side.
  */
-import type { CommandItem } from "@/components/command-palette";
+import type { CommandItem } from '@/components/command-palette-helpers';
 
 export interface ShortcutCategoryGroup {
   category: string;

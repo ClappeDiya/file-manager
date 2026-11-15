@@ -19,6 +19,8 @@ struct HostState {
     /// Managed settings applied by the agent, in order (`None` = released).
     settings: Vec<Option<ManagedSettings>>,
     fail_settings: bool,
+    fail_workspaces: bool,
+    workspaces: Vec<Vec<WorkspaceDelivery>>,
 }
 
 #[derive(Clone, Default)]
@@ -115,6 +117,13 @@ impl AgentHost for FakeHost {
             Ok(())
         })
     }
+    fn apply_workspaces(&self, workspaces: Vec<WorkspaceDelivery>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            if self.st().fail_workspaces { return Err(AppError::validation("workspace disk write failed")); }
+            self.st().workspaces.push(workspaces);
+            Ok(())
+        })
+    }
     fn diagnostics(&self) -> BoxFuture<'_, Result<DiagnosticsUpload, AppError>> {
         Box::pin(async move {
             match self.st().diag_size {
@@ -140,6 +149,7 @@ struct Console {
     rotations: u32,
     diagnostics: Vec<Value>,
     managed_settings: Value,
+    workspaces: Vec<Value>,
     secret: Option<String>,
     cred_version: u64,
 }
@@ -181,7 +191,7 @@ fn console() -> (MockConsole, Arc<Mutex<Console>>) {
             }
             "/api/agent/policies" => (
                 200,
-                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": c.secret.clone().unwrap_or_else(|| "s3cret".into()), "updatedAt": "", "version": c.cred_version }], "managedSettings": c.managed_settings }),
+                json!({ "policySetVersion": c.version, "policies": c.policies, "credentials": [{ "credentialId": "central:crd_1", "name": "pw", "secret": c.secret.clone().unwrap_or_else(|| "s3cret".into()), "updatedAt": "", "version": c.cred_version }], "managedSettings": c.managed_settings, "workspaces": c.workspaces }),
             ),
             "/api/agent/policies/applied" => {
                 c.applied = r.body.clone();
@@ -385,7 +395,7 @@ async fn managed_settings_apply_on_change_report_errors_and_release() {
     assert!(c.lock().unwrap().applied["errors"][MANAGED_SETTINGS_KEY].as_str().unwrap().contains("unreachable"));
     host.st().fail_settings = false;
     a.cycle().await.unwrap();
-    assert_eq!(a.config().managed_settings_version, 2, "no policy-set change, no retry until the next change");
+    assert_eq!(a.config().managed_settings_version, 4, "a failed application retries on the next heartbeat without requiring another console edit");
 
     // The console stops managing: settings are released.
     set(Value::Null, "s5");
@@ -603,4 +613,39 @@ fn templates_and_urls() {
     assert!(normalize_console_url("ftp://c.example.com").is_err());
     assert!(normalize_console_url("not a url").is_err());
     assert_eq!(parse_tags("B, a,,a c"), vec!["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn workspaces_are_acknowledged_only_after_installation_and_retry_without_a_revision_change() {
+    let (m, c) = console(); let host = FakeHost::default(); let a = agent(&host).await;
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    { let mut s = c.lock().unwrap(); s.version = "workspace-v1".into(); s.workspaces = vec![json!({"id":id,"name":"Design","version":7,"connections":[{"id":uuid::Uuid::new_v4().to_string(),"name":"Assets","protocol":"sftp","host":"files.example.org","remotePath":"/assets","credentialId":"central:crd_1"}]})]; }
+    host.st().fail_workspaces = true;
+    a.cycle().await.unwrap();
+    let key = format!("workspace:{id}");
+    assert!(c.lock().unwrap().applied["applied"].get(&key).is_none());
+    assert!(c.lock().unwrap().applied["errors"][&key].as_str().unwrap().contains("disk write"));
+    host.st().fail_workspaces = false;
+    a.cycle().await.unwrap();
+    assert_eq!(c.lock().unwrap().applied["applied"][&key], 7);
+    assert_eq!(host.st().workspaces.last().unwrap()[0].name, "Design");
+    assert_eq!(host.st().creds["central:crd_1"], "s3cret");
+    // The full empty snapshot is meaningful: it removes the last grant.
+    { let mut s = c.lock().unwrap(); s.version = "workspace-revoked".into(); s.workspaces.clear(); }
+    host.st().fail_workspaces = true;
+    a.cycle().await.unwrap();
+    assert!(a.config().policy_errors.contains_key("workspace:reconciliation"));
+    host.st().fail_workspaces = false;
+    a.cycle().await.unwrap();
+    assert!(host.st().workspaces.last().unwrap().is_empty());
+    assert!(a.config().policy_errors.is_empty());
+}
+
+#[tokio::test]
+async fn revoked_console_tokens_remove_installed_workspace_connections() {
+    let (m, c) = console(); let host = FakeHost::default(); let a = agent(&host).await;
+    a.register(&m.url, "ufop_reg_good", vec![]).await.unwrap();
+    c.lock().unwrap().revoked = true;
+    assert!(a.cycle().await.is_err()); assert!(host.st().workspaces.last().unwrap().is_empty());
 }

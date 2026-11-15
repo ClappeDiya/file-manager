@@ -3,18 +3,19 @@
  * picker, forced delete), webhook presets and headers, HTML mail with a
  * sandboxed preview. Shapes sent to Rust match the serde types.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useUIStore } from "@/stores/ui-store";
+import { fireEvent,render,screen,waitFor,within } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { HeadersEditor, NotificationsEditor, newNotification } from "@/components/backup/backup-notifications";
-import { NotificationProfilePicker, NotificationProfilesManager } from "@/components/backup/backup-notification-profiles";
-import { channelLabel, profileSendsOn, useNotifyStore, validHeaderName, type NotificationProfile } from "@/stores/backup-notify";
-import type { BackupNotification, WebhookHeader } from "@/stores/backup-store";
+import { NotificationProfilePicker,NotificationProfilesManager } from "@/components/backup/backup-notification-profiles";
+import { HeadersEditor,NotificationsEditor } from '@/components/backup/backup-notifications';
+import { newNotification } from '@/components/backup/backup-notifications-helpers';
+import { channelLabel,profileSendsOn,useNotifyStore,validHeaderName,type NotificationProfile } from "@/stores/backup-notify";
 import { SETTING_SECTIONS } from "@/stores/backup-policy";
+import type { BackupNotification,WebhookHeader } from "@/stores/backup-store";
 
 const PD: BackupNotification = {
   type: "webhook",

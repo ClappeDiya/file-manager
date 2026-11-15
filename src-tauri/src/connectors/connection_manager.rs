@@ -48,6 +48,7 @@ impl ConnectionManager {
         password: Option<String>,
         key_passphrase: Option<String>,
     ) -> Result<ConnectionProfile, AppError> {
+        crate::managed_workspaces::ensure_editable(&self.repo, profile.id).await?;
         // Store password in keychain if provided
         if let Some(pwd) = password {
             let cred_key = CredentialStore::credential_key(&profile.id);
@@ -143,6 +144,7 @@ impl ConnectionManager {
 
     /// Delete a connection and its stored credentials.
     pub async fn delete_connection(&self, id: Uuid) -> Result<(), AppError> {
+        crate::managed_workspaces::ensure_editable(&self.repo, id).await?;
         // Delete credentials from keychain
         let cred_key = CredentialStore::credential_key(&id);
         self.credential_store.delete(&cred_key).await?;
@@ -155,7 +157,8 @@ impl ConnectionManager {
 
     /// Retrieve the password for a connection.
     pub async fn get_password(&self, connection_id: Uuid) -> Result<Option<String>, AppError> {
-        let cred_key = CredentialStore::credential_key(&connection_id);
+        let central = self.repo.get_connection(connection_id).await?.and_then(|p| p.credential_ref).filter(|r| r.starts_with("central:"));
+        let cred_key = central.unwrap_or_else(|| CredentialStore::credential_key(&connection_id));
         self.credential_store.retrieve(&cred_key).await
     }
 
@@ -170,11 +173,13 @@ impl ConnectionManager {
 
     /// Store a new primary secret (e.g. rotated OAuth tokens) for a saved connection.
     pub async fn set_password(&self, connection_id: Uuid, secret: &str) -> Result<(), AppError> {
+        crate::managed_workspaces::ensure_editable(&self.repo, connection_id).await?;
         self.credential_store.store(&CredentialStore::credential_key(&connection_id), secret).await
     }
 
     /// Forget a connection's primary secret (e.g. an OAuth sign-in).
     pub async fn delete_password(&self, connection_id: Uuid) -> Result<(), AppError> {
+        crate::managed_workspaces::ensure_editable(&self.repo, connection_id).await?;
         self.credential_store.delete(&CredentialStore::credential_key(&connection_id)).await
     }
 

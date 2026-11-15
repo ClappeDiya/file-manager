@@ -1,3 +1,4 @@
+import SettingsPanel from "@/components/settings-panel";
 /**
  * Simple Mode Wrapper (T-054)
  *
@@ -12,7 +13,7 @@
  * When appMode === "advanced", renders children as-is.
  * Mode switch is instant -- no restart required.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { BackupPanel } from "@/components/backup/backup-panel";
@@ -72,6 +73,7 @@ export function SimpleModeWrapper({
   });
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
   const [activeSection, setActiveSection] = useState<SimpleNavSection>("files");
+  const [settingsRequest, setSettingsRequest] = useState(0);
 
   useEffect(() => {
     const show = () => setActiveSection("files");
@@ -86,6 +88,12 @@ export function SimpleModeWrapper({
         document.querySelector('[role="dialog"], [role="alertdialog"]')
       )
         return;
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key === ",") {
+        event.preventDefault();
+        setSettingsRequest(value => value + 1);
+        setActiveSection("settings");
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setActiveSection("files");
@@ -163,7 +171,7 @@ export function SimpleModeWrapper({
       case "settings":
         return (
           settingsPanel || (
-            <SimpleSettingsView onOpenOnboarding={onOpenOnboarding} />
+            <SimpleSettingsView settingsRequest={settingsRequest} onOpenOnboarding={onOpenOnboarding} />
           )
         );
       default:
@@ -321,15 +329,33 @@ function SimplePlaceholder({
 // ──────────────────────────────────────────────
 
 function SimpleSettingsView({
+  settingsRequest = 0,
   onOpenOnboarding,
 }: {
+  settingsRequest?: number;
   onOpenOnboarding?: () => void;
 }) {
+  const [allSettings, setAllSettings] = useState(settingsRequest > 0);
+  useEffect(() => { if (settingsRequest > 0) setAllSettings(true); }, [settingsRequest]);
+  const fullSettingsRef = useRef<HTMLButtonElement>(null);
+  const openSettingsRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (allSettings) fullSettingsRef.current?.focus();
+    else openSettingsRef.current?.focus();
+  }, [allSettings]);
   const appMode = useUIStore((s) => s.appMode);
   const setAppMode = useUIStore((s) => s.setAppMode);
   const theme = useUIStore((s) => s.theme);
   const setTheme = useUIStore((s) => s.setTheme);
 
+  if (allSettings) return (
+    <section className="h-full min-h-0 flex flex-col" aria-label="All settings">
+      <div className="p-3 border-b border-[var(--color-border)]">
+        <Button ref={fullSettingsRef} variant="ghost" onClick={() => setAllSettings(false)}>Back to settings overview</Button>
+      </div>
+      <div className="flex-1 min-h-0"><SettingsPanel /></div>
+    </section>
+  );
   return (
     <div className="max-w-lg mx-auto p-8">
       <h2 className="text-xl font-semibold text-[color:var(--color-text)] mb-6">
@@ -337,6 +363,10 @@ function SimpleSettingsView({
       </h2>
 
       <div className="space-y-6">
+        <div className="space-y-2">
+          <Button ref={openSettingsRef} onClick={() => setAllSettings(true)}>All settings</Button>
+          <p className="text-xs text-[color:var(--color-text-secondary)]">Connections, console enrollment, privacy, startup, notifications and diagnostics.</p>
+        </div>
         {/* User Mode */}
         <div className="space-y-2">
           <label className="block text-sm font-medium text-[color:var(--color-text)]">

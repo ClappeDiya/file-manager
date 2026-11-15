@@ -2,12 +2,12 @@
  * K121: text size setting — store, root font scale, persistence, migration,
  * Ctrl/Cmd +/−/0 shortcuts, Settings → Appearance control and palette entries.
  */
-import { beforeEach, describe, expect, it } from "vitest";
-import { fireEvent, render, renderHook, screen } from "@testing-library/react";
-import { FONT_SCALES, migrateUIState, nextFontScale, UI_STATE_VERSION, useUIStore } from "@/stores/ui-store";
-import { textSizeStepForKey, useTextSizeShortcuts } from "@/hooks/use-text-size-shortcuts";
 import { AppearanceSettings } from "@/components/appearance-settings";
-import { getDefaultCommands } from "@/components/command-palette";
+import { getDefaultCommands } from '@/components/command-palette-helpers';
+import { textSizeStepForKey,useTextSizeShortcuts } from "@/hooks/use-text-size-shortcuts";
+import { FONT_SCALES,migrateUIState,nextFontScale,UI_STATE_VERSION,useUIStore } from "@/stores/ui-store";
+import { fireEvent,render,renderHook,screen } from "@testing-library/react";
+import { beforeEach,describe,expect,it } from "vitest";
 
 const scaleVar = () => document.documentElement.style.getPropertyValue("--ufop-font-scale");
 

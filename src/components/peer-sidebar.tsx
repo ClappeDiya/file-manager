@@ -1,3 +1,4 @@
+import { TrustLevel } from './peer-sidebar-helpers';
 /**
  * Peer Sidebar Component (T-031)
  *
@@ -13,34 +14,33 @@
  * Used alongside device-sidebar.tsx for the "Peers" / "Nearby" section.
  */
 
-import { useState, useEffect, useCallback } from "react";
-import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
-import { formatBytes } from "@/lib/format-bytes";
-import { cn } from "@ufop/ui-components";
-import { ScrollArea } from "@ufop/ui-components";
-import {
-  Monitor,
-  Laptop,
-  Server,
-  Wifi,
-  WifiOff,
-  Shield,
-  ShieldCheck,
-  ShieldX,
-  ShieldQuestion,
-  Send,
-  Plus,
-  ChevronDown,
-  ChevronRight,
-  RefreshCw,
-  MoreHorizontal,
-  X,
-  Check,
-  Loader2,
-  ArrowUpDown,
-  XCircle,
-} from "lucide-react";
+import { isTauriAvailable,tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
+import { formatBytes } from "@/lib/format-bytes";
+import { cn,ScrollArea } from "@ufop/ui-components";
+import {
+ArrowUpDown,
+Check,
+ChevronDown,
+ChevronRight,
+Laptop,
+Loader2,
+Monitor,
+MoreHorizontal,
+Plus,
+RefreshCw,
+Send,
+Server,
+Shield,
+ShieldCheck,
+ShieldQuestion,
+ShieldX,
+Wifi,
+WifiOff,
+X,
+XCircle,
+} from "lucide-react";
+import { useCallback,useEffect,useState } from "react";
 
 // ──────────────────────────────────────────────
 // Types (matching Rust peer module)
@@ -48,7 +48,6 @@ import { errorText } from "@/lib/error-text";
 
 export type PeerOs = "macos" | "windows" | "linux" | "unknown";
 export type PeerStatus = "online" | "offline" | "connecting" | "transferring";
-export type TrustLevel = "unknown" | "untrusted" | "trusted" | "blocked";
 
 export interface PeerDeviceData {
   id: string;
@@ -153,20 +152,6 @@ function getOsLabel(os: PeerOs): string {
       return "Linux";
     default:
       return "Unknown";
-  }
-}
-
-/** Get the appropriate trust icon for a peer's trust level */
-export function getTrustIcon(trust: TrustLevel) {
-  switch (trust) {
-    case "trusted":
-      return ShieldCheck;
-    case "blocked":
-      return ShieldX;
-    case "untrusted":
-      return ShieldQuestion;
-    default:
-      return Shield;
   }
 }
 

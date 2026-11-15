@@ -3,13 +3,14 @@
  * keep snake_case keys (including nested ones), secrets go only to the
  * credential store.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { CloudDestinationForm, newCloudConfig, PROVIDER_FIELDS } from "@/components/backup/backup-cloud-destination";
+import { CloudDestinationForm } from '@/components/backup/backup-cloud-destination';
+import { newCloudConfig,PROVIDER_FIELDS } from '@/components/backup/backup-cloud-destination-helpers';
 import type { CloudConfig } from "@/stores/backup-store";
 
 beforeEach(() => {

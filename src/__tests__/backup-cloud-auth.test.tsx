@@ -5,17 +5,18 @@
  * rclone editors write the snake_case shapes the Rust configs read, and the
  * point-in-time and request-limit controls call the backend correctly.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { CloudDestinationForm, newCloudConfig } from "@/components/backup/backup-cloud-destination";
+import { CloudDestinationForm } from '@/components/backup/backup-cloud-destination';
+import { newCloudConfig } from '@/components/backup/backup-cloud-destination-helpers';
 import { PointInTimeOpen } from "@/components/backup/backup-point-in-time";
 import { RequestLimitsEditor } from "@/components/backup/backup-request-limits";
-import { azureAuthOf, s3CredentialsOf, secretHint } from "@/lib/backup-cloud-auth";
-import { DEFAULT_REQUEST_LIMITS, newBackupJob, type BackupJob, type CloudConfig } from "@/stores/backup-store";
+import { azureAuthOf,s3CredentialsOf,secretHint } from "@/lib/backup-cloud-auth";
+import { DEFAULT_REQUEST_LIMITS,newBackupJob,type BackupJob,type CloudConfig } from "@/stores/backup-store";
 import { useUIStore } from "@/stores/ui-store";
 
 const tls = { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] };

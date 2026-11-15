@@ -1,13 +1,8 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import {
-  FileList,
-  formatFileSize,
-  formatDate,
-  ActivityDot,
-  type FileEntryData,
-} from "@/components/file-list";
-import { filterFiles } from "@/components/filter-bar";
+import { ActivityDot,FileList } from '@/components/file-list';
+import { formatDate,formatFileSize,type FileEntryData } from '@/components/file-list-helpers';
+import { filterFiles } from '@/components/filter-bar-helpers';
+import { fireEvent,render,screen } from "@testing-library/react";
+import { describe,expect,it,vi } from "vitest";
 
 // ── T-007: Directory Listing tests ──
 

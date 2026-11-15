@@ -1,3 +1,4 @@
+import { errorText } from "@/lib/error-text";
 /**
  * AI Store (T-043..T-045)
  *
@@ -5,9 +6,9 @@
  * Provides reactive state for chat, suggestions, NL job creation,
  * safety controls, and audit logging.
  */
+import { tauriInvoke } from "@/hooks/use-tauri";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { tauriInvoke } from "@/hooks/use-tauri";
 
 // ── Types ──
 
@@ -196,17 +197,17 @@ export const useAiStore = create<AiState>()(
             chatMessages: [...state.chatMessages, response],
           }));
           return response;
-        } catch (e: any) {
+        } catch (e: unknown) {
           // Fallback: structured error response
           const fallback: AiChatMessage = {
             id: `fallback-${Date.now()}`,
             role: "assistant",
-            content: `I'm unable to process your request right now. Error: ${e?.message || "Unknown error"}. Please try again or check the error details panel.`,
+            content: `I'm unable to process your request right now. Error: ${errorText(e, "Unknown error")}. Please try again or check the error details panel.`,
             timestamp: new Date().toISOString(),
           };
           set((state) => ({
             chatMessages: [...state.chatMessages, fallback],
-            error: e?.message || "Chat request failed",
+            error: errorText(e, "Chat request failed"),
           }));
           return fallback;
         } finally {
@@ -218,8 +219,8 @@ export const useAiStore = create<AiState>()(
         try {
           const messages = await tauriInvoke<AiChatMessage[]>("ai_get_chat_history", undefined, []);
           set({ chatMessages: messages });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to load chat history" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to load chat history") });
         }
       },
 
@@ -227,8 +228,8 @@ export const useAiStore = create<AiState>()(
         try {
           await tauriInvoke("ai_clear_chat");
           set({ chatMessages: [] });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to clear chat" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to clear chat") });
         }
       },
 
@@ -265,8 +266,8 @@ export const useAiStore = create<AiState>()(
             contextJson,
           });
           set({ suggestions });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to generate suggestions" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to generate suggestions") });
         } finally {
           set({ suggestionsLoading: false });
         }
@@ -277,8 +278,8 @@ export const useAiStore = create<AiState>()(
         try {
           const suggestions = await tauriInvoke<AiSuggestion[]>("ai_get_suggestions", undefined, []);
           set({ suggestions });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to load suggestions" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to load suggestions") });
         } finally {
           set({ suggestionsLoading: false });
         }
@@ -290,8 +291,8 @@ export const useAiStore = create<AiState>()(
           set((state) => ({
             suggestions: state.suggestions.filter((s) => s.id !== id),
           }));
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to dismiss suggestion" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to dismiss suggestion") });
         }
       },
 
@@ -313,8 +314,8 @@ export const useAiStore = create<AiState>()(
           }
 
           return payload;
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to accept suggestion" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to accept suggestion") });
           throw e;
         }
       },
@@ -329,8 +330,8 @@ export const useAiStore = create<AiState>()(
           });
           set({ currentParsedJob: config });
           return config;
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to parse natural language" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to parse natural language") });
           throw e;
         } finally {
           set({ nlLoading: false });
@@ -345,8 +346,8 @@ export const useAiStore = create<AiState>()(
             set({ confirmationPending: null });
           }
           return confirmed;
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to confirm action" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to confirm action") });
           return false;
         }
       },
@@ -358,8 +359,8 @@ export const useAiStore = create<AiState>()(
             offset,
           });
           set({ auditLog: log });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to load audit log" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to load audit log") });
         }
       },
 
@@ -367,8 +368,8 @@ export const useAiStore = create<AiState>()(
         try {
           const toggles = await tauriInvoke<AiFeatureToggles>("ai_get_feature_toggles");
           set({ featureToggles: toggles });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to load feature toggles" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to load feature toggles") });
         }
       },
 
@@ -378,8 +379,8 @@ export const useAiStore = create<AiState>()(
             togglesJson: JSON.stringify(toggles),
           });
           set({ featureToggles: toggles });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to update feature toggles" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to update feature toggles") });
           throw e;
         }
       },
@@ -407,8 +408,8 @@ export const useAiStore = create<AiState>()(
               : "preview";
           set({ currentIntentPreview: config, intentPhase: phase });
           return config;
-        } catch (e: any) {
-          set({ intentPhase: "idle", error: e?.message });
+        } catch (e: unknown) {
+          set({ intentPhase: "idle", error: errorText(e, "Failed to interpret request") });
           return null;
         }
       },
@@ -422,8 +423,8 @@ export const useAiStore = create<AiState>()(
           });
           set({ intentPhase: "idle" as AiState["intentPhase"], currentIntentPreview: null as ParsedJobConfig | null });
           return result;
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to execute intent" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to execute intent") });
           return null;
         }
       },
@@ -445,8 +446,8 @@ export const useAiStore = create<AiState>()(
         try {
           await tauriInvoke("ai_set_ollama_model", { model });
           set({ ollamaModel: model, ollamaAvailable: null });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to set model" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to set model") });
         }
       },
 

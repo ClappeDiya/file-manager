@@ -1,17 +1,18 @@
 /** WS-C: backup duplicate + shared rule tools in the backup editor, Settings › sync defaults and bandwidth timetable. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
 import { BackupPanel } from "@/components/backup/backup-panel";
-import { SyncDefaultsSection } from "@/components/sync-defaults-section";
 import { BandwidthTimetableSection } from "@/components/bandwidth-timetable-section";
-import { FilterPresetPicker, appendRules } from "@/components/filter-rules-editor";
-import { rulesToText, textToRules } from "@/lib/backup-helpers";
+import { FilterPresetPicker } from '@/components/filter-rules-editor';
+import { appendRules } from '@/components/filter-rules-editor-helpers';
+import { SyncDefaultsSection } from "@/components/sync-defaults-section";
+import { rulesToText,textToRules } from "@/lib/backup-helpers";
 import { DEFAULT_COPY_OPTIONS } from "@/lib/copy-options";
-import { newBackupJob, type BackupJob, type FilterRule } from "@/stores/backup-store";
+import { newBackupJob,type BackupJob,type FilterRule } from "@/stores/backup-store";
 import { useUIStore } from "@/stores/ui-store";
 
 const STATUS = { running: true, paused: false, paused_until: null, tasks: [], next_runs: [] };

@@ -1,3 +1,4 @@
+import { useProfileChoices } from './backup-notification-profiles-helpers';
 /**
  * Notification profiles (K101):
  * - `NotificationProfilesManager` (Settings): list, add, edit, test and delete
@@ -7,13 +8,13 @@
  *   also sends to.
  * Organization profiles (from the console) are listed read-only.
  */
-import { useEffect, useState } from "react";
 import { inputCls } from "@/lib/backup-helpers";
-import { errorText, type BackupNotification } from "@/stores/backup-store";
-import { channelLabel, newProfile, profileSendsOn, useNotifyStore, type NotificationProfile, type Severity } from "@/stores/backup-notify";
-import { AddChannel, NotificationCard } from "./backup-notifications";
+import { channelLabel,newProfile,profileSendsOn,useNotifyStore,type NotificationProfile,type Severity } from "@/stores/backup-notify";
+import { errorText,type BackupNotification } from "@/stores/backup-store";
+import { useEffect,useState } from "react";
 import { AdvancedOnly } from "./advanced-only";
-import { Banner, Btn, Check, Field, Section } from "./backup-ui";
+import { AddChannel,NotificationCard } from "./backup-notifications";
+import { Banner,Btn,Check,Field,Section } from "./backup-ui";
 
 function ProfileEditor({ profile, onDone }: { profile: NotificationProfile; onDone: (msg: string | null) => void }) {
   const saveProfile = useNotifyStore((s) => s.saveProfile);
@@ -160,16 +161,6 @@ export function NotificationProfilesManager() {
       )}
     </Section>
   );
-}
-
-/** The saved profiles and which of the `chosen` ids no longer exist (shared by every picker). */
-export function useProfileChoices(chosen: string[]) {
-  const { profiles, loadProfiles } = useNotifyStore();
-  useEffect(() => {
-    void loadProfiles();
-  }, [loadProfiles]);
-  const missing = chosen.filter((id) => !profiles.some((p) => p.id === id));
-  return { profiles, missing };
 }
 
 /** Job editor: the profiles this job also sends to. */

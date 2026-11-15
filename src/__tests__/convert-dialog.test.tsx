@@ -1,13 +1,13 @@
 /** Convert dialog: images vs documents, the spec sent to Rust, results, and the context menu entry. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
+import { getFileContextMenuItems } from '@/components/context-menu-helpers';
 import { ConvertDialog } from "@/components/convert-dialog";
-import { getFileContextMenuItems } from "@/components/context-menu";
-import { convertKind, useConvertDialog } from "@/stores/convert-store";
+import { convertKind,useConvertDialog } from "@/stores/convert-store";
 
 let office = true;
 beforeEach(() => {

@@ -1,3 +1,4 @@
+import { parseIds } from './chat-control-section-helpers';
 /**
  * Chat-bot remote control (Settings → Advanced). Off by default. When on, a
  * Telegram or Slack bot answers only the people on its allow-list, with a
@@ -8,9 +9,9 @@
  * Mirrors Rust `chat_control::{ChatControlSettings, service::ChatControlStatus}`
  * (`chat_control_get`, `chat_control_save`, `chat_control_status`).
  */
-import { useEffect, useState } from "react";
+import { isTauriAvailable,tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
-import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
+import { useEffect,useState } from "react";
 
 export interface ChatChannelSettings {
   enabled: boolean;
@@ -43,11 +44,6 @@ export interface ChatControlStatus {
 export interface ChatControlView {
   settings: ChatControlSettings;
   status: ChatControlStatus;
-}
-
-/** Ids as typed: separated by commas, spaces or new lines. */
-export function parseIds(text: string): string[] {
-  return [...new Set(text.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean))];
 }
 
 const field = "w-full rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-2 py-1 text-sm";

@@ -98,7 +98,7 @@ export function FleetAgentSection() {
             type="button"
             disabled={busy}
             onClick={() => {
-              if (window.confirm("Leave the management console? Managed backup jobs are removed (their backups stay).")) {
+              if (window.confirm("Leave the management console? Managed connections and backup jobs are removed (their backups stay).")) {
                 void unregister(state === "revoked");
               }
             }}

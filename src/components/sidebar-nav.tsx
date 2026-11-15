@@ -1,27 +1,26 @@
-import { useState, useCallback, useEffect } from "react";
-import { paneLabel, useFileManagerStore, type FavoriteItem } from "@/stores/file-manager-store";
-import { useConnectionsStore } from "@/stores/connections-store";
-import { isRemotePath } from "@/lib/location";
-import { cn } from "@ufop/ui-components";
-import { ScrollArea } from "@ufop/ui-components";
-import {
-  Star,
-  HardDrive,
-  Clock,
-  ChevronRight,
-  ChevronDown,
-  Folder,
-  FolderOpen,
-  Trash2,
-  TriangleAlert,
-  Sparkles,
-  Cloud,
-} from "lucide-react";
-import type { FileEntryData } from "./file-list";
-import { SmartSpacesSection } from "./smart-spaces-section";
-import type { SmartSpace } from "@/stores/spaces-store";
 import { tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useT } from "@/lib/i18n";
+import { isRemotePath } from "@/lib/location";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { paneLabel,useFileManagerStore,type FavoriteItem } from "@/stores/file-manager-store";
+import type { SmartSpace } from "@/stores/spaces-store";
+import { cn,ScrollArea } from "@ufop/ui-components";
+import {
+ChevronDown,
+ChevronRight,
+Clock,
+Cloud,
+Folder,
+FolderOpen,
+HardDrive,
+Sparkles,
+Star,
+Trash2,
+TriangleAlert,
+} from "lucide-react";
+import { useCallback,useEffect,useState } from "react";
+import type { FileEntryData } from './file-list-helpers';
+import { SmartSpacesSection } from "./smart-spaces-section";
 
 /** Mirrors `cloud_folders::CloudFolder`. */
 export interface CloudFolder {

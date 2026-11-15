@@ -1,10 +1,11 @@
-import { describe, it, expect, vi } from "vitest";
-import { PreviewView } from "@/components/sync-panel";
-import { render, screen, fireEvent } from "@testing-library/react";
+import type { SyncDiffEntry } from "@/stores/sync-store";
 import { SyncComparison } from "@/components/sync-comparison";
-import { buildComparisonRows, summarizeRows, type PreviewEntry, type PreviewLike } from "@/lib/sync-compare";
+import { PreviewView } from "@/components/sync-panel";
+import { buildComparisonRows,summarizeRows } from "@/lib/sync-compare";
+import { fireEvent,render,screen } from "@testing-library/react";
+import { describe,expect,it,vi } from "vitest";
 
-const entry = (path: string, action: string, src: number | null, dst: number | null): PreviewEntry => ({
+const entry = (path: string, action: string, src: number | null, dst: number | null): SyncDiffEntry => ({
   relative_path: path,
   action,
   source_size: src,
@@ -12,9 +13,10 @@ const entry = (path: string, action: string, src: number | null, dst: number | n
   source_modified: src === null ? null : "2026-01-01T00:00:00Z",
   dest_modified: dst === null ? null : "2025-01-01T00:00:00Z",
   reason: "r",
+  path_length_warning: null,
 });
 
-const preview: PreviewLike = {
+const preview = {
   additions: [entry("docs/new.txt", "add", 10, null)],
   modifications: [entry("docs/changed.txt", "modify", 20, 5)],
   deletions: [entry("old/gone.txt", "delete", null, 7)],
@@ -113,7 +115,7 @@ describe("PreviewView delete confirmation", () => {
     total_conflicts: 0,
     total_bytes: 30,
     ...preview,
-  } as any;
+  };
 
   it("blocks Proceed until deletions are acknowledged", () => {
     const onProceed = vi.fn();

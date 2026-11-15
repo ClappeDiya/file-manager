@@ -1,200 +1,204 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
+import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
+import { useClearFilterOnNavigate } from "@/hooks/use-clear-filter-on-navigate";
+import { useDirectoryActivity,useRecentlyTouchedSet } from "@/hooks/use-directory-activity";
 import {
-  paneLabel,
-  useFileManagerStore,
-  type ViewMode,
-} from "@/stores/file-manager-store";
-import { formatBytes } from "@/lib/format-bytes";
-import { useUIStore } from "@/stores/ui-store";
+invalidateDriveCache,
+refreshDriveCacheIfStale,
+useAllDrives,
+useDriveSpace,
+} from "@/hooks/use-drive-space";
+import { useFileDragDrop,useFileSelection } from "@/hooks/use-file-selection";
+import { useLedgerTailPoll } from "@/hooks/use-ledger-tail-poll";
+import { OS_DROP_ATTR,useOsFileDrop } from "@/hooks/use-os-file-drop";
+import { fileExtension,loadSmartDestinations,type SmartDestination } from "@/hooks/use-smart-destinations";
+import { isTauriAvailable,tauriInvoke,tauriInvokeSafe } from "@/hooks/use-tauri";
 import { useTextSizeShortcuts } from "@/hooks/use-text-size-shortcuts";
-import { useAiStore, type AiExecutionResult } from "@/stores/ai-store";
+import { isSecondaryWindow,openNewWindow } from "@/lib/app-window";
+import { archiveExtractDest } from "@/lib/archive-paths";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
+import { dropIntent,dropPreconfirmed,measuredDrop,type DropRequest } from "@/lib/drag-drop";
+import {
+formatDriveSpace,
+formatDriveSpaceDetail,
+} from "@/lib/drive-space";
+import { errorText } from "@/lib/error-text";
+import { isTextEntry,resolveFileActionKey,resolveFileTransferKey,resolveNewFolderKey,resolveNewWindowKey,resolveParentFolderKey } from "@/lib/file-action-keys";
+import { pickFolder } from "@/lib/folder-picker";
+import { formatBytes } from "@/lib/format-bytes";
+import {
+deriveLabel,
+dispatchLedgerPath,
+formatRelativeTime,
+labelForKind,
+pickJumpRingTarget,
+type JumpRingDirection,
+} from "@/lib/ledger-dispatch";
+import { formatAddress,isRemotePath,isTopFolder,joinLocation,locationConnectionId,parentLocation,remoteLocation } from "@/lib/location";
+import {
+connectionQuota,
+connectorPath,
+dragDropMode,
+isRunnableName,
+listDirectory,
+LOCAL_ONLY_REASON,
+localCopyOf,
+makeDirectory,
+measureLocations,
+movableInto,
+needsLocationTransfer,
+remoteFolderSize,
+removeEntries,
+renameEntry,
+resolveItems,
+statLocation,
+transferItems,
+type LocationTransferOutcome,
+type RemoteQuotaInfo,
+} from "@/lib/location-provider";
+import { reportOperationFailure } from "@/lib/op-error-toast";
+import { awaitPaneCopyJobs } from "@/lib/pane-copy";
+import {
+describePathRecall,
+inferPathRecall,
+type PathRecallInfo,
+} from "@/lib/path-recall";
+import { confirmText,promptText } from "@/lib/prompt-dialog";
+import { rcloneStatus,type RcloneStatus } from "@/lib/rclone";
+import {
+dispatchRefresh,
+parentDirectoriesOf,
+REFRESH_EVENT,
+shouldRefreshPane,
+type RefreshEventDetail,
+} from "@/lib/refresh-affected";
+import { formatQuota } from "@/lib/remote-quota";
+import { assessBeforeExecute,confirmIntent,FS_INTENT_KIND,measureSelection } from "@/lib/safety";
+import {
+computeListBytes,
+computeSelectionBytes,
+formatPaneStatsLabel,
+} from "@/lib/selection-stats";
+import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
+import { useAiStore,type AiExecutionResult } from "@/stores/ai-store";
+import { useAppLockStore } from "@/stores/app-lock-store";
 import { useAutomationStore } from "@/stores/automation-store";
+import { useCompareStore } from "@/stores/compare-store";
+import { useConnectionBrowse } from "@/stores/connection-browse-store";
+import { useConnectionsStore } from "@/stores/connections-store";
+import { convertKind,useConvertDialog } from "@/stores/convert-store";
+import { openCopyToMany } from "@/stores/copy-to-many-store";
+import { useFeedbackDialog } from "@/stores/feedback-store";
+import { useFileClipboardStore } from "@/stores/file-clipboard-store";
+import {
+paneLabel,
+useFileManagerStore,
+type ViewMode,
+} from "@/stores/file-manager-store";
+import { looksEncrypted,looksLikeSignature,useGpgDialog } from "@/stores/gpg-store";
+import { useLineageStore,type FileLineage } from "@/stores/lineage-store";
+import { useLogViewer } from "@/stores/log-viewer-store";
+import { useMountsUi } from "@/stores/mounts-ui-store";
+import { useOperationsStore } from "@/stores/operations-store";
+import { usePathJumpStore } from "@/stores/path-jump-store";
+import { useRcloneUi } from "@/stores/rclone-ui-store";
+import type { SearchScope } from "@/stores/search-store";
+import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
 import { useSpacesStore } from "@/stores/spaces-store";
 import { useTerminalStore } from "@/stores/terminal-store";
-import { isTauriAvailable, tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
-import { loadSmartDestinations, fileExtension, type SmartDestination } from "@/hooks/use-smart-destinations";
-import { assessBeforeExecute, confirmIntent, measureSelection, FS_INTENT_KIND } from "@/lib/safety";
-import { formatAddress, isRemotePath, isTopFolder, joinLocation, locationConnectionId, parentLocation, remoteLocation } from "@/lib/location";
+import { queueWorkspaceItems,useTransferWorkspace,type WorkspaceJob } from "@/stores/transfer-workspace-store";
+import { useUIStore } from "@/stores/ui-store";
+import { Badge,Button,cn } from "@ufop/ui-components";
 import {
-  connectionQuota,
-  dragDropMode,
-  isRunnableName,
-  listDirectory,
-  localCopyOf,
-  makeDirectory,
-  movableInto,
-  needsLocationTransfer,
-  remoteFolderSize,
-  measureLocations,
-  removeEntries,
-  renameEntry,
-  resolveItems,
-  statLocation,
-  transferItems,
-  connectorPath,
-  LOCAL_ONLY_REASON,
-  type LocationTransferOutcome,
-  type RemoteQuotaInfo,
-} from "@/lib/location-provider";
-import { useConnectionsStore } from "@/stores/connections-store";
-import { DragDropConfirm } from "./drag-drop-confirm";
-import { dropIntent, dropPreconfirmed, measuredDrop, type DropRequest } from "@/lib/drag-drop";
-import { formatQuota } from "@/lib/remote-quota";
-import { ShareLinkDialog } from "./share-link-dialog";
-import { SHAREABLE_PROTOCOLS } from "@/stores/share-store";
-import { copyToClipboardWithToast } from "@/lib/clipboard";
-import { reportOperationFailure } from "@/lib/op-error-toast";
-import { OS_DROP_ATTR, useOsFileDrop } from "@/hooks/use-os-file-drop";
-import {
-  computeListBytes,
-  computeSelectionBytes,
-  formatPaneStatsLabel,
-} from "@/lib/selection-stats";
-import { archiveExtractDest } from "@/lib/archive-paths";
-import { pickFolder } from "@/lib/folder-picker";
-import { queueWorkspaceItems, useTransferWorkspace, type WorkspaceJob } from "@/stores/transfer-workspace-store";
-import { awaitPaneCopyJobs } from "@/lib/pane-copy";
-import { isTextEntry, resolveFileActionKey, resolveFileTransferKey, resolveNewFolderKey, resolveNewWindowKey, resolveParentFolderKey } from "@/lib/file-action-keys";
-import { isSecondaryWindow, openNewWindow } from "@/lib/app-window";
-import { useAppLockStore } from "@/stores/app-lock-store";
-import {
-  useDriveSpace,
-  useAllDrives,
-  invalidateDriveCache,
-  refreshDriveCacheIfStale,
-} from "@/hooks/use-drive-space";
-import {
-  formatDriveSpace,
-  formatDriveSpaceDetail,
-} from "@/lib/drive-space";
-import {
-  dispatchLedgerPath,
-  deriveLabel,
-  labelForKind,
-  formatRelativeTime,
-  pickJumpRingTarget,
-  type JumpRingDirection,
-} from "@/lib/ledger-dispatch";
-import { DualPaneLayout } from "./dual-pane-layout";
-import { TabBar } from "./tab-bar";
-import { BreadcrumbBar } from "./breadcrumb-bar";
-import { SidebarNav } from "./sidebar-nav";
-import { FileList, type FileEntryData } from "./file-list";
-import { FilterBar, filterFiles } from "./filter-bar";
-import { ContextMenu, getFileContextMenuItems, type ContextMenuItem } from "./context-menu";
-import { CommandPalette, getDefaultCommands, type CommandItem } from "./command-palette";
-import { KeyboardCheatSheet } from "./keyboard-cheat-sheet";
-import { BatchRename } from "./batch-rename";
-import SettingsPanel from "./settings-panel";
-import { ConnectionPanel } from "./connection-panel";
-import { useConnectionBrowse } from "@/stores/connection-browse-store";
-import { LogViewerDialog } from "./log-viewer-dialog";
-import { useLogViewer } from "@/stores/log-viewer-store";
-import { FeedbackDialog } from "./feedback-dialog";
-import { useFeedbackDialog } from "@/stores/feedback-store";
-import { useRcloneUi } from "@/stores/rclone-ui-store";
-import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
-import { rcloneStatus, type RcloneStatus } from "@/lib/rclone";
-import { SyncPanel } from "./sync-panel";
-import { BackupPanel } from "./backup/backup-panel";
-import { PeerSidebar } from "./peer-sidebar";
-import { MountsHost } from "./mounts-host";
-import { useMountsUi } from "@/stores/mounts-ui-store";
-import { ScheduleLibraryPanel } from "./schedule-library-panel";
-import { PreviewPane } from "./preview-pane";
-import { TransferHistoryPanel } from "./transfer-history-panel";
-import { ArchiveBrowser, CreateArchiveDialog } from "./archive-browser";
-import { TextEditorModal } from "./text-editor-modal";
-import { CompareFilesModal, type CompareData } from "./compare-files-modal";
-import { IntegrityTools } from "./integrity-tools";
-import {
-  dispatchRefresh,
-  shouldRefreshPane,
-  parentDirectoriesOf,
-  REFRESH_EVENT,
-  type RefreshEventDetail,
-} from "@/lib/refresh-affected";
-import { useLedgerTailPoll } from "@/hooks/use-ledger-tail-poll";
+Activity,
+AlignJustify,
+Bot,
+CalendarClock,
+DatabaseBackup,
+Eye,
+EyeOff,
+FolderDown,
+FolderOpen,
+GitCompareArrows,
+Globe,
+Grid3X3,
+HardDrive,
+Layers,
+Layout,
+Link2,
+List,
+MonitorSmartphone,
+PanelLeft,
+Save,
+ScrollText,
+Terminal,
+Undo2,
+Unlink2,
+X,
+Zap,
+} from "lucide-react";
+import { useCallback,useEffect,useMemo,useRef,useState } from "react";
+import { ActivityTimelinePanel } from "./activity-timeline-panel";
 import { AiPanel } from "./ai-panel";
+import { ArchiveBrowser,CreateArchiveDialog } from "./archive-browser";
 import { AutomationPanel } from "./automation-panel";
 import { AutomationRuleEditor } from "./automation-rule-editor";
-import { CopyToManyDialog } from "./copy-to-many-dialog";
-import { IndexedSearchResults } from "./indexed-search-results";
-import { GpgDialog } from "./gpg-dialog";
+import { BackupPanel } from "./backup/backup-panel";
+import { BatchRename } from "./batch-rename";
+import { BreadcrumbBar } from "./breadcrumb-bar";
+import { CommandPalette } from './command-palette';
+import { getDefaultCommands,type CommandItem } from './command-palette-helpers';
+import { CompareFilesModal,type CompareData } from "./compare-files-modal";
+import { ConnectionPanel } from "./connection-panel";
+import { ContextMenu } from './context-menu';
+import { getFileContextMenuItems,type ContextMenuItem } from './context-menu-helpers';
 import { ConvertDialog } from "./convert-dialog";
-import { OperationsDrawer, OperationsIndicator } from "./operations-drawer";
-import { useOperationsStore } from "@/stores/operations-store";
-import { looksEncrypted, looksLikeSignature, useGpgDialog } from "@/stores/gpg-store";
-import { convertKind, useConvertDialog } from "@/stores/convert-store";
-import type { SearchScope } from "@/stores/search-store";
-import { openCopyToMany } from "@/stores/copy-to-many-store";
-import { VaultPanel } from "./vault-panel";
-import { TransferPanel } from "./transfer-panel";
-import {
-  MigrationWizard,
-  type MigrationConfig,
-  type MigrationFolder,
-  type MigrationProgress,
-  type MigrationSummary,
-  type SpaceAnalysis,
-} from "./migration-wizard";
-import { SmartSpaceWizard } from "./smart-space-wizard";
-import { TerminalPanel } from "./terminal-panel";
-import { SinceLastSeenToast, type LedgerSinceSummary } from "./since-last-seen-toast";
-import { ActivityTimelinePanel } from "./activity-timeline-panel";
-import { useActivityTimelineStore } from "@/stores/activity-timeline-store";
-import { LineagePanel } from "./lineage-panel";
-import { useLineageStore, type FileLineage } from "@/stores/lineage-store";
-import {
-  inferPathRecall,
-  describePathRecall,
-  type PathRecallInfo,
-} from "@/lib/path-recall";
-import { PathJumpDialog } from "./path-jump-dialog";
-import { useClearFilterOnNavigate } from "@/hooks/use-clear-filter-on-navigate";
-import { useFileClipboardStore } from "@/stores/file-clipboard-store";
-import { PromptDialogHost } from "./prompt-dialog-host";
-import { promptText, confirmText } from "@/lib/prompt-dialog";
-import { usePathJumpStore } from "@/stores/path-jump-store";
-import { SafetyInterlockDialog } from "./safety-interlock-dialog";
-import { FolderCompareDialog } from "./folder-compare-dialog";
-import { useCompareStore } from "@/stores/compare-store";
+import { CopyToManyDialog } from "./copy-to-many-dialog";
+import { DragDropConfirm } from "./drag-drop-confirm";
+import { DualPaneLayout } from "./dual-pane-layout";
 import { EnginePulseIndicator } from "./engine-pulse-indicator";
-import { errorText } from "@/lib/error-text";
-import { useDirectoryActivity, useRecentlyTouchedSet } from "@/hooks/use-directory-activity";
-import { useFileSelection, useFileDragDrop } from "@/hooks/use-file-selection";
-import { cn } from "@ufop/ui-components";
-import { Button, Badge } from "@ufop/ui-components";
-import { ThemeSwitcher } from "./theme-switcher";
-import { NotificationBell } from "./notification-bell";
+import { FeedbackDialog } from "./feedback-dialog";
+import { FileList } from './file-list';
+import { type FileEntryData } from './file-list-helpers';
+import { FilterBar } from './filter-bar';
+import { filterFiles } from './filter-bar-helpers';
+import { FolderCompareDialog } from "./folder-compare-dialog";
+import { GpgDialog } from "./gpg-dialog";
+import { IndexedSearchResults } from "./indexed-search-results";
+import { IntegrityTools } from "./integrity-tools";
+import { KeyboardCheatSheet } from "./keyboard-cheat-sheet";
+import { LineagePanel } from "./lineage-panel";
+import { LogViewerDialog } from "./log-viewer-dialog";
 import {
-  FolderOpen,
-  PanelLeft,
-  List,
-  AlignJustify,
-  Grid3X3,
-  Layout,
-  Undo2,
-  Bot,
-  Terminal,
-  Eye,
-  EyeOff,
-  Link2,
-  Unlink2,
-  Save,
-  FolderDown,
-  Zap,
-  Activity,
-  Layers,
-  X,
-  DatabaseBackup,
-  CalendarClock,
-  MonitorSmartphone,
-  HardDrive,
-  GitCompareArrows,
-  ScrollText,
-  Globe,
-} from "lucide-react";
+MigrationWizard,
+type MigrationConfig,
+type MigrationFolder,
+type MigrationProgress,
+type MigrationSummary,
+type SpaceAnalysis,
+} from "./migration-wizard";
+import { MountsHost } from "./mounts-host";
+import { NotificationBell } from "./notification-bell";
+import { OperationsDrawer,OperationsIndicator } from "./operations-drawer";
+import { PathJumpDialog } from "./path-jump-dialog";
+import { PeerSidebar } from "./peer-sidebar";
+import { PreviewPane } from "./preview-pane";
+import { PromptDialogHost } from "./prompt-dialog-host";
+import { SafetyInterlockDialog } from "./safety-interlock-dialog";
+import { ScheduleLibraryPanel } from "./schedule-library-panel";
+import SettingsPanel from "./settings-panel";
+import { ShareLinkDialog } from "./share-link-dialog";
+import { SidebarNav } from "./sidebar-nav";
+import { SinceLastSeenToast,type LedgerSinceSummary } from "./since-last-seen-toast";
+import { SmartSpaceWizard } from "./smart-space-wizard";
+import { SyncPanel } from "./sync-panel";
+import { TabBar } from "./tab-bar";
+import { TerminalPanel } from "./terminal-panel";
+import { TextEditorModal } from "./text-editor-modal";
+import { ThemeSwitcher } from "./theme-switcher";
+import { TransferHistoryPanel } from "./transfer-history-panel";
+import { TransferPanel } from "./transfer-panel";
+import { VaultPanel } from "./vault-panel";
 
 // Toolbar customization definition (#14)
 const ALL_TOOLBAR_ITEMS = [
@@ -513,6 +517,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
   // `batchRenameFiles`: the keyboard handler in the useEffect
   // below needs the setter in scope.
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsDialogRef = useFocusTrap<HTMLDivElement>({ active: settingsOpen, onEscape: () => setSettingsOpen(false) });
   /** Settings section to open on (`"rclone"` from the palette), else none. */
   const [settingsFocus, setSettingsFocus] = useState<string | null>(null);
   // Two more orphaned panels surfaced the same way as Connections/Sync:
@@ -1881,7 +1886,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [toggleSidebar, undoStack, toggleAiPanel, toggleTerminalPanel, toggleActivityTimeline, handleUndo, handleRedo, handleSaveWorkspace, handleJumpLastTouched]);
+  }, [toggleSidebar, undoStack, toggleAiPanel, toggleTerminalPanel, toggleActivityTimeline, handleUndo, handleRedo, handleSaveWorkspace, handleJumpLastTouched, setCommandPaletteOpen]);
 
   // "What happened while you were away?" — single mount-time ledger
   // summary call. Reads events added since the last session and shows a
@@ -2506,7 +2511,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
         keywords: ["connection", "cloud", "remote", "open in pane", c.protocol, c.name.toLowerCase()],
       })),
     ],
-    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, getFirstSelectedPath, getAllSelectedPaths, toggleAutomationPanel, automationPanelOpen, toggleActivityTimeline, favorites, handleJumpLastTouched, appMode, paletteConnections, openConnectionInPane],
+    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, toggleAutomationPanel, toggleActivityTimeline, favorites, appMode, paletteConnections, getFirstSelectedPath, automationPanelOpen, openNearby, getAllSelectedPaths, handleJumpLastTouched, openConnectionInPane],
   );
 
   return (
@@ -3448,6 +3453,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           role="dialog"
           aria-modal="true"
           aria-label="Settings"
+          ref={settingsDialogRef}
           data-testid="settings-backdrop"
           onClick={() => setSettingsOpen(false)}
         >
@@ -3754,7 +3760,7 @@ function FilePane({
   const [infoDialog, setInfoDialog] = useState<{
     path: string;
     name: string;
-    metadata: Record<string, any> | null;
+    metadata: Record<string, unknown> | null;
     comment: string;
   } | null>(null);
 
@@ -4686,7 +4692,7 @@ function FilePane({
 
   const handleGetInfo = useCallback(async (filePath: string) => {
     const fileName = filePath.split("/").pop() || filePath;
-    let metadata: Record<string, any> | null = null;
+    let metadata: Record<string, unknown> | null = null;
     let comment = "";
 
     if (isRemotePath(filePath)) {
@@ -5246,7 +5252,7 @@ function FilePane({
       });
       onContextMenu({ position: { x: event.clientX, y: event.clientY }, items });
     },
-    [selectedPaths, currentPath, handleOpen, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDeletePermanently, handleRename, handleDuplicate, handleNewFolder, handleNewFile, handleGetInfo, handleCalculateSize, handleEditRemote, handleCompareFiles, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, selectAll, invertSelection, onContextMenu, loadDirectory, isGitRepo, handleSendTo, onVerifyIntegrity, onCompress, onSendToComputer, handleExtractHere, isRemote, remoteConn],
+    [selectedPaths, handleCopy, handleCut, handlePaste, handleCopyToOtherPane, handleMoveToOtherPane, handleDelete, handleDuplicate, handleNewFolder, handleNewFile, selectAll, invertSelection, handleEditRemote, handleCompareFiles, isGitRepo, handleSetPermissions, handleCreateSymlink, handleCopyAsScript, handleCopyPath, handleCopyRemotePath, handleCopyUrl, handleCopyRelativePath, handleOpenWith, handleOpenInEditor, handleSendTo, isRemote, remoteConn, onContextMenu, currentPath, otherPanePath, handleDeletePermanently, handleRename, handleGetInfo, handleOpen, loadDirectory, handleCalculateSize, onVerifyIntegrity, onCompress, onSendToComputer, handleExtractHere],
   );
 
   // Keyboard shortcuts for compare (#47), quick select (#71), and the
@@ -5745,7 +5751,7 @@ function StatusBarContent() {
 
   useEffect(() => {
     if (isTauriAvailable()) {
-      tauriInvoke<Record<string, any>>("load_workspace_state").then(
+      tauriInvoke<Record<string, unknown>>("load_workspace_state").then(
         (state) => { if (state) { console.log("Workspace state loaded:", state); } },
         () => {}
       );
@@ -5775,7 +5781,7 @@ function StatusBarContent() {
     try {
       const cfg = await tauriInvoke<Record<string, string>>("list_config");
       setConfigEntries(cfg);
-    } catch (e: any) { setConfigError(e?.message || "Failed to load config"); }
+    } catch (e: unknown) { setConfigError(errorText(e, "Failed to load config")); }
   };
 
   const handleSetConfig = async () => {
@@ -5784,7 +5790,7 @@ function StatusBarContent() {
     try {
       await tauriInvoke("set_config", { key: configKey.trim(), value: configValue });
       setConfigKey(""); setConfigValue(""); await loadConfig();
-    } catch (e: any) { setConfigError(e?.message || "Failed to save config"); }
+    } catch (e: unknown) { setConfigError(errorText(e, "Failed to save config")); }
   };
 
   const toggleSettings = async () => {

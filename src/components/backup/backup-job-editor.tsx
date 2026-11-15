@@ -2,44 +2,46 @@
  * Backup job editor: a stepped setup wizard that also serves as the editor
  * for existing jobs. Every field maps 1:1 onto the Rust `BackupJob`.
  */
-import { useEffect, useMemo, useState } from "react";
+import { FilterPresetPicker,FilterRulesEditor,ImportRulesButton } from '@/components/filter-rules-editor';
+import { appendRules } from '@/components/filter-rules-editor-helpers';
+import { FolderField,RemoteFolderPicker } from "@/components/remote-folder-picker";
 import { tauriInvoke } from "@/hooks/use-tauri";
-import { formatBytes } from "@/lib/format-bytes";
-import {
-  DEFAULT_REQUEST_LIMITS,
-  errorText,
-  useBackupStore,
-  type BackupDestination,
-  type BackupJob,
-  type FilterRule,
-  type HookMode,
-  hookBeforeMode,
-  type PassphraseStrength,
-  type SavedDestination,
-  type SourcePreview,
-} from "@/stores/backup-store";
-import { inputCls, rulesToText, textToRules } from "@/lib/backup-helpers";
+import { inputCls,rulesToText,textToRules } from "@/lib/backup-helpers";
 import { pickFolder } from "@/lib/folder-picker";
-import { Banner, Btn, Check, Field, PathInput, Section } from "./backup-ui";
-import { RetentionEditor } from "./backup-retention-editor";
-import { BackupAdvancedOptions } from "./backup-advanced-options";
-import { StdinCommandEditor } from "./backup-run-options";
-import { BackupHardening } from "./backup-hardening";
-import { BackupReplicas } from "./backup-replicas";
-import { RequestLimitsEditor } from "./backup-request-limits";
-import { CloudDestinationForm, newCloudConfig } from "./backup-cloud-destination";
-import { HeadersEditor, LogOutputsEditor, NotificationsEditor, ReportExtras } from "./backup-notifications";
-import { NotificationProfilePicker } from "./backup-notification-profiles";
-import { JobSecretProviders } from "./backup-secret-providers";
-import { PhotosSourceSection } from "./backup-photos-source";
+import { formatBytes } from "@/lib/format-bytes";
+import { parseLocation,remoteLocation } from "@/lib/location";
+import { changedPaths,setPath } from "@/stores/backup-policy";
+import {
+DEFAULT_REQUEST_LIMITS,
+errorText,
+hookBeforeMode,
+useBackupStore,
+type BackupDestination,
+type BackupJob,
+type FilterRule,
+type HookMode,
+type PassphraseStrength,
+type SavedDestination,
+type SourcePreview,
+} from "@/stores/backup-store";
+import { useEffect,useMemo,useState } from "react";
 import { AdvancedOnly } from "./advanced-only";
-import { appendRules, FilterPresetPicker, FilterRulesEditor, ImportRulesButton } from "@/components/filter-rules-editor";
+import { BackupAdvancedOptions } from "./backup-advanced-options";
+import { CloudDestinationForm } from './backup-cloud-destination';
+import { newCloudConfig } from './backup-cloud-destination-helpers';
+import { BackupHardening } from "./backup-hardening";
+import { NotificationProfilePicker } from "./backup-notification-profiles";
+import { HeadersEditor,LogOutputsEditor,NotificationsEditor,ReportExtras } from "./backup-notifications";
+import { PhotosSourceSection } from "./backup-photos-source";
+import { EffectiveSettingsPanel,MaintenanceScheduleEditor,TemplatePicker } from "./backup-policies";
+import { BackupReplicas } from "./backup-replicas";
 import { BackupChangePassphrase } from "./backup-repository-format";
+import { RequestLimitsEditor } from "./backup-request-limits";
+import { RetentionEditor } from "./backup-retention-editor";
+import { StdinCommandEditor } from "./backup-run-options";
 import { ScheduleEditor } from "./backup-schedule-editor";
-import { EffectiveSettingsPanel, MaintenanceScheduleEditor, TemplatePicker } from "./backup-policies";
-import { changedPaths, setPath } from "@/stores/backup-policy";
-import { FolderField, RemoteFolderPicker } from "@/components/remote-folder-picker";
-import { parseLocation, remoteLocation } from "@/lib/location";
+import { JobSecretProviders } from "./backup-secret-providers";
+import { Banner,Btn,Check,Field,PathInput,Section } from "./backup-ui";
 
 interface ConnectionProfile {
   id: string;

@@ -1,5 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: 'standalone',
+  outputFileTracingRoot: require('path').join(__dirname, '..'),
   transpilePackages: ['@ufop/design-tokens', '@ufop/ui-components'],
   serverExternalPackages: [],
   async headers() {

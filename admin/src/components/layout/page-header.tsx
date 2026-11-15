@@ -3,6 +3,7 @@
 import React from 'react';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils/cn';
+import { deriveBreadcrumbs } from '@/lib/breadcrumbs';
 import { Breadcrumbs, type BreadcrumbItem } from '@/components/ui/breadcrumbs';
 
 interface PageHeaderProps {
@@ -11,28 +12,6 @@ interface PageHeaderProps {
   actions?: React.ReactNode;
   breadcrumbs?: BreadcrumbItem[];
   className?: string;
-}
-
-function humanize(segment: string): string {
-  return segment
-    .split('-')
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
-}
-
-function deriveBreadcrumbs(pathname: string | null, title: string): BreadcrumbItem[] {
-  if (!pathname || pathname === '/' || pathname === '/dashboard') return [];
-  const segments = pathname.split('/').filter(Boolean);
-  // Build cumulative paths so each crumb links back. The last crumb uses the
-  // page title (which often differs from the URL slug) and stays unlinked.
-  const crumbs: BreadcrumbItem[] = [{ label: 'Dashboard', href: '/dashboard' }];
-  let acc = '';
-  segments.forEach((seg, idx) => {
-    acc += `/${seg}`;
-    const isLast = idx === segments.length - 1;
-    crumbs.push({ label: isLast ? title : humanize(seg), href: isLast ? undefined : acc });
-  });
-  return crumbs;
 }
 
 export function PageHeader({ title, description, actions, breadcrumbs, className }: PageHeaderProps) {
