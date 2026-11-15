@@ -10,12 +10,12 @@
  * - `FilterPresetPicker`: apply a user-saved preset, save the current rules
  *   as one (both views), delete presets (Advanced).
  */
-import { useCallback, useEffect, useRef, useState } from "react";
-import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
-import { errorText } from "@/lib/error-text";
+import { tauriInvoke,tauriInvokeSafe } from "@/hooks/use-tauri";
 import { inputCls } from "@/lib/backup-helpers";
-import type { FilterGroupInfo, FilterRule } from "@/stores/backup-store";
+import { errorText } from "@/lib/error-text";
+import type { FilterGroupInfo,FilterRule } from "@/stores/backup-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useCallback,useEffect,useRef,useState } from "react";
 import { Btn } from "./backup/backup-ui";
 
 /** Mirrors `UserFilterPreset` in src-tauri sync_engine/filter_presets.rs. */
@@ -33,19 +33,6 @@ const KIND_LABELS: [FilterRule["kind"], string][] = [
   ["group", "Group"],
   ["rclone", "rclone glob"],
 ];
-
-/** The groups for the "Group" kind, from the shared engine. */
-export function useFilterGroups(): FilterGroupInfo[] {
-  const [groups, setGroups] = useState<FilterGroupInfo[]>([]);
-  useEffect(() => {
-    let live = true;
-    void tauriInvokeSafe<FilterGroupInfo[]>("get_filter_groups", undefined, []).then((g) => live && setGroups(Array.isArray(g) ? g : []));
-    return () => {
-      live = false;
-    };
-  }, []);
-  return groups;
-}
 
 export function FilterRulesEditor({
   rules,
@@ -121,13 +108,6 @@ export function FilterRulesSummary({ rules, onChange }: { rules: FilterRule[]; o
       <Btn onClick={() => onChange([])}>Clear all rules</Btn>
     </div>
   );
-}
-
-/** Rules not already in `rules`, appended in order. */
-export function appendRules(rules: FilterRule[], extra: FilterRule[]): FilterRule[] {
-  const key = (r: FilterRule) => `${r.action}|${r.kind}|${r.pattern}`;
-  const have = new Set(rules.map(key));
-  return [...rules, ...extra.filter((r) => !have.has(key(r)))];
 }
 
 export function ImportRulesButton({ onImport }: { onImport: (rules: FilterRule[]) => void }) {

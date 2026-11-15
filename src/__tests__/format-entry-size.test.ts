@@ -15,9 +15,9 @@
  * A future refactor that re-orphans the cache would silently re-
  * break the feature — this test guards the surface contract.
  */
-import { describe, it, expect } from "vitest";
-import { formatEntrySize } from "@/components/file-list";
-import type { FileEntryData } from "@/components/file-list";
+import type { FileEntryData } from '@/components/file-list-helpers';
+import { formatEntrySize } from '@/components/file-list-helpers';
+import { describe,expect,it } from "vitest";
 
 function makeFile(overrides: Partial<FileEntryData> = {}): FileEntryData {
   return {

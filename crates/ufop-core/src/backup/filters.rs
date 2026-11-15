@@ -115,10 +115,7 @@ impl SourceFilter {
                 }
             }
         }
-        if md.is_dir() && self.has_marker(path) {
-            return false;
-        }
-        true
+        !(md.is_dir() && self.has_marker(path))
     }
 
     /// Which ignore files the scanner reads.

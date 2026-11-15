@@ -1,14 +1,13 @@
 /**
  * Simple Mode Sidebar (T-054)
  *
- * Streamlined navigation for Simple mode:
+ * Task-based navigation for both sidebar layouts:
  * Files, Transfers, Sync, Cloud & Servers, Search, Favorites, Activity, Settings
  *
  * Larger touch targets, more whitespace, fewer controls.
- * Advanced features hidden but discoverable via "More options".
+ * Basic keeps everyday destinations; All features always exposes every tool.
  */
-import { useCallback, useState } from "react";
-import { useUIStore, type AppMode } from "@/stores/ui-store";
+import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@ufop/ui-components";
 import { ScrollArea } from "@ufop/ui-components";
 import {
@@ -22,7 +21,10 @@ import {
   Settings,
   DatabaseBackup,
   ChevronRight,
-  Sparkles,
+  LayoutGrid,
+  Zap,
+  Shield,
+  Wrench,
 } from "lucide-react";
 
 // ──────────────────────────────────────────────
@@ -38,7 +40,11 @@ export type SimpleNavSection =
   | "search"
   | "favorites"
   | "activity"
-  | "settings";
+  | "settings"
+  | "features"
+  | "automation"
+  | "security"
+  | "tools";
 
 interface SimpleSidebarProps {
   compact?: boolean;
@@ -57,6 +63,30 @@ const NAV_ITEMS: {
   icon: React.ReactNode;
   description: string;
 }[] = [
+  {
+    id: "features",
+    label: "All features",
+    icon: <LayoutGrid className="h-5 w-5" aria-hidden="true" />,
+    description: "Find every platform tool by task",
+  },
+  {
+    id: "automation",
+    label: "Automation & AI",
+    icon: <Zap className="h-5 w-5" aria-hidden="true" />,
+    description: "Quickflows, schedules, Smart Spaces and AI",
+  },
+  {
+    id: "security",
+    label: "Security & Sharing",
+    icon: <Shield className="h-5 w-5" aria-hidden="true" />,
+    description: "Vault, encryption, sharing and security settings",
+  },
+  {
+    id: "tools",
+    label: "Tools & Diagnostics",
+    icon: <Wrench className="h-5 w-5" aria-hidden="true" />,
+    description: "Terminal, file tools, logs and diagnostics",
+  },
   {
     id: "files",
     label: "Files",
@@ -124,13 +154,6 @@ export function SimpleSidebar({
   className,
 }: SimpleSidebarProps) {
   const appMode = useUIStore((s) => s.appMode);
-  const setAppMode = useUIStore((s) => s.setAppMode);
-  const [showModeHint, setShowModeHint] = useState(false);
-
-  const handleModeSwitch = useCallback(() => {
-    const newMode: AppMode = appMode === "simple" ? "advanced" : "simple";
-    setAppMode(newMode);
-  }, [appMode, setAppMode]);
 
   return (
     <ScrollArea
@@ -144,11 +167,22 @@ export function SimpleSidebar({
         {/* Navigation items with larger touch targets */}
         <div className="flex-1 space-y-1 px-2">
           {[
-            { label: "Workspace", ids: ["files", "search", "favorites"] },
+            {
+              label: "Workspace",
+              ids: ["files", "search", "favorites", "features"],
+            },
             {
               label: "File operations",
-              ids: ["transfers", "sync", "backups", "cloud"],
+              ids: ["transfers", "backups", "sync", "cloud"],
             },
+            ...(appMode === "advanced"
+              ? [
+                  {
+                    label: "Advanced tools",
+                    ids: ["automation", "security", "tools"],
+                  },
+                ]
+              : []),
             { label: "Manage", ids: ["activity", "settings"] },
           ].map((group) => (
             <section
@@ -161,8 +195,11 @@ export function SimpleSidebar({
                   {group.label}
                 </h2>
               )}
-              {NAV_ITEMS.filter((item) => group.ids.includes(item.id)).map(
-                (item) => (
+              {NAV_ITEMS.filter((item) => group.ids.includes(item.id))
+                .sort(
+                  (a, b) => group.ids.indexOf(a.id) - group.ids.indexOf(b.id),
+                )
+                .map((item) => (
                   <button
                     key={item.id}
                     className={cn(
@@ -191,46 +228,27 @@ export function SimpleSidebar({
                       />
                     )}
                   </button>
-                ),
-              )}
+                ))}
             </section>
           ))}
         </div>
 
-        {/* Mode switcher at bottom */}
         <div className="px-2 pt-3 mt-auto border-t border-[var(--color-border)]">
+          {!compact && (
+            <p className="px-3 text-xs text-[color:var(--color-text-secondary)]">
+              {appMode === "simple" ? "Basic" : "Advanced"} sidebar
+            </p>
+          )}
           <button
-            className={cn(
-              "flex items-center gap-3 w-full py-2.5 rounded-lg text-left",
-              compact ? "px-2 justify-center" : "px-4",
-              "text-[color:var(--color-text-tertiary)] hover:bg-[var(--color-hover-bg)] hover:text-[color:var(--color-text)]",
-              "transition-all duration-150",
-              "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)]",
-            )}
-            onClick={handleModeSwitch}
-            onFocus={() => setShowModeHint(true)}
-            onBlur={() => setShowModeHint(false)}
-            onMouseEnter={() => setShowModeHint(true)}
-            onMouseLeave={() => setShowModeHint(false)}
-            aria-label={
-              appMode === "simple"
-                ? "Switch to Advanced mode for more features"
-                : "Switch to Simple mode for a cleaner interface"
-            }
+            type="button"
+            className="flex gap-3 items-center w-full rounded-lg px-3 py-2.5 text-sm hover:bg-[var(--color-hover-bg)] focus-visible:outline-2 focus-visible:outline-[var(--color-focus-ring)]"
+            onClick={() => onSectionChange("settings")}
+            aria-label="Customize sidebar"
           >
-            <Sparkles className="h-5 w-5" aria-hidden="true" />
-            <div className={compact ? "sr-only" : "flex-1 min-w-0"}>
-              <span className="text-sm font-medium">
-                {appMode === "simple" ? "More Options" : "Simple Mode"}
-              </span>
-              {showModeHint && (
-                <p className="text-xs text-[color:var(--color-text-tertiary)] mt-0.5">
-                  {appMode === "simple"
-                    ? "Enable advanced features like regex, checksums, and scripting"
-                    : "Switch to a cleaner interface with fewer controls"}
-                </p>
-              )}
-            </div>
+            <Settings className="h-4 w-4" aria-hidden="true" />
+            <span className={compact ? "sr-only" : undefined}>
+              Customize sidebar
+            </span>
           </button>
         </div>
       </nav>

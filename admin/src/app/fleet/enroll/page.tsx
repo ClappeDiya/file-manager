@@ -122,7 +122,7 @@ export default function EnrollPage() {
               <Input label="Tags (comma separated)" value={claimTags} onChange={(e) => setClaimTags(e.target.value)} />
             </div>
             <Button type="submit">Claim</Button>
-            {claimed && <p className="text-sm text-success">Claimed “{claimed}”. It connects within a few seconds.</p>}
+            {claimed && <p className="text-sm text-success-foreground">Claimed “{claimed}”. It connects within a few seconds.</p>}
           </form>
         </Card>
         <Card>

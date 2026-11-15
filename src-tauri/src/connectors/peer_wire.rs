@@ -7,6 +7,7 @@
 //! - Frames are `[kind u8][len u32 BE][payload]`: kind 0 a JSON
 //!   [`PeerMessage`](super::peer::PeerMessage), kind 1 file bytes.
 
+use rustls::pki_types::pem::PemObject;
 use crate::core::error::AppError;
 use crate::security::tls::cert_fingerprint;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -65,11 +66,11 @@ impl PeerIdentity {
     }
 
     pub fn cert_der(&self) -> Result<CertificateDer<'static>, AppError> {
-        rustls_pemfile::certs(&mut self.cert_pem.as_bytes()).next().and_then(Result::ok).ok_or_else(|| AppError::internal("Peer certificate is not valid PEM"))
+        CertificateDer::pem_slice_iter(self.cert_pem.as_bytes()).next().and_then(Result::ok).ok_or_else(|| AppError::internal("Peer certificate is not valid PEM"))
     }
 
     fn key_der(&self) -> Result<PrivateKeyDer<'static>, AppError> {
-        rustls_pemfile::private_key(&mut self.key_pem.as_bytes()).ok().flatten().ok_or_else(|| AppError::internal("Peer key is not valid PEM"))
+        PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes()).ok().ok_or_else(|| AppError::internal("Peer key is not valid PEM"))
     }
 
     pub fn fingerprint(&self) -> String {

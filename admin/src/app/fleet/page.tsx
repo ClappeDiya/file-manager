@@ -84,7 +84,7 @@ export default function FleetDashboardPage() {
             <Card>
               <CardHeader>
                 <CardTitle>Open alerts</CardTitle>
-                <Link href="/alerts" className="text-sm text-primary">
+                <Link href="/alerts" className="text-sm text-link">
                   All alerts
                 </Link>
               </CardHeader>
@@ -94,7 +94,7 @@ export default function FleetDashboardPage() {
                 <ul className="space-y-3">
                   {data.openAlerts.slice(0, 8).map((a) => (
                     <li key={a.id} className="flex gap-2 text-sm">
-                      <Bell size={14} className={a.severity === 'critical' ? 'mt-0.5 text-error' : 'mt-0.5 text-warning'} aria-hidden="true" />
+                      <Bell size={14} className={a.severity === 'critical' ? 'mt-0.5 text-error-foreground' : 'mt-0.5 text-warning-foreground'} aria-hidden="true" />
                       <div>
                         <p className="text-foreground">{a.message}</p>
                         <p className="text-xs text-foreground-tertiary">
@@ -126,7 +126,7 @@ export default function FleetDashboardPage() {
                   <TableRow key={`${b.machineId}:${b.backupId}`}>
                     <TableCell className="font-medium">{b.name}</TableCell>
                     <TableCell>
-                      <Link href={`/fleet/machines/${b.machineId}`} className="text-primary">
+                      <Link href={`/fleet/machines/${b.machineId}`} className="text-link">
                         {b.machineName}
                       </Link>
                     </TableCell>
@@ -140,7 +140,7 @@ export default function FleetDashboardPage() {
                 {data.largestBackups.length === 0 && (
                   <TableRow>
                     <TableCell colSpan={5} className="text-center text-foreground-secondary">
-                      No backups reported yet. <Link href="/fleet/enroll" className="text-primary underline underline-offset-2">Enroll a machine</Link>.
+                      No backups reported yet. <Link href="/fleet/enroll" className="text-link underline underline-offset-2">Enroll a machine</Link>.
                     </TableCell>
                   </TableRow>
                 )}

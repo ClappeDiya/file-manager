@@ -527,7 +527,7 @@ fn create_7z_with_stdin_password(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     use std::io::Write;
     let count = sources.len();
-    let mut args = vec!["a".to_string(), format!("-p"), output.to_string()];
+    let mut args = vec!["a".to_string(), "-p".to_string(), output.to_string()];
     args.extend(sources.iter().cloned());
 
     let mut child = std::process::Command::new("7z")
@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(n, 2);
         assert!(!d.path().join("out.zip.part").exists());
         let mut z = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
-        let names: Vec<String> = z.file_names().map(String::from).collect();
+        let names: Vec<String> = z.file_names().map(|name| name.unwrap().into_owned()).collect();
         assert!(names.contains(&"reports/q3/a.txt".to_string()) && names.contains(&"single.txt".to_string()), "{names:?}");
         assert!(z.by_name("reports/q3/a.txt").is_err(), "entries need the password");
         assert!(z.by_name_decrypt("reports/q3/a.txt", b"wrong").is_err());

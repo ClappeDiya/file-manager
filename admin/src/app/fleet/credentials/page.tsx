@@ -43,7 +43,7 @@ function CredentialDetails({ c }: { c: CredentialRow }) {
           <ul className="space-y-0.5">
             {c.propagation.pending.map((m) => (
               <li key={m.id}>
-                <a className="text-primary hover:underline" href={`/fleet/machines/${m.id}`}>
+                <a className="text-link hover:underline" href={`/fleet/machines/${m.id}`}>
                   {m.name}
                 </a>{' '}
                 ({m.version === null ? 'not delivered yet' : `has v${m.version}`})
@@ -124,7 +124,7 @@ export default function CredentialsPage() {
                 <TableHead className="hidden md:table-cell">Reference</TableHead>
                 <TableHead className="hidden md:table-cell">Updated</TableHead>
                 <TableHead>Version</TableHead>
-                <TableHead />
+                <TableHead><span className="sr-only">Actions</span></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>

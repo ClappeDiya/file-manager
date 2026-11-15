@@ -235,7 +235,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
                 <TableHead className="hidden md:table-cell">Source</TableHead>
                 <TableHead className="hidden md:table-cell">Stored</TableHead>
                 <TableHead className="hidden md:table-cell">Versions</TableHead>
-                <TableHead />
+                <TableHead><span className="sr-only">Actions</span></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -355,7 +355,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
                   <span>
                     {p.name} <span className="text-xs text-foreground-tertiary">v{p.version}</span>
                   </span>
-                  {p.applied === p.version ? <StatusBadge value="succeeded" /> : <span className="text-xs text-warning">{p.applied ? `applied v${p.applied}, update pending` : 'not applied yet'}</span>}
+                  {p.applied === p.version ? <StatusBadge value="succeeded" /> : <span className="text-xs text-warning-foreground">{p.applied ? `applied v${p.applied}, update pending` : 'not applied yet'}</span>}
                 </li>
               ))}
             </ul>
@@ -413,7 +413,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
                   <TableHead>Sent</TableHead>
                   <TableHead>Command</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead />
+                  <TableHead><span className="sr-only">Actions</span></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

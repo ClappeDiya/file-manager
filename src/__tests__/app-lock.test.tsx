@@ -58,7 +58,7 @@ describe("app lock: commands wait while locked", () => {
     const a = tauriInvoke<string[]>("list_directory", { path: "/home" });
     const b = tauriInvokeSafe<string[]>("list_directory", { path: "/home" }, []);
     const c = tauriInvoke<string[]>("list_directory", { path: "/tmp" });
-    expect(await tauriInvoke("app_lock_status")).toEqual(status);
+    expect(await tauriInvoke<AppLockStatus>("app_lock_status")).toEqual(status);
     await new Promise((r) => setTimeout(r, 10));
     expect(calls("list_directory")).toHaveLength(0);
     setIpcLocked(false);

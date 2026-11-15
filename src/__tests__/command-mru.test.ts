@@ -19,15 +19,15 @@
  *
  * Pure unit tests with a stubbed localStorage.
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { beforeEach,describe,expect,it,vi } from "vitest";
+import type { CommandItem } from '../components/command-palette-helpers';
 import {
-  readCommandUsage,
-  recordCommandUsage,
-  applyMruOrdering,
-  MRU_STORAGE_KEY,
-  MAX_TRACKED_COMMANDS,
+applyMruOrdering,
+MAX_TRACKED_COMMANDS,
+MRU_STORAGE_KEY,
+readCommandUsage,
+recordCommandUsage,
 } from "../lib/command-mru";
-import type { CommandItem } from "../components/command-palette";
 
 /** In-memory localStorage stub so each test runs against a clean
  *  storage. Installed via `Object.defineProperty` so the real

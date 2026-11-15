@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect } from 'react';
+import { usePathname, useRouter } from 'next/navigation';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { Sidebar } from './sidebar';
@@ -17,7 +18,10 @@ interface AdminShellProps {
 }
 
 export function AdminShell({ children }: AdminShellProps) {
-  const { isAuthenticated, isValidating, validateSession } = useAuthStore();
+  const { isAuthenticated, validateSession } = useAuthStore();
+  const pathname = usePathname();
+  const router = useRouter();
+  const publicPage = pathname === '/login' || pathname === '/reset-password' || pathname?.startsWith('/invite/');
   // Block rendering only for the first check; later refreshes (after sign-in,
   // switching organization) keep the page mounted.
   const [checkedOnce, setCheckedOnce] = React.useState(false);
@@ -29,6 +33,12 @@ export function AdminShell({ children }: AdminShellProps) {
   useEffect(() => {
     void validateSession().finally(() => setCheckedOnce(true));
   }, [validateSession]);
+
+  useEffect(() => {
+    if (checkedOnce && !isAuthenticated && !publicPage) {
+      router.replace(`/login?redirect=${encodeURIComponent(pathname || '/')}`);
+    }
+  }, [checkedOnce, isAuthenticated, publicPage, pathname, router]);
 
   // The organization's branding (reloaded when switching organization).
   const orgId = useAuthStore((s) => s.user?.organizationId);
@@ -50,15 +60,15 @@ export function AdminShell({ children }: AdminShellProps) {
     return () => media.removeEventListener('change', onChange);
   }, [applyTheme, theme]);
 
-  if (isValidating && !checkedOnce) {
+  if (!publicPage && (!checkedOnce || !isAuthenticated)) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
-        <div className="text-muted-foreground">Validating session...</div>
+        <div role="status" className="text-muted-foreground">{checkedOnce ? 'Redirecting to sign in...' : 'Validating session...'}</div>
       </div>
     );
   }
 
-  if (!isAuthenticated) {
+  if (publicPage) {
     return (
       <>
         {children}

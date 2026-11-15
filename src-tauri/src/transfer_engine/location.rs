@@ -885,7 +885,11 @@ pub(crate) mod tests {
                 let _running = Running(&self.active_uploads);
                 self.peak_uploads.fetch_max(now, SeqCst);
                 let delay = self.upload_delay_ms.load(SeqCst);
-                let failing = self.fail_next_uploads.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok();
+                let failing = loop {
+                    let remaining = self.fail_next_uploads.load(SeqCst);
+                    if remaining == 0 { break false; }
+                    if self.fail_next_uploads.compare_exchange(remaining, remaining - 1, SeqCst, SeqCst).is_ok() { break true; }
+                };
                 if delay > 0 || failing {
                     self.files.lock().unwrap().insert(r.clone(), b"part".to_vec());
                 }

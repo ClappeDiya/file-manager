@@ -1,3 +1,4 @@
+import { errorText } from "@/lib/error-text";
 /**
  * Sync Panel Component (T-039..T-042)
  *
@@ -9,57 +10,51 @@
  * - Conflict resolution UI
  * - Reports and rollback
  */
-import { NamedSchedulePicker } from "@/components/schedule-pickers";
-import { refId, useScheduleStore } from "@/stores/schedule-store";
-import { useState, useCallback, useEffect, useRef } from "react";
-import { SyncRunOptionsSection } from "@/components/sync-run-options";
-import { DEFAULT_RUN_OPTIONS, type SyncPair as StoreSyncPair, type SyncReport } from "@/stores/sync-store";
-import { RunNotifyPicker } from "@/components/run-notify-picker";
-import type { RunNotify } from "@/lib/run-notify";
-import { formatNextRun, useNextRuns } from "@/lib/upcoming-runs";
-import { useUIStore } from "@/stores/ui-store";
-import {
-  appendRules,
-  FilterPresetPicker,
-  FilterRulesSummary,
-  FilterRulesEditor,
-  ImportRulesButton,
-  useFilterGroups,
-} from "@/components/filter-rules-editor";
-import {
-  changedOptionKeys,
-  emptyPairForm,
-  filterFromForm,
-  formFromPair,
-  optionsForMode,
-  pairFromForm,
-  type SyncPairForm,
-} from "@/lib/sync-pair-form";
-import { downloadText } from "@/lib/backup-helpers";
-import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
-import { formatBytes } from "@/lib/format-bytes";
-import { SyncProgressCard } from "@/components/sync-progress-card";
-import { SyncComparison } from "@/components/sync-comparison";
-import { SyncRunItems } from "@/components/sync-run-items";
+import { FilterPresetPicker,FilterRulesEditor,FilterRulesSummary,ImportRulesButton } from '@/components/filter-rules-editor';
+import { appendRules,useFilterGroups } from '@/components/filter-rules-editor-helpers';
 import { HistoryRangeChips } from "@/components/history-range-chips";
-import { ALL_TIME, formatLocalTime, rangeArgs, type HistoryRange } from "@/lib/history-range";
-import { triggerLabel } from "@/lib/run-trigger";
-import { canOpen, localTarget, openTarget } from "@/lib/open-location";
-import { TwoWayHistory } from "@/components/sync-two-way-history";
-import {
-  CopyPresetPicker,
-  RobocopyCommandPreview,
-  RobocopyImport,
-  RobocopyOptionsSection,
-} from "@/components/robocopy-options";
-import {
-  DEFAULT_COPY_OPTIONS,
-  countChangedOptions,
-  describeExitCode,
-  type CopyOptions,
-  type RobocopyJob,
-} from "@/lib/copy-options";
 import { FolderField } from "@/components/remote-folder-picker";
+import {
+CopyPresetPicker,
+RobocopyCommandPreview,
+RobocopyImport,
+RobocopyOptionsSection,
+} from "@/components/robocopy-options";
+import { RunNotifyPicker } from "@/components/run-notify-picker";
+import { NamedSchedulePicker } from "@/components/schedule-pickers";
+import { SyncComparison } from "@/components/sync-comparison";
+import { SyncProgressCard } from "@/components/sync-progress-card";
+import { SyncRunItems } from "@/components/sync-run-items";
+import { SyncRunOptionsSection } from "@/components/sync-run-options";
+import { TwoWayHistory } from "@/components/sync-two-way-history";
+import { tauriInvoke,tauriInvokeSafe } from "@/hooks/use-tauri";
+import { downloadText } from "@/lib/backup-helpers";
+import {
+DEFAULT_COPY_OPTIONS,
+countChangedOptions,
+describeExitCode,
+type CopyOptions,
+type RobocopyJob,
+} from "@/lib/copy-options";
+import { formatBytes } from "@/lib/format-bytes";
+import { ALL_TIME,formatLocalTime,rangeArgs,type HistoryRange } from "@/lib/history-range";
+import { canOpen,localTarget,openTarget } from "@/lib/open-location";
+import type { RunNotify } from "@/lib/run-notify";
+import { triggerLabel } from "@/lib/run-trigger";
+import {
+changedOptionKeys,
+emptyPairForm,
+filterFromForm,
+formFromPair,
+optionsForMode,
+pairFromForm,
+type SyncPairForm,
+} from "@/lib/sync-pair-form";
+import { formatNextRun,useNextRuns } from "@/lib/upcoming-runs";
+import { refId,useScheduleStore } from "@/stores/schedule-store";
+import { DEFAULT_RUN_OPTIONS,type SyncPair as StoreSyncPair,type SyncReport } from "@/stores/sync-store";
+import { useUIStore } from "@/stores/ui-store";
+import { useCallback,useEffect,useRef,useState } from "react";
 
 // ── Types ──
 
@@ -227,10 +222,10 @@ export function SyncPanel() {
       }
       setHealthMap(healthResults);
       void refreshNextRuns();
-    } catch (e: any) {
-      setError(e?.message || "Failed to load sync pairs");
+    } catch (e: unknown) {
+      setError(errorText(e, "Failed to load sync pairs"));
     }
-  }, [refreshNextRuns]);
+  }, [refreshNextRuns, setPairs]);
 
   useEffect(() => {
     loadPairs();
@@ -319,8 +314,8 @@ export function SyncPanel() {
       setEditing(null);
       setCreateForm(emptyPairForm(syncDefaults));
       _setDetectedOffset(null);
-    } catch (e: any) {
-      setError(e?.message || (editing ? "Failed to update sync pair" : "Failed to create sync pair"));
+    } catch (e: unknown) {
+      setError(errorText(e, editing ? "Failed to update sync pair" : "Failed to create sync pair"));
     } finally {
       setLoading(false);
     }
@@ -338,8 +333,8 @@ export function SyncPanel() {
           : `Created "${copy.name}". It is disabled, so its schedule is off: point it at its own folders, then turn it on in Edit.`,
       );
       await loadPairs();
-    } catch (e: any) {
-      setError(e?.message || "Failed to duplicate sync pair");
+    } catch (e: unknown) {
+      setError(errorText(e, "Failed to duplicate sync pair"));
     }
   };
 
@@ -348,8 +343,8 @@ export function SyncPanel() {
     try {
       const json = await tauriInvoke<string>("export_sync_pair", { pairId: pair.id });
       downloadText(`sync-pair-${pair.name.replace(/[^\w.-]+/g, "_")}.json`, json);
-    } catch (e: any) {
-      setError(e?.message || "Export failed");
+    } catch (e: unknown) {
+      setError(errorText(e, "Export failed"));
     }
   };
 
@@ -362,8 +357,8 @@ export function SyncPanel() {
         [`Imported "${result.pair.name}".`, ...result.warnings].join(" "),
       );
       await loadPairs();
-    } catch (e: any) {
-      setError(e?.message || "Import failed");
+    } catch (e: unknown) {
+      setError(errorText(e, "Import failed"));
     }
   };
 
@@ -376,8 +371,8 @@ export function SyncPanel() {
       const result = await tauriInvoke<SyncPreview>("sync_dry_run", { pairId });
       setPreview(result);
       setView("preview");
-    } catch (e: any) {
-      setError(e?.message || "Dry run failed");
+    } catch (e: unknown) {
+      setError(errorText(e, "Dry run failed"));
     } finally {
       setLoading(false);
     }
@@ -394,8 +389,8 @@ export function SyncPanel() {
       setReports([report]);
       setView("reports");
       await loadPairs();
-    } catch (e: any) {
-      setError(e?.message || "Sync failed");
+    } catch (e: unknown) {
+      setError(errorText(e, "Sync failed"));
     } finally {
       setSyncRunning(false);
       setRunningPairId(null);
@@ -408,8 +403,8 @@ export function SyncPanel() {
     try {
       await tauriInvoke("delete_sync_pair", { pairId });
       await loadPairs();
-    } catch (e: any) {
-      setError(e?.message || "Failed to delete sync pair");
+    } catch (e: unknown) {
+      setError(errorText(e, "Failed to delete sync pair"));
     }
   };
 
@@ -424,10 +419,10 @@ export function SyncPanel() {
     setPairs(pairsRef.current);
     try {
       await tauriInvoke("update_sync_pair", { pairJson: JSON.stringify(updated) });
-    } catch (e: any) {
+    } catch (e: unknown) {
       pairsRef.current = pairsRef.current.map((p) => (p.id === pairId ? pair : p));
       setPairs(pairsRef.current);
-      setError(e?.message || "Failed to save the notification settings");
+      setError(errorText(e, "Failed to save the notification settings"));
     }
   };
 
@@ -440,8 +435,8 @@ export function SyncPanel() {
       setError(null);
       alert(`Rollback complete: ${restored} file(s) restored.`);
       await loadPairs();
-    } catch (e: any) {
-      setError(e?.message || "Rollback failed");
+    } catch (e: unknown) {
+      setError(errorText(e, "Rollback failed"));
     } finally {
       setLoading(false);
     }
@@ -459,8 +454,8 @@ export function SyncPanel() {
       setReportsPairId(pairId);
       setReportsRange(range);
       setView("reports");
-    } catch (e: any) {
-      setError(e?.message || "Failed to load reports");
+    } catch (e: unknown) {
+      setError(errorText(e, "Failed to load reports"));
     }
   };
 
@@ -480,8 +475,8 @@ export function SyncPanel() {
       a.download = `sync-preview-${preview.pair_name}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setError(e?.message || "Export failed");
+    } catch (e: unknown) {
+      setError(errorText(e, "Export failed"));
     }
   };
 
@@ -495,8 +490,8 @@ export function SyncPanel() {
       await tauriInvoke("resolve_sync_conflict", { conflictId, resolution });
       const updated = await tauriInvoke<SyncConflictItem[]>("get_sync_conflicts", undefined, []);
       setConflicts(updated);
-    } catch (e: any) {
-      setError(e?.message || "Failed to resolve conflict");
+    } catch (e: unknown) {
+      setError(errorText(e, "Failed to resolve conflict"));
     }
   };
 
@@ -938,7 +933,7 @@ function CreatePairView({
   /** Global sync defaults: presets start from them. */
   defaults?: CopyOptions;
 }) {
-  const update = (field: keyof SyncPairForm, value: any) =>
+  const update = <K extends keyof SyncPairForm,>(field: K, value: SyncPairForm[K]) =>
     setForm({ ...form, [field]: value });
   const advancedView = useUIStore((s) => s.appMode === "advanced");
   const groups = useFilterGroups();
@@ -963,8 +958,8 @@ function CreatePairView({
         // Next runs of the cron (or named schedule), days off marked.
         const runs = await tauriInvoke<{ at: string; skipped_by: string | null }[]>("schedule_preview", { cronExpr: form.cronExpr, count: 3 });
         setCronValidation({ valid: true, next_runs: runs.map((r) => (r.skipped_by ? `${r.at}|${r.skipped_by}` : r.at)), error: null });
-      } catch (e: any) {
-        setCronValidation({ valid: false, next_runs: [], error: e?.message || "Validation failed" });
+      } catch (e: unknown) {
+        setCronValidation({ valid: false, next_runs: [], error: errorText(e, "Validation failed") });
       } finally {
         setCronValidating(false);
       }
@@ -1365,7 +1360,7 @@ function CreatePairView({
                       destPath: form.destPath,
                     });
                     update("timeOffsetSecs", offset);
-                  } catch (e: any) {
+                  } catch (e: unknown) {
                     console.error("Time offset detection failed:", e);
                   }
                 }}
@@ -1681,8 +1676,8 @@ function ReportsView({
       a.download = `sync-report-${pairName}-${reportId}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setExportError(e?.message || "CSV export failed");
+    } catch (e: unknown) {
+      setExportError(errorText(e, "CSV export failed"));
     }
   };
 
@@ -1697,8 +1692,8 @@ function ReportsView({
       a.download = `sync-report-${pairName}-${reportId}.json`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch (e: any) {
-      setExportError(e?.message || "JSON export failed");
+    } catch (e: unknown) {
+      setExportError(errorText(e, "JSON export failed"));
     }
   };
   if (reports.length === 0) {

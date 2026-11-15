@@ -63,7 +63,7 @@ export default function AIGovernancePage() {
     return (
       <div>
         <PageHeader title="AI Governance" description="Control how AI features process organizational data with full transparency" />
-        <p className="text-sm text-error mt-4">Could not load AI governance settings: {error}</p>
+        <p className="text-sm text-error-foreground mt-4">Could not load AI governance settings: {error}</p>
       </div>
     );
   }
@@ -163,7 +163,7 @@ export default function AIGovernancePage() {
               <Card key={feature.id}>
                 <div className="flex items-start gap-4">
                   <div className={`p-3 rounded-lg ${enabled ? 'bg-primary/10' : 'bg-background-tertiary'}`}>
-                    <Icon size={20} className={enabled ? 'text-primary' : 'text-foreground-disabled'} />
+                    <Icon size={20} className={enabled ? 'text-link' : 'text-foreground-disabled'} />
                   </div>
                   <div className="flex-1">
                     <div className="flex items-center gap-2">

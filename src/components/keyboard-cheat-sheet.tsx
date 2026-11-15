@@ -35,11 +35,11 @@
  *   dismissal pattern so users don't have to learn two different
  *   "get out of this modal" gestures.
  */
-import { useEffect, useMemo } from "react";
+import { groupShortcutCommandsByCategory } from "@/lib/keyboard-shortcut-groups";
 import { cn } from "@ufop/ui-components";
 import { X } from "lucide-react";
-import type { CommandItem } from "./command-palette";
-import { groupShortcutCommandsByCategory } from "@/lib/keyboard-shortcut-groups";
+import { useEffect,useMemo } from "react";
+import type { CommandItem } from './command-palette-helpers';
 
 interface KeyboardCheatSheetProps {
   commands: CommandItem[];

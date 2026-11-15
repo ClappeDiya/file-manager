@@ -111,7 +111,7 @@ All agent calls carry `Authorization: Bearer ufop_agent_…`, except registratio
 
 ## Tests
 
-`cd admin && npx vitest run` covers:
+`pnpm --dir admin test` covers:
 
 - migrations, sessions, audit;
 - tenancy and isolation;
@@ -121,3 +121,21 @@ All agent calls carry `Authorization: Bearer ufop_agent_…`, except registratio
 - SSO against a live `oidc-provider` and SAML responses signed by a samlify IdP.
 
 The SMTP cases expect the local aiosmtpd server on `127.0.0.1:2525` (`UFOP_TEST_SMTP_DIR`, `UFOP_TEST_SMTP_CERT`).
+
+## Connector provisioning and shared workspaces
+
+Connectors persists organization-scoped storage definitions and grants them to explicitly selected, active desktop agents in that organization. Supported provisioning protocols are SFTP, FTP/FTPS, WebDAV, SMB, NFS, S3, Azure Blob, ADLS Gen2, Azure Files and B2. Create secrets in Fleet → Credentials; definitions contain references rather than passwords. OAuth and rclone connections continue to be configured on each desktop.
+
+Shared Workspaces groups those definitions and grants the set to selected desktops. Edit a workspace to add or revoke a desktop. Storage authorization remains the responsibility of the remote account; a console grant does not change a remote server's ACLs. The console requires the corresponding read/write permissions, recent authentication for mutations, and records changes in its audit chain.
+
+Agents receive a full snapshot with their fleet policy bundle. The desktop installs saved connections with a Managed badge, keeps secrets in its secure store and acknowledges the actual revision after installation succeeds. Pending means no acknowledgement; Failed includes the agent's installation error and retries on a later heartbeat. Changes and credential rotations generate a new revision. Removing the last grant removes the managed profile on the next successful sync, without deleting personal connections. Offline agents retain their prior configuration until they reconnect; revoking an agent token removes managed profiles when the agent observes the refusal.
+
+Test endpoint performs a bounded TCP reachability check. It does not claim authentication or folder access succeeded. Private targets are refused unless the console operator enables `CONNECTORS_ALLOW_PRIVATE=1` for a trusted corporate network.
+
+## Local CI and GHCR images
+
+GitHub Actions stay disabled. Run `pnpm verify` for the local gate, or install its pre-push hook with `pnpm hooks:install`. The gate includes zero-warning lint, type checks and tests for desktop, admin and marketing, strict Rust checks, contract checks and production builds. `--fast` skips production builds, native integration tests and the optional Windows target check. Rust uses the pinned toolchain in `rust-toolchain.toml`.
+
+`./scripts/build-push-ghcr.sh all` runs the full local gate and publishes admin and marketing images with immutable full commit SHA tags. It refuses dirty source and an existing SHA tag. `--dry-run` prints the plan without publishing. Images carry source/revision labels and provenance. Native desktop releases are packaged separately.
+
+`docker-compose.admin.ghcr.yml` is an explicit, separate admin stack. Set `IMAGE_TAG`, `ADMIN_DOMAIN`, `ADMIN_PUBLIC_URL`, `NEXTAUTH_SECRET`, and `ADMIN_ENCRYPTION_KEY` before use. Keep encryption keys stable across redeployments and back up the `admin-data` volume. Publishing an image does not deploy this stack or invent a production hostname.

@@ -22,7 +22,7 @@ export function TranscriptDialog({ reportId, onClose }: { reportId: string | nul
       <ErrorBanner message={error} />
       {t && (
         <div className="space-y-3 text-sm">
-          <p className={t.verification.matches && t.verification.chainOk ? 'text-success' : 'text-error'}>
+          <p className={t.verification.matches && t.verification.chainOk ? 'text-success-foreground' : 'text-error-foreground'}>
             {t.verification.matches && t.verification.chainOk ? '✓ Unchanged since it was recorded (hash on the audit chain, chain verifies)' : `✗ ${t.verification.reason}`}
           </p>
           <section>

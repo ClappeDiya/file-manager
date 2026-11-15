@@ -164,7 +164,7 @@ pub fn validate_batch(folder: &Path, rules: &BatchRules) -> Result<ValidationRep
         let p = matcher(&m.pattern)?;
         let hits: Vec<&(String, PathBuf, u64)> = files.iter().filter(|(n, ..)| matches(&p, n)).collect();
         let n = hits.len() as u32;
-        let count_ok = n >= m.min && m.max.map_or(true, |max| n <= max);
+        let count_ok = n >= m.min && m.max.is_none_or(|max| n <= max);
         let wanted = match m.max {
             Some(max) if max == m.min => format!("{max}"),
             Some(max) => format!("{}–{max}", m.min),

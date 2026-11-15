@@ -153,6 +153,7 @@ impl std::fmt::Debug for CentralCredential {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PolicyBundle {
+    pub workspaces: Vec<super::WorkspaceDelivery>,
     pub policy_set_version: String,
     pub policies: Vec<FleetPolicy>,
     pub credentials: Vec<CentralCredential>,

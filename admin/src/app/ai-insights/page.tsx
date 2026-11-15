@@ -120,7 +120,7 @@ export default function AiInsightsPage() {
                       )}
                     </p>
                   </div>
-                  {r.error ? <p className="text-sm text-error">{r.error}</p> : <div className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">{r.content}</div>}
+                  {r.error ? <p className="text-sm text-error-foreground">{r.error}</p> : <div className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">{r.content}</div>}
                 </Card>
               ))
             )}

@@ -1948,7 +1948,11 @@ mod tests {
     #[tokio::test]
     async fn failed_local_writes_retry_with_a_fresh_journal_and_real_bytes() {
         for retry_all in [false, true] {
-            let mgr = mgr_with_journal().await;
+            use crate::core::traits::StorageOperations;
+            let repo = crate::storage::Repository::open_in_memory().await.unwrap();
+            let mgr = TransferManager::new();
+            mgr.init_journal(repo.pool().clone()).await;
+            retention::persist_terminal_states(&mgr, repo.clone());
             let dir = tempfile::tempdir().unwrap();
             let src = dir.path().join("source.bin");
             let dst = dir.path().join("destination.bin");
@@ -1961,6 +1965,14 @@ mod tests {
             mgr.run_local_job(job.id).await;
             assert_eq!(mgr.get_job(job.id).await.unwrap().unwrap().status, TransferStatus::Failed);
             assert!(!dst.exists());
+            // Observe the old failure on disk before retrying: this is the row
+            // that used to survive a successful retry and resurrect on restart.
+            for _ in 0..200 {
+                if !StorageOperations::load_transfer_queue(&repo).await.unwrap().is_empty() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(StorageOperations::load_transfer_queue(&repo).await.unwrap()[0].status, TransferStatus::Failed);
+
             std::fs::remove_dir(&partial).unwrap();
             if retry_all {
                 assert_eq!(mgr.retry_all_failed().await.unwrap(), vec![job.id]);
@@ -1974,6 +1986,24 @@ mod tests {
             assert!(done.source_checksum.is_some());
             assert_eq!(std::fs::read(&dst).unwrap(), bytes);
             assert_eq!(std::fs::read(&src).unwrap(), bytes);
+            let mut saved = None;
+            for _ in 0..200 {
+                let id = job.id.to_string();
+                saved = repo.pool().execute(move |conn| {
+                    Ok(conn.query_row("SELECT status, source_checksum, dest_checksum, error_message FROM transfer_history WHERE id = ?1", [&id], |r| Ok((r.get::<_, String>(0)?,r.get::<_, Option<String>>(1)?,r.get::<_, Option<String>>(2)?,r.get::<_, Option<String>>(3)?))).ok())
+                }).await.unwrap();
+                if saved.as_ref().is_some_and(|s| s.0 == "completed") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let saved = saved.expect("terminal state persisted before shutdown");
+            assert_eq!(saved.0, "completed");
+            assert_eq!(saved.1, done.source_checksum);
+            assert_eq!(saved.2, done.dest_checksum);
+            assert_eq!(saved.3, None);
+            let restarted = TransferManager::new();
+            restarted.restore_jobs(StorageOperations::load_transfer_queue(&repo).await.unwrap()).await;
+            assert!(restarted.get_job(job.id).await.unwrap().is_none(), "a completed retry must not return as a failed queued job");
+
         }
     }
 

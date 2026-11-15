@@ -9,21 +9,21 @@
  *   copy / move between any two locations      (callers keep copy_files/move_files
  *                                               for local↔local)  |  enqueue_location_transfer
  */
+import type { FileEntryData } from '@/components/file-list-helpers';
 import { tauriInvoke } from "@/hooks/use-tauri";
-import type { FileEntryData } from "@/components/file-list";
-import { useConnectionsStore, type PaneConnection } from "@/stores/connections-store";
-import { measureSelection } from "@/lib/safety";
 import {
-  isRemotePath,
-  joinLocation,
-  parentLocation,
-  parseLocation,
-  rememberRemoteNames,
-  remoteLocation,
-  remoteName,
-  sameFolder,
-  sameLocationRoot,
+isRemotePath,
+joinLocation,
+parentLocation,
+parseLocation,
+rememberRemoteNames,
+remoteLocation,
+remoteName,
+sameFolder,
+sameLocationRoot,
 } from "@/lib/location";
+import { measureSelection } from "@/lib/safety";
+import { useConnectionsStore,type PaneConnection } from "@/stores/connections-store";
 
 /** Tooltip of actions that only work on this computer's folders. */
 export const LOCAL_ONLY_REASON = "Not available in connection folders — copy the item to this computer first";
@@ -348,4 +348,4 @@ export function connectorPath(path: string): string {
   return parseLocation(path).path;
 }
 
-export { joinLocation, parentLocation };
+export { joinLocation,parentLocation };

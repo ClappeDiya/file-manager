@@ -240,7 +240,7 @@ run_stage() {
     STAGE_NAMES+=("$name"); STAGE_STATUS+=("skip"); STAGE_SECONDS+=("0")
     return
   fi
-  if [[ "$FAST" == true && ( "$name" == "cargo-test" || "$name" == "build" || "$name" == "win-check" ) ]]; then
+  if [[ "$FAST" == true && ( "$name" == "cargo-test" || "$name" == "build" || "$name" == "admin-build" || "$name" == "marketing-build" || "$name" == "win-check" ) ]]; then
     printf '%b==> %s%b %s(skipped in --fast)%s\n' "$C_BOLD" "$name" "$C_RESET" "$C_DIM" "$C_RESET"
     STAGE_NAMES+=("$name"); STAGE_STATUS+=("skip"); STAGE_SECONDS+=("0")
     return
@@ -277,6 +277,7 @@ run_stage "ipc-args"     "bash scripts/check-ipc-args.sh"
 run_stage "appstate"     "bash scripts/check-appstate.sh"
 run_stage "tauri-config" "bash scripts/check-tauri-config.sh"
 run_stage "migrations"   "bash scripts/check-migrations.sh"
+run_stage "store-check-tests" "node --test scripts/check-store-keys.test.mjs"
 run_stage "stores"       "bash scripts/check-store-keys.sh"
 run_stage "connectors"   "bash scripts/check-connectors.sh"
 run_stage "unwraps"      "bash scripts/check-command-unwraps.sh"
@@ -290,6 +291,7 @@ run_stage "hygiene"      "bash scripts/check-bash-hygiene.sh"
 run_stage "changelog"    "bash scripts/check-changelog.sh"
 run_stage "gha"          "bash scripts/check-github-actions.sh"
 run_stage "release"      "bash scripts/test-release-scripts.sh"
+run_stage "deploy-tests" "bash scripts/test-deploy-admin.sh"
 run_stage "audit"        "bash scripts/check-pnpm-audit.sh"
 run_stage "ws-deps"      "bash scripts/check-workspace-deps.sh"
 run_stage "csp"          "bash scripts/check-tauri-csp.sh"
@@ -299,14 +301,22 @@ run_stage "cargo-audit"  "bash scripts/check-cargo-audit.sh"
 run_stage "ret-types"    "bash scripts/check-command-return-types.sh"
 run_stage "env-example"  "bash scripts/check-env-example-drift.sh"
 run_stage "invoke-types" "bash scripts/check-tauri-invoke-types.sh"
+run_stage "admin-lint"   "pnpm --dir admin lint"
+run_stage "admin-types"  "pnpm --dir admin exec tsc --noEmit"
+run_stage "admin-test"   "pnpm --dir admin test"
+run_stage "marketing-lint" "pnpm --dir marketing lint"
+run_stage "marketing-types" "pnpm --dir marketing exec tsc --noEmit"
+run_stage "marketing-test"  "pnpm --dir marketing test"
 run_stage "test"         "pnpm test"
 run_stage "cargo"        "cd src-tauri && cargo check --workspace"
-run_stage "clippy"       "cd src-tauri && cargo clippy --all-targets -- -D warnings"
-run_stage "core"         "cd crates/ufop-core && cargo clippy --all-targets -- -D warnings && cargo test"
-run_stage "cli"          "cd cli && cargo clippy --all-targets -- -D warnings && cargo test"
-run_stage "cargo-test"   "cd src-tauri && cargo test"
+run_stage "clippy"       "cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings"
+run_stage "core"         "cd crates/ufop-core && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features"
+run_stage "cli"          "cd cli && cargo clippy --all-targets --all-features -- -D warnings && cargo test"
+run_stage "cargo-test"   "cd src-tauri && cargo test --features tauri/custom-protocol -- --test-threads=1"
 run_stage "win-check"    "bash scripts/check-windows-build.sh"
 run_stage "build"        "pnpm build"
+run_stage "admin-build"  "pnpm --dir admin build"
+run_stage "marketing-build" "pnpm --dir marketing build"
 
 # ---------------------------------------------------------------------------
 # Summary

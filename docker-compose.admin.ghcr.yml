@@ -1,0 +1,44 @@
+# Separate opt-in stack: an existing marketing deploy never starts an unconfigured console.
+name: filemanager-admin
+services:
+  admin:
+    image: ghcr.io/clappediya/filemanager-admin:${IMAGE_TAG:?Set an immutable sha tag}
+    restart: unless-stopped
+    mem_limit: 1g
+    environment:
+      NODE_ENV: production
+      ADMIN_DB_PATH: /data/admin.sqlite
+      ADMIN_PUBLIC_URL: ${ADMIN_PUBLIC_URL:-https://app.filemanager.clappe.com}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?Set the bootstrap owner email}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Set a strong session signing secret}
+      ADMIN_ENCRYPTION_KEY: ${ADMIN_ENCRYPTION_KEY:?Set the persistent credential encryption key}
+      CONNECTORS_ALLOW_PRIVATE: ${CONNECTORS_ALLOW_PRIVATE:-0}
+    volumes:
+      - admin-data:/data
+    expose: ["3001"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: dokploy-network
+      traefik.http.routers.filemanager-admin.rule: Host(`${ADMIN_DOMAIN:-app.filemanager.clappe.com}`)
+      traefik.http.routers.filemanager-admin-http.rule: Host(`${ADMIN_DOMAIN:-app.filemanager.clappe.com}`)
+      traefik.http.routers.filemanager-admin-http.entrypoints: web
+      traefik.http.routers.filemanager-admin-http.middlewares: filemanager-admin-https
+      traefik.http.middlewares.filemanager-admin-https.redirectscheme.scheme: https
+      traefik.http.middlewares.filemanager-admin-https.redirectscheme.permanent: "true"
+      traefik.http.routers.filemanager-admin.entrypoints: websecure
+      traefik.http.routers.filemanager-admin.tls: "true"
+      traefik.http.routers.filemanager-admin.tls.certresolver: letsencrypt
+      traefik.http.services.filemanager-admin.loadbalancer.server.port: "3001"
+    networks: [dokploy-network]
+volumes:
+  admin-data:
+networks:
+  dokploy-network:
+    external: true

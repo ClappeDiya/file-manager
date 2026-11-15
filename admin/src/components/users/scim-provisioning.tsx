@@ -82,7 +82,7 @@ export function ScimProvisioning() {
               <TableHead>Token</TableHead>
               <TableHead>Default role</TableHead>
               <TableHead>Last used</TableHead>
-              <TableHead />
+              <TableHead><span className="sr-only">Actions</span></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>

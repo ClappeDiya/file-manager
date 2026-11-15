@@ -84,7 +84,7 @@ pub async fn search_files_query(
             .indexed_at
             .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map_or(true, |t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() > STALE_AFTER_SECS);
+            .is_none_or(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() > STALE_AFTER_SECS);
         if stale {
             manager.start(&c.path);
         }

@@ -35,7 +35,7 @@
  *   and the usage record as inputs and returns a new sorted list.
  *   Unit-testable without mocking React or Tauri.
  */
-import type { CommandItem } from "@/components/command-palette";
+import type { CommandItem } from '@/components/command-palette-helpers';
 
 /** Storage key for the MRU record. Namespaced so the `ufop-` prefix
  *  matches the project's other localStorage conventions. */

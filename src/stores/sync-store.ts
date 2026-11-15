@@ -1,3 +1,4 @@
+import { errorText } from "@/lib/error-text";
 /**
  * Sync Store (T-039..T-042)
  *
@@ -5,9 +6,9 @@
  * Provides reactive state for sync pairs, previews, reports,
  * conflicts, and quarantine.
  */
-import { create } from "zustand";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import type { RunNotify } from "@/lib/run-notify";
+import { create } from "zustand";
 
 // ── Types ──
 
@@ -224,8 +225,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
         }
       }
       set({ healthMap });
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to load sync pairs" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to load sync pairs") });
     } finally {
       set({ loading: false });
     }
@@ -249,8 +250,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
       });
       await get().loadPairs();
       return pair;
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to create sync pair" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to create sync pair") });
       throw e;
     } finally {
       set({ loading: false });
@@ -261,8 +262,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
     try {
       await tauriInvoke("delete_sync_pair", { pairId });
       await get().loadPairs();
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to delete sync pair" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to delete sync pair") });
       throw e;
     }
   },
@@ -272,8 +273,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
       const pair = await tauriInvoke<SyncPair>("update_sync_pair", { pairJson });
       await get().loadPairs();
       return pair;
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to update sync pair" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to update sync pair") });
       throw e;
     }
   },
@@ -285,8 +286,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
       set({ currentReports: [report, ...get().currentReports] });
       await get().loadPairs();
       return report;
-    } catch (e: any) {
-      set({ error: e?.message || "Sync failed" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Sync failed") });
       throw e;
     } finally {
       set({ syncRunning: false });
@@ -299,8 +300,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
       const preview = await tauriInvoke<SyncPreview>("sync_dry_run", { pairId });
       set({ currentPreview: preview });
       return preview;
-    } catch (e: any) {
-      set({ error: e?.message || "Dry run failed" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Dry run failed") });
       throw e;
     } finally {
       set({ loading: false });
@@ -310,8 +311,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
   exportPreviewCsv: async (pairId) => {
     try {
       return await tauriInvoke<string>("export_sync_preview_csv", { pairId });
-    } catch (e: any) {
-      set({ error: e?.message || "Export failed" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Export failed") });
       throw e;
     }
   },
@@ -320,8 +321,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
     try {
       const reports = await tauriInvoke<SyncReport[]>("get_sync_reports", { pairId });
       set({ currentReports: reports });
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to load reports" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to load reports") });
     }
   },
 
@@ -343,8 +344,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
       const restored = await tauriInvoke<number>("rollback_sync", { pairId });
       await get().loadPairs();
       return restored;
-    } catch (e: any) {
-      set({ error: e?.message || "Rollback failed" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Rollback failed") });
       throw e;
     } finally {
       set({ loading: false });
@@ -355,8 +356,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
     try {
       await tauriInvoke("resolve_sync_conflict", { conflictId, resolution });
       await get().loadConflicts();
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to resolve conflict" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to resolve conflict") });
       throw e;
     }
   },
@@ -365,8 +366,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
     try {
       const conflicts = await tauriInvoke<SyncConflictItem[]>("get_sync_conflicts");
       set({ pendingConflicts: conflicts });
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to load conflicts" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to load conflicts") });
     }
   },
 
@@ -376,16 +377,16 @@ export const useSyncStore = create<SyncState>((set, get) => ({
         pairId,
       });
       set({ quarantineEntries: entries });
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to load quarantine" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to load quarantine") });
     }
   },
 
   startWatcher: async (pairId) => {
     try {
       await tauriInvoke("start_sync_watcher", { pairId });
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to start watcher" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to start watcher") });
       throw e;
     }
   },
@@ -393,8 +394,8 @@ export const useSyncStore = create<SyncState>((set, get) => ({
   stopWatcher: async (pairId) => {
     try {
       await tauriInvoke("stop_sync_watcher", { pairId });
-    } catch (e: any) {
-      set({ error: e?.message || "Failed to stop watcher" });
+    } catch (e: unknown) {
+      set({ error: errorText(e, "Failed to stop watcher") });
       throw e;
     }
   },

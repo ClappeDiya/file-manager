@@ -1,3 +1,4 @@
+import { replicaResults } from './backup-run-history-helpers';
 /**
  * Run history (K122): every backup and maintenance run in a sortable,
  * paged table loaded from the backend one page at a time (view remembered
@@ -6,41 +7,22 @@
  * per-destination results and Open source / Open destination buttons open
  * below the table.
  */
-import { useEffect, useState } from "react";
-import type { ColumnDef } from "@tanstack/react-table";
-import { tauriInvoke } from "@/hooks/use-tauri";
 import { usePagedListing } from "@/hooks/use-paged-listing";
 import { useTableView } from "@/hooks/use-table-view";
-import { formatDate, inputCls, statusColor } from "@/lib/backup-helpers";
+import { tauriInvoke } from "@/hooks/use-tauri";
+import { formatDate,inputCls,statusColor } from "@/lib/backup-helpers";
 import { runDuration } from "@/lib/backup-time";
-import { useBackupStore, type BackupRun, type SavedDestination } from "@/stores/backup-store";
+import { ALL_TIME,rangeArgs,type HistoryRange } from "@/lib/history-range";
+import { canOpen,destinationTarget,localTarget,openTarget,type OpenTarget } from "@/lib/open-location";
+import { triggerLabel } from "@/lib/run-trigger";
+import { useBackupStore,type BackupRun,type SavedDestination } from "@/stores/backup-store";
+import type { ColumnDef } from "@tanstack/react-table";
+import { useEffect,useState } from "react";
 import { DataGrid } from "../data-grid";
 import { HistoryRangeChips } from "../history-range-chips";
-import { ALL_TIME, rangeArgs, type HistoryRange } from "@/lib/history-range";
-import { triggerLabel } from "@/lib/run-trigger";
-import { canOpen, destinationTarget, localTarget, openTarget, type OpenTarget } from "@/lib/open-location";
-import { Banner, Btn } from "./backup-ui";
+import { Banner,Btn } from "./backup-ui";
 
 const PREFS = "backup-runs";
-
-/** One destination's result in a run (a replication report's `replica_runs`). */
-interface ReplicaResult {
-  id: string;
-  name: string;
-  status: string;
-  started_at: string;
-  finished_at: string | null;
-  files: number;
-  bytes: number;
-  error: string | null;
-}
-
-/** The per-destination results a run's report carries: a replication's own, or those of the replications a backup ran after itself. */
-export function replicaResults(report: Record<string, unknown>): ReplicaResult[] {
-  const own = Array.isArray(report.replica_runs) ? (report.replica_runs as ReplicaResult[]) : [];
-  const after = Array.isArray(report.replication) ? (report.replication as Record<string, unknown>[]).flatMap((r) => (Array.isArray(r.replica_runs) ? (r.replica_runs as ReplicaResult[]) : [])) : [];
-  return [...own, ...after];
-}
 
 export function BackupRunHistory() {
   const jobs = useBackupStore((s) => s.jobs);

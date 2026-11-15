@@ -24,10 +24,10 @@ export function StatCard({
 }: StatCardProps) {
   const iconVariants = {
     default: 'bg-background-tertiary text-foreground-secondary',
-    success: 'bg-success-bg text-success',
-    warning: 'bg-warning-bg text-warning',
-    error: 'bg-error-bg text-error',
-    info: 'bg-info-bg text-info',
+    success: 'bg-success-bg text-success-foreground',
+    warning: 'bg-warning-bg text-warning-foreground',
+    error: 'bg-error-bg text-error-foreground',
+    info: 'bg-info-bg text-info-foreground',
   };
 
   return (
@@ -48,7 +48,7 @@ export function StatCard({
             <p
               className={cn(
                 'text-xs font-medium mt-2',
-                trend.value >= 0 ? 'text-success' : 'text-error'
+                trend.value >= 0 ? 'text-success-foreground' : 'text-error-foreground'
               )}
             >
               {trend.value >= 0 ? '+' : ''}{trend.value}% {trend.label}

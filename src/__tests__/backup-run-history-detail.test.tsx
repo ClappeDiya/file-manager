@@ -1,15 +1,16 @@
 /** WS-I row 73: backup run history shows what started a run, filters by date, shows per-destination results and opens the folders. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor,within } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { BackupRunHistory, replicaResults } from "@/components/backup/backup-run-history";
 import { ReplicaHistory } from "@/components/backup/backup-replicas";
+import { BackupRunHistory } from '@/components/backup/backup-run-history';
+import { replicaResults } from '@/components/backup/backup-run-history-helpers';
+import { destinationTarget } from "@/lib/open-location";
 import { useBackupStore } from "@/stores/backup-store";
 import { useConnectionBrowse } from "@/stores/connection-browse-store";
-import { destinationTarget } from "@/lib/open-location";
 
 const replicaRuns = [
   { id: "usb", name: "USB", status: "success", started_at: "2026-10-01T10:00:00Z", finished_at: "2026-10-01T10:00:30Z", files: 4, bytes: 1094, error: null },

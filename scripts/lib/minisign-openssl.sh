@@ -17,7 +17,7 @@ ms_keygen() {
   openssl pkey -in "$d/sk.pem" -pubout -outform DER 2>/dev/null | tail -c 32 > "$d/pk.raw"
   head -c 8 /dev/urandom > "$d/keyid"
   { printf 'Ed'; cat "$d/keyid" "$d/pk.raw"; } > "$d/pk.bin"
-  printf 'untrusted comment: minisign public key %s\n%s\n' "$(od -An -tx1 "$d/keyid" | tr -d ' \n' | tr 'a-f' 'A-F')" "$(base64 -w0 < "$d/pk.bin")" > "$d/minisign.pub"
+  printf 'untrusted comment: minisign public key %s\n%s\n' "$(od -An -tx1 "$d/keyid" | tr -d ' \n' | tr 'a-f' 'A-F')" "$(base64 < "$d/pk.bin" | tr -d '\r\n')" > "$d/minisign.pub"
 }
 
 ms_sign() {
@@ -29,9 +29,9 @@ ms_sign() {
   openssl pkeyutl -sign -inkey "$d/sk.pem" -rawin -in "$t/g.msg" -out "$t/g.sig" 2>/dev/null
   {
     printf 'untrusted comment: signature from minisign-openssl\n'
-    { printf 'ED'; cat "$d/keyid" "$t/sig"; } | base64 -w0
+    { printf 'ED'; cat "$d/keyid" "$t/sig"; } | base64 | tr -d '\r\n'
     printf '\ntrusted comment: %s\n' "$comment"
-    base64 -w0 < "$t/g.sig"
+    base64 < "$t/g.sig" | tr -d '\r\n'
     printf '\n'
   } > "$f.minisig"
   rm -rf "$t"

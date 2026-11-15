@@ -86,7 +86,7 @@ The new content is stored, and the previous versions keep the old content. The r
 
 **Back up a command's output** (Advanced, in the job's Sources step; job field `stdin_command`) runs a command at every backup. What the command prints is stored as one file in the version, for example a database dump (`pg_dump mydb`). Fields:
 
-| Field | |
+| Field | Description |
 |---|---|
 | `command` | Command line, split like the hook scripts'. No shell is involved unless you run one (`sh -c '…'`). |
 | `path` | File name in the version. `mydb.sql` is stored as `/stdin/mydb.sql`. An absolute path such as `/dumps/mydb.sql` is used as it is. Empty means `/stdin/command-output`. |
@@ -132,7 +132,7 @@ The snapshot policy (`off`, `auto`, `on`, `required`) works as before. *Auto* fa
 - **estimated time**: new data divided by the throughput of recent successful backups (bytes uploaded ÷ duration). Without history, an assumed speed of 20 MiB/s is used; this can be changed with `assumed_bytes_per_sec`, and 0 means no time estimate.
 - the 10 largest new or changed files
 
-| Where | |
+| Where | Usage |
 |---|---|
 | App | **Estimate** on the job card |
 | IPC | `backup_estimate { jobId, assumedBytesPerSec? }` |
@@ -145,7 +145,7 @@ The output of a backup command is not included in the estimate; a warning says s
 
 **Back up all now** (Standard mode, above the job list, and in the tray menu) queues a backup of every job. Read-only jobs and jobs that are already queued or running are skipped, and the result names them with the reason. The backups go through the normal queue, so at most *Operations at the same time* (Defaults & destinations) run at once. One job never runs twice at once.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | App | **Back up all now** above the job list, and the tray menu *Back up all now* |
 | IPC | `backup_run_all { filter?: { job_ids, scheduled_only, dry_run } }`, which returns `{ started: [{job_id, job_name, task_id}], skipped: [{job_id, job_name, reason}] }` |

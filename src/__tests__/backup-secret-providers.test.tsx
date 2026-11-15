@@ -3,13 +3,14 @@
  * `type` tag), credentials go only to the secure store, tests and the job
  * placeholder check call the right commands.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { JobSecretProviders, SecretProvidersEditor, newProvider } from "@/components/backup/backup-secret-providers";
+import { JobSecretProviders,SecretProvidersEditor } from '@/components/backup/backup-secret-providers';
+import { newProvider } from '@/components/backup/backup-secret-providers-helpers';
 import type { SecretSettings } from "@/stores/backup-store";
 
 let stored: SecretSettings;

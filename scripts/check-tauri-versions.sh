@@ -229,6 +229,8 @@ done
 
 if [[ "$failed" -eq 0 ]]; then
   echo "OK: $n Tauri dep(s), all on major version $canonical"
-  exit 0
+  node --test scripts/test-tauri-version-matrix.mjs || exit 1
+  node scripts/check-tauri-resolved-versions.mjs
+  exit $?
 fi
 exit 1

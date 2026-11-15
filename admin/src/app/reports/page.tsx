@@ -177,7 +177,7 @@ export default function ReportsPage() {
                     {r.delivery
                       .filter((d) => !d.ok)
                       .map((d) => (
-                        <span key={d.channelId} className="block text-xs text-error">
+                        <span key={d.channelId} className="block text-xs text-error-foreground">
                           {d.channelId}: {d.error}
                         </span>
                       ))}

@@ -1,6 +1,6 @@
 /** Grid thumbnails: LRU, request sharing, cell rendering, fallbacks. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -8,8 +8,9 @@ vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (p: string) => `asset://localhost${p}`,
 }));
 
-import { GridIcon, type FileEntryData } from "@/components/file-list";
-import { LruMap, clearThumbnailMemory, hasThumbnail, loadThumbnail } from "@/lib/thumbnails";
+import { GridIcon } from '@/components/file-list';
+import { type FileEntryData } from '@/components/file-list-helpers';
+import { LruMap,clearThumbnailMemory,hasThumbnail,loadThumbnail } from "@/lib/thumbnails";
 
 const entry = (name: string, is_dir = false): FileEntryData => ({
   name, path: `/pics/${name}`, is_dir, is_symlink: false, size: 10, modified: "2026-01-01T00:00:00Z", created: null, is_hidden: false, extension: null, permissions: null,

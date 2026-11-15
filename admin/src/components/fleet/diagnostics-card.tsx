@@ -66,7 +66,7 @@ export function DiagnosticsCard({ machineId, canRequest, canDelete, heartbeatSec
               <TableHead>Uploaded</TableHead>
               <TableHead>Client</TableHead>
               <TableHead>Size</TableHead>
-              <TableHead />
+              <TableHead><span className="sr-only">Actions</span></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -82,7 +82,7 @@ export function DiagnosticsCard({ machineId, canRequest, canDelete, heartbeatSec
                 </TableCell>
                 <TableCell className="text-xs">{formatBytes(d.size)}</TableCell>
                 <TableCell className="whitespace-nowrap text-right">
-                  <a href={`${base}?download=${encodeURIComponent(d.id)}`} download={d.fileName} className="inline-flex items-center gap-1 px-2 text-sm text-primary hover:underline">
+                  <a href={`${base}?download=${encodeURIComponent(d.id)}`} download={d.fileName} className="inline-flex items-center gap-1 px-2 text-sm text-link hover:underline">
                     <Download size={14} aria-hidden="true" /> Download
                   </a>
                   {canDelete && (

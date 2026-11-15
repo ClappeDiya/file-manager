@@ -1,9 +1,8 @@
-import { useCallback, useRef, useEffect, useState } from "react";
-import { cn } from "@ufop/ui-components";
-import { Button, Badge } from "@ufop/ui-components";
-import { Search, X, Filter, Save, ChevronDown, Wind, Archive } from "lucide-react";
-import { useFileManagerStore, type SavedSearch } from "@/stores/file-manager-store";
+import { useFileManagerStore,type SavedSearch } from "@/stores/file-manager-store";
 import type { SearchScope } from "@/stores/search-store";
+import { Badge,Button,cn } from "@ufop/ui-components";
+import { Archive,ChevronDown,Filter,Save,Search,Wind,X } from "lucide-react";
+import { useCallback,useEffect,useRef,useState } from "react";
 
 // ──────────────────────────────────────────────
 // FilterBar - real-time filter-as-you-type
@@ -451,30 +450,4 @@ export function SearchPanel({
       )}
     </div>
   );
-}
-
-// ──────────────────────────────────────────────
-// useFileFilter - hook for filtering file lists
-// ──────────────────────────────────────────────
-
-/**
- * Filter a file list by text query. Runs in <100ms for typical file lists.
- */
-export function filterFiles<T extends { name: string; path: string; extension: string | null }>(
-  files: T[],
-  filterText: string,
-): T[] {
-  if (!filterText.trim()) return files;
-
-  const query = filterText.toLowerCase().trim();
-  const terms = query.split(/\s+/);
-
-  return files.filter((file) => {
-    const name = file.name.toLowerCase();
-    const ext = (file.extension || "").toLowerCase();
-
-    return terms.every(
-      (term) => name.includes(term) || ext.includes(term),
-    );
-  });
 }

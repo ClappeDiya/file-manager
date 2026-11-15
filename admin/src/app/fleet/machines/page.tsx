@@ -136,7 +136,7 @@ export default function MachinesPage() {
               {data.machines.map((m) => (
                 <TableRow key={m.id}>
                   <TableCell>
-                    <Link href={`/fleet/machines/${m.id}`} className="font-medium text-primary">
+                    <Link href={`/fleet/machines/${m.id}`} className="font-medium text-link">
                       {m.name}
                     </Link>
                     <p className="text-xs text-foreground-tertiary">
@@ -149,8 +149,8 @@ export default function MachinesPage() {
                   </TableCell>
                   <TableCell>
                     {m.backups}
-                    {m.failing > 0 && <span className="ml-2 text-xs text-error">{m.failing} failing</span>}
-                    {m.openAlerts > 0 && <span className="ml-2 text-xs text-warning">{m.openAlerts} alert(s)</span>}
+                    {m.failing > 0 && <span className="ml-2 text-xs text-error-foreground">{m.failing} failing</span>}
+                    {m.openAlerts > 0 && <span className="ml-2 text-xs text-warning-foreground">{m.openAlerts} alert(s)</span>}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell">{formatBytes(m.backendSize)}</TableCell>
                   <TableCell className="hidden lg:table-cell">

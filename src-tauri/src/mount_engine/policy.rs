@@ -454,13 +454,13 @@ pub fn effective_on(requested: &MountOptions, protocol: &str, mount_point: &Path
         }
     }
     if let Some(max) = p.max_cache_mb {
-        if o.max_cache_mb.map_or(true, |m| m > max) {
+        if o.max_cache_mb.is_none_or(|m| m > max) {
             o.max_cache_mb = Some(max);
             notes.push(format!("cache up to {max} MB (organization policy)"));
         }
     }
     if let Some(max) = p.max_cache_age_hours {
-        if o.max_cache_age_hours.map_or(true, |h| h > max) {
+        if o.max_cache_age_hours.is_none_or(|h| h > max) {
             o.max_cache_age_hours = Some(max);
             notes.push(format!("cached files kept up to {max} h (organization policy)"));
         }

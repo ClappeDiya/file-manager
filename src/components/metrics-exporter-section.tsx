@@ -1,3 +1,4 @@
+import { portProblem } from './metrics-exporter-section-helpers';
 /**
  * Prometheus metrics (Settings → Advanced, K108 extra): the desktop app can
  * serve `/metrics` on 127.0.0.1 for a local Prometheus or agent to scrape.
@@ -5,9 +6,9 @@
  * Mirrors Rust `backup_engine::metrics_exporter::{MetricsStatus,
  * MetricsSettingsUpdate}` (`desktop_metrics_status`, `desktop_metrics_configure`).
  */
-import { useEffect, useState } from "react";
+import { isTauriAvailable,tauriInvoke } from "@/hooks/use-tauri";
 import { errorText } from "@/lib/error-text";
-import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
+import { useEffect,useState } from "react";
 
 export interface MetricsStatus {
   enabled: boolean;
@@ -26,13 +27,6 @@ export interface MetricsSettingsUpdate {
 }
 
 export const DEFAULT_METRICS_PORT = 9464;
-
-/** Port validation shared with the backend (1024–65535). */
-export function portProblem(raw: string): string | null {
-  const n = Number(raw);
-  if (!/^\d+$/.test(raw.trim()) || n < 1024 || n > 65535) return "Use a port from 1024 to 65535.";
-  return null;
-}
 
 const field = "w-full rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-2 py-1 text-sm";
 

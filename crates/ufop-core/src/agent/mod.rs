@@ -16,6 +16,8 @@ pub mod mock;
 pub mod policy;
 pub mod protocol;
 pub mod runner;
+pub mod workspaces;
+pub use workspaces::*;
 
 pub use limits::{AgentLimits, SymlinkPolicy};
 pub use managed::*;

@@ -7,7 +7,7 @@
 import React, { Suspense, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { PasswordStrength } from '@/components/auth/password-strength';
@@ -73,15 +73,15 @@ function ResetForm() {
 
   const ok = checkPassword(password, { email: info?.email }).ok && password === confirm;
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background-secondary p-4">
+    <main className="flex min-h-screen items-center justify-center bg-background-secondary p-4">
       <Card className="w-full max-w-sm">
         <CardHeader className="flex-col items-start gap-1">
-          <CardTitle>{token ? (info?.purpose === 'expired' ? 'Your password has expired' : 'Choose a new password') : 'Reset your password'}</CardTitle>
+          <h1 className="text-lg font-semibold text-foreground">{token ? (info?.purpose === 'expired' ? 'Your password has expired' : 'Choose a new password') : 'Reset your password'}</h1>
           <CardDescription>{token ? info?.email ?? '' : 'We e-mail you a link that is valid for one hour.'}</CardDescription>
         </CardHeader>
         <CardContent>
           {error && (
-            <p role="alert" className="mb-3 text-sm text-error">
+            <p role="alert" className="mb-3 text-sm text-error-foreground">
               {error}
             </p>
           )}
@@ -106,12 +106,12 @@ function ResetForm() {
               </Button>
             </form>
           ) : null}
-          <Link href="/login" className="mt-3 block text-center text-xs text-primary hover:underline">
+          <Link href="/login" className="mt-3 block text-center text-xs text-link hover:underline">
             Back to sign in
           </Link>
         </CardContent>
       </Card>
-    </div>
+    </main>
   );
 }
 

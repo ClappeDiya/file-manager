@@ -6,7 +6,6 @@
 import {
   type PolicyRule,
   type PolicyDomain,
-  type PolicyAssignmentTarget,
   POLICY_PRECEDENCE,
 } from '../types/policies';
 

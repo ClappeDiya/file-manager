@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React from "react";
+import { useFocusTrap } from "@ufop/ui-components";
 import { cn } from "@/lib/utils/cn";
 
 interface DialogProps {
@@ -12,53 +13,9 @@ interface DialogProps {
 
 const DialogTitleId = React.createContext<string | undefined>(undefined);
 
-const FOCUSABLE_SELECTOR =
-  'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
-
 export function Dialog({ open, onClose, children, className }: DialogProps) {
   const titleId = React.useId();
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  const closeRef = useRef(onClose);
-  closeRef.current = onClose;
-
-  useEffect(() => {
-    if (!open) return;
-    // Remember whoever opened the dialog so we can return focus on close.
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-    const panel = panelRef.current;
-    const focusables = panel?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-    focusables?.[0]?.focus();
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeRef.current();
-        return;
-      }
-      if (event.key !== "Tab" || !panel) return;
-      const items = panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-      if (items.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = items[0];
-      const last = items[items.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (event.shiftKey && active === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && active === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      previouslyFocused?.focus?.();
-    };
-  }, [open]);
+  const panelRef = useFocusTrap<HTMLDivElement>({ active: open, onEscape: onClose });
 
   if (!open) return null;
 
@@ -127,7 +84,7 @@ export function DialogFooter({
 }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn("flex items-center justify-end gap-2 mt-6", className)}
+      className={cn("sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 mt-6 border-t border-border bg-background-elevated pt-3", className)}
       {...props}
     />
   );

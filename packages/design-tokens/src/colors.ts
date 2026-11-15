@@ -15,6 +15,8 @@ export const lightColors = {
   primary: "#2563eb",
   primaryHover: "#1d4ed8",
   primaryActive: "#1e40af",
+  link: "#1d4ed8",
+  linkHover: "#1e40af",
   primaryForeground: "#ffffff",
 
   // Accent
@@ -52,6 +54,9 @@ export const lightColors = {
   error: "#dc2626",
   errorBg: "#fef2f2",
   errorForeground: "#b91c1c",
+  destructive: "#b91c1c",
+  destructiveHover: "#991b1b",
+  destructiveForeground: "#ffffff",
   info: "#2563eb",
   infoBg: "#eff6ff",
   infoForeground: "#1d4ed8",
@@ -76,6 +81,8 @@ export const darkColors = {
   primary: "#3b82f6",
   primaryHover: "#60a5fa",
   primaryActive: "#93c5fd",
+  link: "#60a5fa",
+  linkHover: "#93c5fd",
   primaryForeground: "#0f172a",
 
   // Accent
@@ -113,6 +120,9 @@ export const darkColors = {
   error: "#ef4444",
   errorBg: "#450a0a",
   errorForeground: "#f87171",
+  destructive: "#b91c1c",
+  destructiveHover: "#991b1b",
+  destructiveForeground: "#ffffff",
   info: "#3b82f6",
   infoBg: "#172554",
   infoForeground: "#60a5fa",
@@ -137,6 +147,8 @@ export const highContrastColors = {
   primary: "#1d4ed8",
   primaryHover: "#1e40af",
   primaryActive: "#1e3a8a",
+  link: "#1e40af",
+  linkHover: "#1e3a8a",
   primaryForeground: "#ffffff",
 
   // Accent
@@ -174,6 +186,9 @@ export const highContrastColors = {
   error: "#b91c1c",
   errorBg: "#fee2e2",
   errorForeground: "#991b1b",
+  destructive: "#991b1b",
+  destructiveHover: "#7f1d1d",
+  destructiveForeground: "#ffffff",
   info: "#1d4ed8",
   infoBg: "#dbeafe",
   infoForeground: "#1e40af",

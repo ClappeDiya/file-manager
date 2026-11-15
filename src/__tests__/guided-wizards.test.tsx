@@ -4,8 +4,8 @@
  * interrupted-transfer queue, compat renames, reports, peers, drives and
  * backups.
  */
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, act } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeAll,beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
@@ -20,21 +20,21 @@ vi.mock("@tauri-apps/api/path", () => ({
 const pickFolderMock = vi.fn(async () => "/home/me/Picked");
 vi.mock("@/lib/folder-picker", () => ({ pickFolder: (...a: unknown[]) => pickFolderMock(...(a as [])) }));
 
-import { ConnectLocalSyncWizard, ConnectSFTPWizard, ConnectSMBWizard } from "@/components/guided-flows/connection-flows";
-import { CreateSyncWizard, HandleCompatWarningWizard, ResolveInterruptionWizard, StartTransferWizard } from "@/components/guided-flows/operation-flows";
+import { getDefaultCommands } from '@/components/command-palette-helpers';
+import { ConnectLocalSyncWizard,ConnectSFTPWizard,ConnectSMBWizard } from "@/components/guided-flows/connection-flows";
+import { CreateSyncWizard,HandleCompatWarningWizard,ResolveInterruptionWizard,StartTransferWizard } from "@/components/guided-flows/operation-flows";
 import {
-  BackupFolderWizard,
-  CopyToExternalWizard,
-  ExportReportWizard,
-  MigrateComputersWizard,
-  OldToNewDriveWizard,
-  RestoreNamesWizard,
-  TransferToComputerWizard,
+BackupFolderWizard,
+CopyToExternalWizard,
+ExportReportWizard,
+MigrateComputersWizard,
+OldToNewDriveWizard,
+RestoreNamesWizard,
+TransferToComputerWizard,
 } from "@/components/guided-flows/utility-flows";
-import { getDefaultCommands } from "@/components/command-palette";
 import { syncTrigger } from "@/lib/guided-actions";
-import { useTransferWorkspace } from "@/stores/transfer-workspace-store";
 import { useFileManagerStore } from "@/stores/file-manager-store";
+import { useTransferWorkspace } from "@/stores/transfer-workspace-store";
 import { useUIStore } from "@/stores/ui-store";
 
 type Handler = (a: Record<string, unknown>) => unknown;

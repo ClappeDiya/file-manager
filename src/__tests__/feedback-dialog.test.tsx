@@ -1,12 +1,12 @@
 /** WS-I row 100: Help > Send feedback. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { FeedbackDialog, FeedbackForm, MAX_FEEDBACK_CHARS, type FeedbackDestination, type FeedbackOutcome } from "@/components/feedback-dialog";
-import { getDefaultCommands } from "@/components/command-palette";
+import { getDefaultCommands } from '@/components/command-palette-helpers';
+import { FeedbackDialog,FeedbackForm,MAX_FEEDBACK_CHARS,type FeedbackDestination,type FeedbackOutcome } from "@/components/feedback-dialog";
 import { useFeedbackDialog } from "@/stores/feedback-store";
 
 let destination: FeedbackDestination;

@@ -3,15 +3,16 @@
  * match the serde types (flattened `type` tag, snake_case TLS modes,
  * secrets only through the secure store).
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
-import { LogOutputsEditor, NotificationsEditor, ReportExtras, newNotification } from "@/components/backup/backup-notifications";
+import { LogOutputsEditor,NotificationsEditor,ReportExtras } from '@/components/backup/backup-notifications';
+import { newNotification } from '@/components/backup/backup-notifications-helpers';
 import { BackupSupportTools } from "@/components/backup/backup-support-tools";
-import { newBackupJob, type BackupNotification, type Diagnostics, type LogOutputs } from "@/stores/backup-store";
+import { newBackupJob,type BackupNotification,type Diagnostics,type LogOutputs } from "@/stores/backup-store";
 
 beforeEach(() => {
   mockInvoke.mockReset();

@@ -753,6 +753,19 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 36,
+    description: 'Scoped connector provisioning and acknowledged desktop workspace delivery',
+    up(d) {
+      d.exec(`
+        CREATE TABLE managed_connectors (id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, name TEXT NOT NULL, definition TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL);
+        CREATE INDEX idx_managed_connectors_org ON managed_connectors(org_id);
+        CREATE TABLE delivered_workspaces (id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, name TEXT NOT NULL, definition TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL);
+        CREATE INDEX idx_delivered_workspaces_org ON delivered_workspaces(org_id);
+        CREATE TABLE workspace_receipts (machine_id TEXT PRIMARY KEY REFERENCES machines(id) ON DELETE CASCADE, errors TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA = MIGRATIONS[MIGRATIONS.length - 1].version;

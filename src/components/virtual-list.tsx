@@ -1,8 +1,8 @@
-import { useRef, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { formatBytes } from "@/lib/format-bytes";
-import { observeElementRect, useVirtualizer } from "@tanstack/react-virtual";
+import { observeElementRect,useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@ufop/ui-components";
-import type { FileEntry } from "./data-grid";
+import { useCallback,useEffect,useMemo,useRef,useState,type ReactNode } from "react";
+import type { FileEntry } from './data-grid-helpers';
 
 interface VirtualListProps {
   items: FileEntry[];

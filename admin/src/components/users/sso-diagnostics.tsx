@@ -41,9 +41,9 @@ export function SsoDiagnostics({ provider, onClose }: { provider: { id: string; 
           <li key={a.id} className="rounded-md border border-border p-2">
             <button className="flex w-full items-center justify-between gap-2 text-left" onClick={() => setOpen(open === a.id ? null : a.id)}>
               <span>
-                <span className={a.ok ? 'text-success' : 'text-error'}>{a.ok ? '✓' : '✗'}</span> {a.email || 'unknown user'}
+                <span className={a.ok ? 'text-success-foreground' : 'text-error-foreground'}>{a.ok ? '✓' : '✗'}</span> {a.email || 'unknown user'}
                 {!a.ok && (
-                  <span className="text-error">
+                  <span className="text-error-foreground">
                     {' '}
                     — {STEP_LABELS[a.stage] ?? a.stage}: {a.error}
                   </span>
@@ -57,7 +57,7 @@ export function SsoDiagnostics({ provider, onClose }: { provider: { id: string; 
               <ol className="mt-2 space-y-1 border-t border-border pt-2">
                 {a.steps.map((s, i) => (
                   <li key={i}>
-                    <span className={s.ok ? 'text-success' : 'text-error'}>{s.ok ? '✓' : '✗'}</span> {STEP_LABELS[s.step] ?? s.step}
+                    <span className={s.ok ? 'text-success-foreground' : 'text-error-foreground'}>{s.ok ? '✓' : '✗'}</span> {STEP_LABELS[s.step] ?? s.step}
                     {s.detail && <pre className="mt-1 overflow-x-auto rounded bg-background-secondary p-2 font-mono text-xs">{JSON.stringify(s.detail, null, 2)}</pre>}
                   </li>
                 ))}

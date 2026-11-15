@@ -291,7 +291,7 @@ export default function NetworkWizard({
 
     setCurrentStep(allResults.length);
     setRunning(false);
-  }, [host, effectivePort, protocol, useConnection, connectionId]);
+  }, [host, effectivePort, useConnection, connectionId]);
 
   // Copy results
   const handleCopy = async () => {

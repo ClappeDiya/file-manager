@@ -105,23 +105,25 @@ pub async fn enforce_at_startup(repo: &Repository) {
     }
 }
 
-/// Save every job that fails the moment it fails, so it is still there (and
-/// retryable) after a crash or a force-quit, not only after a clean exit.
-pub fn persist_failures(manager: &crate::transfer_engine::TransferManager, repo: Repository) {
-    manager.add_terminal_hook(std::sync::Arc::new(move |job| {
-        if job.status != crate::core::types::TransferStatus::Failed {
-            return;
+/// Persist terminal transitions in order. Resolve the current job at write time,
+/// so a delayed failure event cannot overwrite a later successful retry.
+pub fn persist_terminal_states(manager: &crate::transfer_engine::TransferManager, repo: Repository) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    manager.add_terminal_hook(std::sync::Arc::new(move |job| { let _ = sender.send(job.id); }));
+    let jobs = std::sync::Arc::downgrade(&manager.jobs);
+    // Startup uses a temporary runtime; this worker must live with the app.
+    tauri::async_runtime::spawn(async move {
+        while let Some(id) = receiver.recv().await {
+            let Some(jobs) = jobs.upgrade() else { break; };
+            let Some(job) = jobs.read().await.get(&id).cloned() else { continue; };
+            if job.external || crate::compare_engine::apply::is_staging(&job.dest_path) { continue; }
+            if !matches!(job.status, crate::core::types::TransferStatus::Completed | crate::core::types::TransferStatus::Failed | crate::core::types::TransferStatus::Cancelled) { continue; }
+            use crate::core::traits::StorageOperations;
+            if let Err(e) = StorageOperations::save_transfer_queue(&repo, std::slice::from_ref(&job)).await {
+                tracing::warn!("Could not save the final transfer {}: {e}", job.id);
+            }
         }
-        let (repo, job) = (repo.clone(), job.clone());
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                use crate::core::traits::StorageOperations;
-                if let Err(e) = StorageOperations::save_transfer_queue(&repo, std::slice::from_ref(&job)).await {
-                    tracing::warn!("Could not save the failed transfer {}: {e}", job.id);
-                }
-            });
-        }
-    }));
+    });
 }
 
 #[cfg(test)]
@@ -203,12 +205,48 @@ mod tests {
         assert_eq!(stored(&repo).await, ["/src/paused"]);
     }
 
+    #[test]
+    fn terminal_persistence_outlives_the_bootstrap_runtime() {
+        use crate::core::traits::TransferOperations;
+        let bootstrap = tokio::runtime::Runtime::new().unwrap();
+        let (repo, manager, id) = bootstrap.block_on(async {
+            let repo = Repository::open_in_memory().await.unwrap();
+            let manager = crate::transfer_engine::TransferManager::new();
+            persist_terminal_states(&manager, repo.clone());
+            let id = manager.enqueue("/src/bootstrap", "/dst/bootstrap", 12).await.unwrap().id;
+            (repo, manager, id)
+        });
+        drop(bootstrap);
+        let app = tokio::runtime::Runtime::new().unwrap();
+        app.block_on(async {
+            manager.fail_job(id, "retryable failure").await.unwrap();
+            for _ in 0..100 {
+                let saved = StorageOperations::load_transfer_queue(&repo).await.unwrap();
+                if saved.first().is_some_and(|job| job.status == TransferStatus::Failed) { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(StorageOperations::load_transfer_queue(&repo).await.unwrap()[0].status, TransferStatus::Failed);
+            assert_eq!(manager.retry_all_failed().await.unwrap(), vec![id]);
+            manager.complete_job(id).await.unwrap();
+            let mut saved_status = String::new();
+            for _ in 0..100 {
+                saved_status = repo.pool().execute(move |connection| {
+                    connection.query_row("SELECT status FROM transfer_history WHERE id = ?1", [id.to_string()], |row| row.get::<_, String>(0)).map_err(Into::into)
+                }).await.unwrap();
+                if saved_status == "completed" { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(saved_status, "completed");
+            assert!(StorageOperations::load_transfer_queue(&repo).await.unwrap().is_empty(), "a completed retry must not be restored as failed");
+        });
+    }
+
     #[tokio::test]
     async fn a_job_is_saved_the_moment_it_fails() {
         use crate::core::traits::TransferOperations;
         let repo = Repository::open_in_memory().await.unwrap();
         let mgr = crate::transfer_engine::TransferManager::new();
-        persist_failures(&mgr, repo.clone());
+        persist_terminal_states(&mgr, repo.clone());
         let job = mgr.enqueue("/src/a.bin", "/dst/a.bin", 10).await.unwrap();
         assert!(StorageOperations::load_transfer_queue(&repo).await.unwrap().is_empty(), "queued jobs are saved on exit, as before");
 

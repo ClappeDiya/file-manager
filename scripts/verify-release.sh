@@ -137,7 +137,7 @@ if command -v minisign >/dev/null 2>&1; then
 elif command -v ufop >/dev/null 2>&1 && ufop verify-release --help >/dev/null 2>&1; then
   ufop verify-release "$SUMS" "$TMP/sums.minisig" --pubkey "$PK_LINE" --signature-only >/dev/null || { echo "FAIL: bad minisign signature" >&2; exit 1; }
   say "  OK (ufop verify-release)"
-elif command -v openssl >/dev/null 2>&1 && openssl list -digest-algorithms 2>/dev/null | grep -qi blake2b512; then
+elif command -v openssl >/dev/null 2>&1 && openssl list -digest-algorithms 2>/dev/null | grep -i blake2b512 >/dev/null; then
   verify_with_openssl || { echo "FAIL: bad minisign signature" >&2; exit 1; }
   say "  OK (openssl)"
 else

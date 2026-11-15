@@ -43,15 +43,18 @@ pub struct BackupHost {
     creds: Arc<CredentialStore>,
     agent_kind: &'static str,
     managed_handler: std::sync::Mutex<Option<ManagedSettingsHandler>>,
+    workspace_handler: std::sync::Mutex<Option<WorkspaceHandler>>,
 }
 
 /// Applies the console's app settings on this kind of client (the desktop
 /// app sets one; the server and CLI have no proxy or AI settings to manage).
+pub type WorkspaceHandler = Arc<dyn Fn(Vec<ufop_core::agent::WorkspaceDelivery>) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync>;
+
 pub type ManagedSettingsHandler = Arc<dyn Fn(Option<ManagedSettings>) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync>;
 
 impl BackupHost {
     pub fn new(mgr: BackupManager, settings: SettingsStore, creds: Arc<CredentialStore>, agent_kind: &'static str) -> Self {
-        Self { mgr, settings, creds, agent_kind, managed_handler: std::sync::Mutex::new(None) }
+        Self { mgr, settings, creds, agent_kind, managed_handler: std::sync::Mutex::new(None), workspace_handler: std::sync::Mutex::new(None) }
     }
 
     /// The owner's limits on what the console may do here (local only).
@@ -71,12 +74,16 @@ impl BackupHost {
         self.settings.set(LIMITS_KEY, &serde_json::to_string(limits)?).await
     }
 
+    pub fn set_workspace_handler(&self, h: WorkspaceHandler) {
+        *self.workspace_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+
     pub fn set_managed_settings_handler(&self, h: ManagedSettingsHandler) {
         *self.managed_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 
-    fn keychain(&self) -> bool {
-        self.creds.is_keychain_available()
+    fn uses_credential_store(&self) -> bool {
+        self.creds.is_persistent() || !self.settings.is_encrypted()
     }
 
     async fn job_for_policy(&self, p: &FleetPolicy) -> Result<(BackupJob, Option<String>), AppError> {
@@ -245,7 +252,19 @@ impl AgentHost for BackupHost {
                 }),
                 None => AgentConfig::default(),
             };
-            let token = if self.keychain() { self.creds.retrieve(TOKEN_KEY).await? } else { self.settings.get_secret(TOKEN_KEY).await? };
+            let token = if self.uses_credential_store() {
+                match self.creds.retrieve(TOKEN_KEY).await? {
+                    Some(token) => Some(token),
+                    None => {
+                        let legacy = self.settings.get_secret(TOKEN_KEY).await?;
+                        if let Some(token) = &legacy {
+                            self.creds.store(TOKEN_KEY, token).await?;
+                            self.settings.delete(TOKEN_KEY).await?;
+                        }
+                        legacy
+                    }
+                }
+            } else { self.settings.get_secret(TOKEN_KEY).await? };
             Ok((cfg, token))
         })
     }
@@ -256,8 +275,11 @@ impl AgentHost for BackupHost {
 
     fn save_token(&self, token: Option<String>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            match (token, self.keychain()) {
-                (Some(t), true) => self.creds.store(TOKEN_KEY, &t).await,
+            match (token, self.uses_credential_store()) {
+                (Some(t), true) => {
+                    self.creds.store(TOKEN_KEY, &t).await?;
+                    self.settings.delete(TOKEN_KEY).await
+                },
                 (Some(t), false) => self.settings.set_secret(TOKEN_KEY, &t).await,
                 (None, _) => {
                     let _ = self.creds.delete(TOKEN_KEY).await;
@@ -304,7 +326,18 @@ impl AgentHost for BackupHost {
     }
 
     fn store_credential(&self, credential_id: String, secret: Option<String>) -> BoxFuture<'_, Result<(), AppError>> {
-        Box::pin(async move { self.mgr.set_destination_secret(&credential_id, secret.as_deref().unwrap_or("")).await })
+        Box::pin(async move {
+            self.mgr.set_destination_secret(&credential_id, secret.as_deref().unwrap_or("")).await?;
+            // Saved desktop connections use the central reference directly;
+            // backups keep their existing destination namespace. Both stores
+            // must succeed before the agent acknowledges a workspace revision.
+            if self.agent_kind == "desktop" {
+                match secret {
+                    Some(secret) => self.creds.store(&credential_id, &secret).await,
+                    None => self.creds.delete(&credential_id).await,
+                }
+            } else { Ok(()) }
+        })
     }
 
     fn apply_policy(&self, p: FleetPolicy) -> BoxFuture<'_, Result<(), AppError>> {
@@ -329,6 +362,17 @@ impl AgentHost for BackupHost {
 
     fn managed_policies(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { self.mgr.list_jobs().await.iter().filter_map(|j| policy_of_job(&j.id).map(String::from)).collect() })
+    }
+
+    fn apply_workspaces(&self, workspaces: Vec<ufop_core::agent::WorkspaceDelivery>) -> BoxFuture<'_, Result<(), AppError>> {
+        let h = self.workspace_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Box::pin(async move {
+            match h {
+                Some(h) => h(workspaces).await,
+                None if workspaces.is_empty() => Ok(()),
+                None => Err(AppError::state("Workspace installation is unavailable on this client", "Use a desktop client.")),
+            }
+        })
     }
 
     fn apply_managed_settings(&self, settings: Option<ManagedSettings>) -> BoxFuture<'_, Result<(), AppError>> {

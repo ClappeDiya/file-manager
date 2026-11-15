@@ -46,7 +46,7 @@ impl SettingsStore {
         }
         let key = match std::env::var(ENV_KEY).ok().filter(|k| !k.is_empty()) {
             Some(k) => Some(k),
-            None if creds.is_keychain_available() => match creds.retrieve(KEYCHAIN_KEY).await? {
+            None if creds.is_persistent() => match creds.retrieve(KEYCHAIN_KEY).await? {
                 Some(k) => Some(k),
                 None => {
                     let k = ufop_core::backup::crypto::generate_passphrase(48);

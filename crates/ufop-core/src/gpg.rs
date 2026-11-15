@@ -366,7 +366,7 @@ impl Gpg {
         // `DECRYPTION_INFO <mdc> <cipher> [<aead>]`: neither MDC nor AEAD means no integrity protection.
         let unprotected = err.lines().filter_map(|l| l.strip_prefix("[GNUPG:] DECRYPTION_INFO ")).any(|info| {
             let f: Vec<&str> = info.split_whitespace().collect();
-            f.first() == Some(&"0") && f.get(2).map_or(true, |a| *a == "0")
+            f.first() == Some(&"0") && f.get(2).is_none_or(|a| *a == "0")
         });
         let signature = (check.valid || check.key_id.is_some() || check.missing_key).then_some(check);
         Ok((out, Decryption { signature, unprotected }))

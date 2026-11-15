@@ -29,7 +29,7 @@ export function Tabs({ tabs, activeTab, onTabChange, children, className }: Tabs
             className={cn(
               'px-4 py-2.5 text-sm font-medium transition-colors relative',
               active === tab.id
-                ? 'text-primary border-b-2 border-primary -mb-px'
+                ? 'text-link border-b-2 border-primary -mb-px'
                 : 'text-foreground-secondary hover:text-foreground hover:bg-background-secondary'
             )}
           >

@@ -420,14 +420,14 @@ pub struct PathQuery {
 }
 
 /// The share for `token` when it is usable, else the page to show instead.
-async fn open(st: &ServerState, token: &str, ip: &str) -> Result<(Share, Option<String>), Response> {
+async fn open(st: &ServerState, token: &str, ip: &str) -> Result<(Share, Option<String>), Box<Response>> {
     let store = st.auth.shares();
     let Ok(Some((share, pw))) = store.by_token(token).await else {
-        return Err(message(StatusCode::NOT_FOUND, "Link not found", "Check the address, or ask for a new link."));
+        return Err(Box::new(message(StatusCode::NOT_FOUND, "Link not found", "Check the address, or ask for a new link.")));
     };
     if let Some(why) = unavailable(&share, Utc::now()) {
         store.record(&share.id, ip, "refused", why).await;
-        return Err(message(StatusCode::GONE, "Link unavailable", why));
+        return Err(Box::new(message(StatusCode::GONE, "Link unavailable", why)));
     }
     Ok((share, pw))
 }
@@ -460,7 +460,7 @@ async fn view(State(st): State<ServerState>, AxPath(token): AxPath<String>, Quer
     let ip = peer.ip().to_string();
     let (share, pw) = match open(&st, &token, &ip).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let store = st.auth.shares();
     let base = format!("/s/{}", q(&token));
@@ -563,7 +563,7 @@ async fn unlock(State(st): State<ServerState>, AxPath(token): AxPath<String>, Co
     let ip = peer.ip().to_string();
     let (share, pw) = match open(&st, &token, &ip).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(hash) = pw else { return Redirect::to(&format!("/s/{}", q(&token))).into_response() };
     let store = st.auth.shares();
@@ -601,7 +601,7 @@ async fn download(State(st): State<ServerState>, AxPath(token): AxPath<String>, 
     let ip = peer.ip().to_string();
     let (share, pw) = match open(&st, &token, &ip).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let store = st.auth.shares();
     if pw.as_deref().is_some_and(|h| !unlocked(&headers, &share, h)) {
@@ -669,7 +669,7 @@ async fn upload(State(st): State<ServerState>, AxPath(token): AxPath<String>, Qu
     let ip = peer.ip().to_string();
     let (share, pw) = match open(&st, &token, &ip).await {
         Ok(s) => s,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let store = st.auth.shares();
     if pw.as_deref().is_some_and(|h| !unlocked(&headers, &share, h)) {
@@ -790,11 +790,11 @@ async fn create_share(State(st): State<ServerState>, Json(n): Json<NewShare>) ->
     if policy.locked && n.kind.uploads() {
         return Err(bad("This folder is locked: it takes no upload links").into());
     }
-    if policy.require_link_password && n.password.as_deref().map_or(true, str::is_empty) {
+    if policy.require_link_password && n.password.as_deref().is_none_or(str::is_empty) {
         return Err(bad("Links to this folder need a password").into());
     }
     if let Some(max) = policy.max_link_days {
-        if n.expires_in_days.map_or(true, |d| d > max) {
+        if n.expires_in_days.is_none_or(|d| d > max) {
             return Err(bad(format!("Links to this folder must expire within {max} days")).into());
         }
     }

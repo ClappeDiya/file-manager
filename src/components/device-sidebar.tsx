@@ -10,7 +10,7 @@
  * Used alongside sidebar-nav.tsx for the "Devices" section.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import { isTauriAvailable, tauriInvoke } from "@/hooks/use-tauri";
 import { formatBytes } from "@/lib/format-bytes";
 import { cn } from "@ufop/ui-components";
@@ -174,26 +174,26 @@ export function DeviceSidebar({
   className,
 }: DeviceSidebarProps) {
   // Wire to Tauri IPC when no callback props are provided and Tauri is available
-  const onDetectDrives = onDetectDrivesProp ?? (isTauriAvailable()
+  const onDetectDrives = useMemo(() => onDetectDrivesProp ?? (isTauriAvailable()
     ? async () => tauriInvoke<DriveInfoData[]>("detect_drives", undefined, [])
-    : undefined);
+    : undefined), [onDetectDrivesProp]);
 
-  const onEjectDrive = onEjectDriveProp ?? (isTauriAvailable()
+  const onEjectDrive = useMemo(() => onEjectDriveProp ?? (isTauriAvailable()
     ? async (mountPoint: string) => { await tauriInvoke("eject_drive", { mountPoint }); }
-    : undefined);
+    : undefined), [onEjectDriveProp]);
 
-  const onDiscoverSmb = onDiscoverSmbProp ?? (isTauriAvailable()
+  const onDiscoverSmb = useMemo(() => onDiscoverSmbProp ?? (isTauriAvailable()
     ? async () => tauriInvoke<SmbDiscoveryData>("smb_discover_shares", undefined, {
         shares: [],
         scan_duration_ms: 0,
         hosts_scanned: 0,
         errors: [],
       })
-    : undefined);
+    : undefined), [onDiscoverSmbProp]);
 
-  const onListNfsExports = onListNfsExportsProp ?? (isTauriAvailable()
+  const onListNfsExports = useMemo(() => onListNfsExportsProp ?? (isTauriAvailable()
     ? async (host: string) => tauriInvoke<NfsExportData[]>("nfs_list_exports", { host }, [])
-    : undefined);
+    : undefined), [onListNfsExportsProp]);
 
   const onConnectNfs = onConnectNfsProp ?? undefined;
 

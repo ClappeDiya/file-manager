@@ -1,12 +1,13 @@
+import { errorText } from "@/lib/error-text";
 /**
  * Terminal Store (T-046)
  *
  * Zustand store for built-in terminal state management.
  * Manages terminal sessions, split layouts, and persistence.
  */
+import { tauriInvoke } from "@/hooks/use-tauri";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { tauriInvoke } from "@/hooks/use-tauri";
 
 // ── Types ──
 
@@ -97,8 +98,8 @@ export const useTerminalStore = create<TerminalState>()(
             panelOpen: true,
           }));
           return session;
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to create terminal session" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to create terminal session") });
           throw e;
         }
       },
@@ -119,8 +120,8 @@ export const useTerminalStore = create<TerminalState>()(
             panelOpen: true,
           }));
           return session;
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to create remote terminal session" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to create remote terminal session") });
           throw e;
         }
       },
@@ -140,8 +141,8 @@ export const useTerminalStore = create<TerminalState>()(
               panelOpen: newSessions.length > 0 ? state.panelOpen : false,
             };
           });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to close terminal session" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to close terminal session") });
         }
       },
 
@@ -149,8 +150,8 @@ export const useTerminalStore = create<TerminalState>()(
         try {
           const sessions = await tauriInvoke<TerminalSession[]>("terminal_list_sessions", undefined, []);
           set({ sessions });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to list sessions" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to list sessions") });
         }
       },
 
@@ -161,8 +162,8 @@ export const useTerminalStore = create<TerminalState>()(
       writeToSession: async (sessionId: string, data: string) => {
         try {
           await tauriInvoke("terminal_write", { sessionId, data });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to write to terminal" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to write to terminal") });
         }
       },
 
@@ -174,7 +175,7 @@ export const useTerminalStore = create<TerminalState>()(
               s.id === sessionId ? { ...s, cols, rows } : s
             ),
           }));
-        } catch (e: any) {
+        } catch (e: unknown) {
           // Resize failures are non-critical
           console.warn("Terminal resize failed:", e);
         }
@@ -198,8 +199,8 @@ export const useTerminalStore = create<TerminalState>()(
               split_ratio: ratio,
             },
           });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to set terminal layout" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to set terminal layout") });
         }
       },
 
@@ -207,8 +208,8 @@ export const useTerminalStore = create<TerminalState>()(
         try {
           const layout = await tauriInvoke<TerminalLayout | null>("terminal_get_layout", undefined, null);
           set({ layout });
-        } catch (e: any) {
-          set({ error: e?.message || "Failed to get terminal layout" });
+        } catch (e: unknown) {
+          set({ error: errorText(e, "Failed to get terminal layout") });
         }
       },
 

@@ -37,7 +37,7 @@ export function SessionsCard() {
           <li key={s.id} className="flex items-center justify-between gap-2">
             <span>
               {browser(s.userAgent)} · {s.ip || 'unknown address'} <span className="text-xs text-foreground-tertiary">· active {formatRelativeTime(s.lastSeenAt)} · {s.method}</span>
-              {s.current && <span className="ml-1 text-xs font-medium text-success">this session</span>}
+              {s.current && <span className="ml-1 text-xs font-medium text-success-foreground">this session</span>}
             </span>
             {!s.current && (
               <Button size="sm" variant="ghost" onClick={() => void end(`id=${encodeURIComponent(s.id)}`)}>

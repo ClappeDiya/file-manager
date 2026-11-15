@@ -66,7 +66,7 @@ export default function DevicesPage() {
       <div>
         <PageHeader title="Devices" description="Monitor device health and policy compliance" />
         <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p className="text-sm text-error">Error: {error}</p>
+          <p className="text-sm text-error-foreground">Error: {error}</p>
         </div>
       </div>
     );
@@ -231,7 +231,7 @@ export default function DevicesPage() {
             <CardContent>
               <h3 className="text-lg font-semibold mb-4">Policy Compliance</h3>
               {selectedDevice.policyCompliance.isCompliant ? (
-                <div className="flex items-center gap-2 text-success">
+                <div className="flex items-center gap-2 text-success-foreground">
                   <Shield size={18} />
                   <span className="text-sm font-medium">Fully Compliant</span>
                 </div>
@@ -239,7 +239,7 @@ export default function DevicesPage() {
                 <div className="space-y-3">
                   {selectedDevice.policyCompliance.violations.map((v, i) => (
                     <div key={i} className="flex items-start gap-3 p-3 rounded-lg bg-error-bg border border-error/20">
-                      <AlertTriangle size={16} className="text-error shrink-0 mt-0.5" />
+                      <AlertTriangle size={16} className="text-error-foreground shrink-0 mt-0.5" />
                       <div>
                         <p className="text-sm font-medium text-foreground">{v.policyName}</p>
                         <p className="text-xs text-foreground-secondary mt-0.5">{v.description}</p>
@@ -260,7 +260,7 @@ export default function DevicesPage() {
                 <div className="space-y-3">
                   {selectedDevice.failurePatterns.map((fp, i) => (
                     <div key={i} className="flex items-start gap-3 p-3 rounded-lg bg-warning-bg border border-warning/20">
-                      <AlertTriangle size={16} className="text-warning shrink-0 mt-0.5" />
+                      <AlertTriangle size={16} className="text-warning-foreground shrink-0 mt-0.5" />
                       <div>
                         <p className="text-sm font-medium text-foreground">{fp.type}</p>
                         <p className="text-xs text-foreground-secondary mt-0.5">{fp.description}</p>

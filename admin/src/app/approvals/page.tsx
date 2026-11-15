@@ -157,7 +157,7 @@ export default function ApprovalsPage() {
       <div>
         <PageHeader title="Approval Workflows" description="Review and manage approval requests" />
         <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p className="text-sm text-error">Error: {error}</p>
+          <p className="text-sm text-error-foreground">Error: {error}</p>
         </div>
       </div>
     );
@@ -231,7 +231,7 @@ export default function ApprovalsPage() {
                       </Badge>
                       <Badge variant="outline">{APPROVAL_TRIGGER_LABELS[approval.trigger]}</Badge>
                       {approval.state === 'pending' && (
-                        <span className="text-xs text-warning font-medium">
+                        <span className="text-xs text-warning-foreground font-medium">
                           {getTimeRemaining(approval.expiresAt)}
                         </span>
                       )}
@@ -368,7 +368,7 @@ export default function ApprovalsPage() {
             )}
           </div>
         )}
-        {decisionError && <p role="alert" className="text-sm text-error">{decisionError}</p>}
+        {decisionError && <p role="alert" className="text-sm text-error-foreground">{decisionError}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={() => { setShowReviewDialog(false); setSelectedApproval(null); setReviewComment(''); }}>
             {selectedApproval?.state === 'pending' ? 'Cancel' : 'Close'}

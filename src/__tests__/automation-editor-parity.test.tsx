@@ -4,15 +4,16 @@
  * the new steps (verify, list, tidy, purge), download straight to a remote,
  * and result notifications.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
 import { AutomationRuleEditor } from "@/components/automation-rule-editor";
-import { RiskBadge, RiskConfirm, fetchHighRiskSteps, fetchRisks } from "@/components/step-risk";
-import { useAutomationStore, type AutomationRule, type RuleAction, type StepRisk } from "@/stores/automation-store";
+import { RiskBadge,RiskConfirm } from '@/components/step-risk';
+import { fetchHighRiskSteps,fetchRisks } from '@/components/step-risk-helpers';
+import { useAutomationStore,type AutomationRule,type RuleAction,type StepRisk } from "@/stores/automation-store";
 import { useUIStore } from "@/stores/ui-store";
 
 let lastSaved: AutomationRule | null = null;

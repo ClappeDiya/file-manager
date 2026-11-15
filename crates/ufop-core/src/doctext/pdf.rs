@@ -924,7 +924,7 @@ fn interpret(content: &[u8], fonts: &HashMap<String, Font>, out: &mut Out) {
                 // Inline image data runs until `EI` after whitespace.
                 let s = lx.s;
                 let mut p = lx.pos + 1;
-                while p + 2 < s.len() && !(is_ws(s[p]) && &s[p + 1..p + 3] == b"EI" && s.get(p + 3).map_or(true, |&b| is_ws(b))) {
+                while p + 2 < s.len() && !(is_ws(s[p]) && &s[p + 1..p + 3] == b"EI" && s.get(p + 3).is_none_or(|&b| is_ws(b))) {
                     p += 1;
                 }
                 lx.pos = (p + 3).min(s.len());

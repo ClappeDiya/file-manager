@@ -53,3 +53,6 @@ export {
   type TabsTriggerProps,
   type TabsContentProps,
 } from "./tabs";
+
+// Modal focus and background isolation (shared by desktop and admin).
+export { useFocusTrap } from "./hooks/use-focus-trap";

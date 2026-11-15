@@ -54,7 +54,7 @@ function Body({ user }: { user: AdminUser }) {
         <h4 className="mb-1 font-semibold">Sign-in rules</h4>
         <ul className="space-y-0.5">
           {data.conditions.map((c) => (
-            <li key={c.key} className={c.ok ? '' : 'text-error'}>
+            <li key={c.key} className={c.ok ? '' : 'text-error-foreground'}>
               {c.ok ? '✓' : '✗'} {c.detail}
             </li>
           ))}
@@ -63,7 +63,7 @@ function Body({ user }: { user: AdminUser }) {
       <section>
         <Select label="Can they…" options={[{ value: '', label: 'Pick a permission' }, ...ALL_PERMISSIONS.map((p) => ({ value: p, label: p }))]} value={permission} onChange={(e) => setPermission(e.target.value)} />
         {data.check && (
-          <p className={`mt-1 ${data.check.allowed ? 'text-success' : 'text-error'}`}>
+          <p className={`mt-1 ${data.check.allowed ? 'text-success-foreground' : 'text-error-foreground'}`}>
             {data.check.allowed ? 'Yes' : 'No'}: {data.check.reason}
           </p>
         )}

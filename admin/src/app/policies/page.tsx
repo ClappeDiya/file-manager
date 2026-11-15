@@ -186,7 +186,7 @@ export default function PoliciesPage() {
       <div>
         <PageHeader title="Policy Engine" description="Configure and manage organizational policies" />
         <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p className="text-sm text-error">Error: {error}</p>
+          <p className="text-sm text-error-foreground">Error: {error}</p>
         </div>
       </div>
     );
@@ -219,7 +219,7 @@ export default function PoliciesPage() {
                   : 'border-border hover:bg-background-secondary'
               }`}
             >
-              <Icon size={18} className={domainFilter === domain ? 'text-primary' : 'text-foreground-secondary'} />
+              <Icon size={18} className={domainFilter === domain ? 'text-link' : 'text-foreground-secondary'} />
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-foreground truncate">{label}</p>
                 <p className="text-xs text-foreground-tertiary">{count} active</p>
@@ -316,14 +316,14 @@ export default function PoliciesPage() {
                       className="p-1.5 rounded hover:bg-background-secondary"
                       title={policy.isActive ? 'Disable' : 'Enable'}
                     >
-                      <Shield size={14} className={policy.isActive ? 'text-success' : 'text-foreground-disabled'} />
+                      <Shield size={14} className={policy.isActive ? 'text-success-foreground' : 'text-foreground-disabled'} />
                     </button>
                     <button
                       onClick={() => handleDeletePolicy(policy.id)}
                       className="p-1.5 rounded hover:bg-error-bg"
                       title="Delete"
                     >
-                      <Trash2 size={14} className="text-error" />
+                      <Trash2 size={14} className="text-error-foreground" />
                     </button>
                   </div>
                 </TableCell>

@@ -4,6 +4,8 @@
  * and see heartbeats, managed policies and queued reports.
  */
 import { useEffect, useRef, useState } from "react";
+import { tauriInvoke } from "@/hooks/use-tauri";
+import { errorText } from "@/lib/error-text";
 import { useFleetAgentStore } from "@/stores/fleet-agent-store";
 
 const input =
@@ -19,6 +21,7 @@ function when(ts: string | null): string {
 export function FleetAgentSection() {
   const { status, busy, error, refresh, register, startClaim, pollClaim, cancelClaim, unregister, setEnabled, syncNow, connect, signInWithBrowser, cancelSignIn } =
     useFleetAgentStore();
+  const [openError, setOpenError] = useState<string | null>(null);
   const [mode, setMode] = useState<"browser" | "link" | "claim">("browser");
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
@@ -68,6 +71,12 @@ export function FleetAgentSection() {
             {status.dropped_reports > 0 ? ` (${status.dropped_reports} dropped while offline)` : ""}
           </dd>
         </dl>
+        <p className="text-xs text-gray-500">Organization tools open in your connected console: fleet, users, roles, policies, credentials and shared workspaces. Your console permissions control access.</p>
+        <button type="button" className={`${button} border border-gray-300 dark:border-gray-600`} onClick={() => {
+          setOpenError(null);
+          void tauriInvoke<void>("open_server_in_browser", {url:status.console_url}).catch(e=>setOpenError(errorText(e)));
+        }}>Open management console</button>
+        {openError && <p role="alert" className="text-xs text-red-600">{openError}</p>}
         {status.last_error && <p className="text-xs text-amber-600">{status.last_error}</p>}
         {status.managed_policies.length > 0 && (
           <div>
@@ -98,7 +107,7 @@ export function FleetAgentSection() {
             type="button"
             disabled={busy}
             onClick={() => {
-              if (window.confirm("Leave the management console? Managed backup jobs are removed (their backups stay).")) {
+              if (window.confirm("Leave the management console? Managed connections and backup jobs are removed (their backups stay).")) {
                 void unregister(state === "revoked");
               }
             }}

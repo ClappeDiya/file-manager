@@ -9,6 +9,7 @@ import net from 'net';
 import { NextRequest } from 'next/server';
 import Database from 'better-sqlite3';
 import { db, migrate } from '@/lib/db';
+import { MIGRATIONS, LATEST_SCHEMA } from '@/lib/db/migrations';
 import { listAudit } from '@/lib/db/repos/audit';
 import { createOrg, license } from '@/lib/db/repos/orgs';
 import { createChannel } from '@/lib/db/repos/channels';
@@ -547,16 +548,14 @@ describe('billing: coupons', () => {
 describe('billing: schema upgrade', () => {
   it('marks organizations that already subscribed as having used their trial', () => {
     const d = new Database(':memory:');
-    migrate(d);
-    // Roll the billing table back to its version-33 shape, as a console upgraded from before trials would have it.
-    for (const c of ['billing_interval', 'trial_end', 'trial_used', 'discount']) d.exec(`ALTER TABLE billing_accounts DROP COLUMN ${c}`);
-    for (const c of ['sub_payment_method', 'customer_payment_method', 'checkout_session_id']) d.exec(`ALTER TABLE billing_accounts DROP COLUMN ${c}`);
+    // Build the actual historical schema; future tables must not already exist.
+    for (const migration of MIGRATIONS.filter(m => m.version <= 33)) migration.up(d);
     d.pragma('user_version = 33');
     const org = (id: string) => d.prepare("INSERT INTO organizations (id, name, created_at, updated_at) VALUES (?, ?, 'now', 'now')").run(id, id);
     for (const id of ['org_old_sub', 'org_old_customer_only']) org(id);
     d.prepare("INSERT INTO billing_accounts (org_id, provider, customer_id, subscription_id, plan, seats, status, updated_at) VALUES ('org_old_sub', 'stripe', 'cus_1', 'sub_1', 'business', 5, 'active', 'now')").run();
     d.prepare("INSERT INTO billing_accounts (org_id, provider, customer_id, status, updated_at) VALUES ('org_old_customer_only', 'stripe', 'cus_2', 'none', 'now')").run();
-    expect(migrate(d)).toBe(2);
+    expect(migrate(d)).toBe(LATEST_SCHEMA - 33);
     expect(d.prepare('SELECT org_id, trial_used FROM billing_accounts ORDER BY org_id').all()).toEqual([
       { org_id: 'org_old_customer_only', trial_used: 0 },
       { org_id: 'org_old_sub', trial_used: 1 },

@@ -7,61 +7,62 @@
  * Rust), overwrite/retry/priority/settle options, a dry run, command
  * approval and webhook URLs. Rules are saved disabled unless switched on.
  */
-import { NamedSchedulePicker } from "@/components/schedule-pickers";
-import { WorkflowBuilder } from "@/components/workflow-builder";
+import { BatchRulesEditor } from "@/components/batch-rules-editor";
 import { PresetCombobox } from "@/components/preset-combobox";
 import { RunNotifyPicker } from "@/components/run-notify-picker";
-import { RiskBadge, RiskConfirm, fetchHighRiskSteps, useRiskLookup, type HighRiskStep } from "@/components/step-risk";
-import { autoLayout, workflowActions } from "@/lib/workflow-model";
-import { refId } from "@/stores/schedule-store";
-import { useCallback, useEffect, useState } from "react";
-import { ArrowDown, ArrowUp, Building2, ClipboardCopy, FlaskConical, Link2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
-import { Button } from "@ufop/ui-components";
+import { NamedSchedulePicker } from "@/components/schedule-pickers";
+import { RiskBadge,RiskConfirm } from '@/components/step-risk';
+import { fetchHighRiskSteps,useRiskLookup,type HighRiskStep } from '@/components/step-risk-helpers';
+import { WorkflowBuilder } from "@/components/workflow-builder";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
-import { useUIStore } from "@/stores/ui-store";
-import { tauriInvoke, tauriInvokeSafe } from "@/hooks/use-tauri";
-import { pickFolder } from "@/lib/folder-picker";
-import { errorText } from "@/lib/error-text";
+import { tauriInvoke,tauriInvokeSafe } from "@/hooks/use-tauri";
 import {
-  ACTION_TYPES,
-  CONDITION_TYPES,
-  CRON_PRESETS,
-  DEFAULT_RETRY,
-  NO_RETRY,
-  OVERWRITE_LABELS,
-  PRESETS,
-  RESULT_FIELDS,
-  TRIGGER_TYPES,
-  earlierResults,
-  commandLines,
-  defaultAction,
-  defaultCondition,
-  defaultTrigger,
-  formFromRule,
-  isFileTrigger,
-  newRuleForm,
-  portableRule,
-  rowKey,
-  ruleFromForm,
-  runsCommands,
-  validateForm,
-  type RuleForm,
-  linearSteps,
+ACTION_TYPES,
+CONDITION_TYPES,
+CRON_PRESETS,
+DEFAULT_RETRY,
+NO_RETRY,
+OVERWRITE_LABELS,
+PRESETS,
+RESULT_FIELDS,
+TRIGGER_TYPES,
+commandLines,
+defaultAction,
+defaultCondition,
+defaultTrigger,
+earlierResults,
+formFromRule,
+isFileTrigger,
+linearSteps,
+newRuleForm,
+portableRule,
+rowKey,
+ruleFromForm,
+runsCommands,
+validateForm,
+type RuleForm,
 } from "@/lib/automation-rule-model";
-import { BatchRulesEditor } from "@/components/batch-rules-editor";
+import { errorText } from "@/lib/error-text";
+import { pickFolder } from "@/lib/folder-picker";
+import { autoLayout,workflowActions } from "@/lib/workflow-model";
 import {
-  DOCUMENT_FORMATS,
-  IMAGE_FORMATS,
-  useAutomationStore,
-  type AutomationLog,
-  type AutomationRule,
-  type OverwritePolicy,
-  type RuleAction,
-  type RuleCondition,
-  type WebhookInfo,
-  type RuleRevision,
-  type Workflow,
+DOCUMENT_FORMATS,
+IMAGE_FORMATS,
+useAutomationStore,
+type AutomationLog,
+type AutomationRule,
+type OverwritePolicy,
+type RuleAction,
+type RuleCondition,
+type RuleRevision,
+type WebhookInfo,
+type Workflow,
 } from "@/stores/automation-store";
+import { refId } from "@/stores/schedule-store";
+import { useUIStore } from "@/stores/ui-store";
+import { Button } from "@ufop/ui-components";
+import { ArrowDown,ArrowUp,Building2,ClipboardCopy,FlaskConical,Link2,Plus,ShieldCheck,Trash2,X } from "lucide-react";
+import { useCallback,useEffect,useState } from "react";
 
 const field = "w-full min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1 text-xs";
 const label = "block text-[11px] font-medium text-[var(--color-text-muted)] mb-1";

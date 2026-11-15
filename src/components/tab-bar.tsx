@@ -1,15 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  paneLabel,
-  useFileManagerStore,
-  type PaneTab,
-} from "@/stores/file-manager-store";
-import { cn } from "@ufop/ui-components";
-import { Tooltip } from "@ufop/ui-components";
-import { X, Plus, Pin, PinOff } from "lucide-react";
 import { formatAddress } from "@/lib/location";
 import { useConnectionsStore } from "@/stores/connections-store";
-import { ContextMenu, getTabContextMenuItems } from "./context-menu";
+import {
+paneLabel,
+useFileManagerStore,
+type PaneTab,
+} from "@/stores/file-manager-store";
+import { cn,Tooltip } from "@ufop/ui-components";
+import { Pin,PinOff,Plus,X } from "lucide-react";
+import { useCallback,useEffect,useMemo,useRef,useState } from "react";
+import { ContextMenu } from './context-menu';
+import { getTabContextMenuItems } from './context-menu-helpers';
 
 /**
  * Tabbed browsing bar for a single pane.

@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { act, renderHook } from "@testing-library/react";
-import { computeRangeSelection, useFileSelection } from "@/hooks/use-file-selection";
+import type { FileEntryData } from '@/components/file-list-helpers';
+import { computeRangeSelection,useFileSelection } from "@/hooks/use-file-selection";
 import { useFileManagerStore } from "@/stores/file-manager-store";
-import type { FileEntryData } from "@/components/file-list";
+import { act,renderHook } from "@testing-library/react";
+import { beforeEach,describe,expect,it } from "vitest";
 
 const files = ["a", "b", "c", "d", "e"].map((n) => ({ path: `/x/${n}`, name: n })) as unknown as FileEntryData[];
 const click = (o: Partial<React.MouseEvent> = {}) => ({ metaKey: false, ctrlKey: false, shiftKey: false, ...o }) as React.MouseEvent;

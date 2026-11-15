@@ -62,7 +62,7 @@ pub fn activity_report(days: u32, now: DateTime<Utc>, logs: &[AutomationLog], ev
         r.files += l.files_affected.len() as u64;
         if l.status == AutomationStatus::Failed {
             r.failed += 1;
-            if r.last_error.as_ref().map_or(true, |(t, _)| l.triggered_at > *t) {
+            if r.last_error.as_ref().is_none_or(|(t, _)| l.triggered_at > *t) {
                 r.last_error = Some((l.triggered_at.clone(), l.error_message.clone().unwrap_or_default()));
             }
         }

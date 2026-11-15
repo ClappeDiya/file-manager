@@ -28,7 +28,7 @@ pub async fn execute(
                 .filter(|c| {
                     protocol
                         .as_ref()
-                        .map_or(true, |p| c.protocol.eq_ignore_ascii_case(p))
+                        .is_none_or(|p| c.protocol.eq_ignore_ascii_case(p))
                 })
                 .map(|c| ConnectionInfo {
                     name: c.name.clone(),

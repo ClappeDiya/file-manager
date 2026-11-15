@@ -754,6 +754,10 @@ impl StorageOperations for Repository {
                                 retry_count = ?12,
                                 partial_checksum = ?13,
                                 conflict_policy = ?14,
+                                verify_checksum = ?16,
+                                checksum_algorithm = ?17,
+                                source_checksum = ?18,
+                                dest_checksum = ?19,
                                 speed_bps = ?20,
                                 eta_seconds = ?21",
                             rusqlite::params![

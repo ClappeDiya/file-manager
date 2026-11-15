@@ -245,3 +245,10 @@ The `.github/workflows/*.yml.disabled` files are reference scaffolding only — 
 ## License & contribution policy
 
 This project is source-available under [PolyForm Shield 1.0.0](LICENSE). By submitting a contribution you agree it is licensed under the same terms. The Shield license prohibits using the software to build a competing product but otherwise permits commercial use, modification, and redistribution.
+
+
+### Local CI and immutable GHCR publishing
+
+GitHub Actions remain disabled. `pnpm verify` also checks admin and marketing lint, types, tests and builds; desktop lint rejects warnings. Install `pnpm hooks:install` to run the fast local gate before pushes. Rust uses `rust-toolchain.toml` (install Rust through rustup and ensure `cargo` is on PATH).
+
+Use `scripts/build-push-ghcr.sh all --dry-run` to inspect the image plan, then `scripts/build-push-ghcr.sh all` from committed source to run the full gate and publish immutable admin/marketing SHA images. See `docs/admin-console.md` for the separate admin compose stack and required persistent secrets. Publishing first runs strict production npm and Rust advisory checks against all three Rust lockfiles. Install `cargo-audit` with `cargo install cargo-audit --locked`; a missing scanner, unavailable advisory database or unsuppressed vulnerability stops publication. The normal local developer gates retain their offline behavior. No image is promoted or deployed automatically.

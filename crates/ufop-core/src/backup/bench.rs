@@ -337,7 +337,7 @@ fn best_of<T>(repeat: u32, mut f: impl FnMut() -> Result<T, AppError>) -> Result
         let t = Instant::now();
         let v = f()?;
         let d = t.elapsed();
-        if best.as_ref().map_or(true, |(_, b)| d < *b) {
+        if best.as_ref().is_none_or(|(_, b)| d < *b) {
             best = Some((v, d));
         }
     }
@@ -513,7 +513,7 @@ fn suggest_kdf(opts: &BenchOptions) -> Result<KdfResult, AppError> {
 /// The chunker variants compared around `block_size`.
 pub fn chunker_variants(block_size: usize) -> Vec<(String, ChunkerSpec)> {
     let b = block_size.max(1024);
-    let kib = |n: usize| if n % 1024 == 0 { format!("{}K", n / 1024) } else { n.to_string() };
+    let kib = |n: usize| if n.is_multiple_of(1024) { format!("{}K", n / 1024) } else { n.to_string() };
     vec![
         (format!("fixed-{}", kib(b)), ChunkerSpec::Fixed { size: b }),
         (format!("fastcdc-{}", kib(b / 2)), ChunkerSpec::fastcdc(b / 2)),

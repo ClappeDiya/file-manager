@@ -3,6 +3,7 @@
 //! certificate is renewed (re-signed by the same CA, so clients that
 //! trust the CA keep working) when it is within 30 days of expiry.
 
+use rustls::pki_types::pem::PemObject;
 use crate::core::error::AppError;
 use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType};
 use serde::{Deserialize, Serialize};
@@ -162,8 +163,8 @@ pub fn server_config(chain: Vec<Vec<u8>>, key: Vec<u8>, min: MinTls) -> Result<r
 
 /// PEM chain + key → DER, for `server_config`.
 pub fn pem_to_der(p: &PemPair) -> Result<(Vec<Vec<u8>>, Vec<u8>), AppError> {
-    let chain = rustls_pemfile::certs(&mut p.cert_chain_pem.as_bytes()).map(|c| c.map(|c| c.to_vec())).collect::<Result<Vec<_>, _>>().map_err(tls_err)?;
-    let key = rustls_pemfile::private_key(&mut p.key_pem.as_bytes()).map_err(tls_err)?.ok_or_else(|| tls_err("no private key in the PEM file"))?;
+    let chain = rustls::pki_types::CertificateDer::pem_slice_iter(p.cert_chain_pem.as_bytes()).map(|c| c.map(|c| c.to_vec())).collect::<Result<Vec<_>, _>>().map_err(tls_err)?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(p.key_pem.as_bytes()).map_err(|_| tls_err("no private key in the PEM file"))?;
     Ok((chain, key.secret_der().to_vec()))
 }
 
@@ -187,7 +188,7 @@ mod tests {
         let (chain, key) = pem_to_der(&pair).unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config(chain, key, min).unwrap()));
         let mut roots = rustls::RootCertStore::empty();
-        for c in rustls_pemfile::certs(&mut std::fs::read(g.ca_cert_path()).unwrap().as_slice()) {
+        for c in rustls::pki_types::CertificateDer::pem_slice_iter(&std::fs::read(g.ca_cert_path()).unwrap()) {
             roots.add(c.unwrap()).unwrap();
         }
         let ccfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))

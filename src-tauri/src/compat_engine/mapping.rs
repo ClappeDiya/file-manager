@@ -309,12 +309,12 @@ impl MappingDb {
     pub async fn count(&self) -> Result<u64, AppError> {
         self.pool
             .execute(|conn| {
-                let count: u64 = conn.query_row(
+                let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM compat_mapping_records",
                     [],
                     |row| row.get(0),
                 )?;
-                Ok(count)
+                u64::try_from(count).map_err(|_| AppError::internal("The mapping record count is invalid"))
             })
             .await
     }

@@ -1,97 +1,33 @@
-import React, { useMemo, useRef, useCallback, useState, useEffect } from "react";
+import { isRemotePath } from "@/lib/location";
+import { hasThumbnail,useThumbnail } from "@/lib/thumbnails";
+import type { ViewMode } from "@/stores/file-manager-store";
 import {
-  useReactTable,
-  getCoreRowModel,
-  getSortedRowModel,
-  getFilteredRowModel,
-  flexRender,
-  type ColumnDef,
-  type SortingState,
-  type ColumnResizeMode,
+flexRender,
+getCoreRowModel,
+getFilteredRowModel,
+getSortedRowModel,
+useReactTable,
+type ColumnDef,
+type ColumnResizeMode,
+type SortingState,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@ufop/ui-components";
-import { formatBytes } from "@/lib/format-bytes";
 import {
-  ArrowUpDown,
-  ArrowUp,
-  ArrowDown,
-  File,
-  Folder,
-  FileText,
-  FileImage,
-  FileCode,
-  FileArchive,
-  Film,
-  Music,
+ArrowDown,
+ArrowUp,
+ArrowUpDown,
+File,
+FileArchive,
+FileCode,
+FileImage,
+FileText,
+Film,
+Folder,
+Music,
 } from "lucide-react";
-import { hasThumbnail, useThumbnail } from "@/lib/thumbnails";
-import { isRemotePath } from "@/lib/location";
-import type { ViewMode } from "@/stores/file-manager-store";
-
-// ──────────────────────────────────────────────
-// Types (maps to Rust FileEntry)
-// ──────────────────────────────────────────────
-
-export interface FileEntryData {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  is_symlink: boolean;
-  size: number;
-  modified: string | null;
-  created: string | null;
-  is_hidden: boolean;
-  extension: string | null;
-  permissions: string | null;
-}
-
-// ──────────────────────────────────────────────
-// Utility functions
-// ──────────────────────────────────────────────
-
-/** File size in the units chosen in Settings → Appearance; "--" for 0. */
-export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return "--";
-  return formatBytes(bytes);
-}
-
-export function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "--";
-  const date = new Date(dateStr);
-  return date.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/**
- * Render the Size column for a row, accounting for the optional
- * `folderSizes` map produced by the user-initiated "Calculate Size"
- * context-menu action.
- *
- * Files always show their byte count.
- *
- * Folders show `--` until the user explicitly asks the platform to
- * compute their recursive size. Once computed, the result is cached
- * in the FilePane's `folderSizes` state and surfaced here so the
- * value sticks for the remainder of the pane's lifetime. Before
- * this iteration the cached value was never read — see
- * `_folderSizes` in `file-manager.tsx`.
- */
-export function formatEntrySize(
-  entry: FileEntryData,
-  folderSizes?: Record<string, number>,
-): string {
-  if (entry.is_dir) {
-    const cached = folderSizes?.[entry.path];
-    return cached !== undefined ? formatFileSize(cached) : "--";
-  }
-  return formatFileSize(entry.size);
-}
+import React,{ useCallback,useEffect,useMemo,useRef,useState } from "react";
+import { FileEntryData,formatDate,formatEntrySize } from './file-list-helpers';
 
 function getFileIcon(entry: FileEntryData): React.ReactNode {
   if (entry.is_dir) {
@@ -719,7 +655,7 @@ function FileTableView({
     }
 
     return cols;
-  }, [viewMode, visibleColumns, gitStatus, activityMap, folderSizes]);
+  }, [viewMode, gitStatus, activityMap, onActivityDotClick, visibleColumns, folderSizes]);
 
   const table = useReactTable({
     data: files,

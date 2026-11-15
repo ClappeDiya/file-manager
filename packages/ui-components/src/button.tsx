@@ -26,7 +26,7 @@ const variantClasses: Record<NonNullable<ButtonProps["variant"]>, string> = {
   ghost:
     "bg-transparent text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)]",
   destructive:
-    "bg-[var(--color-error)] text-white hover:bg-[var(--color-error-foreground)] shadow-[var(--shadow-xs)]",
+    "bg-[var(--color-destructive)] text-[color:var(--color-destructive-foreground)] hover:bg-[var(--color-destructive-hover)] shadow-[var(--shadow-xs)]",
   link: "bg-transparent text-[color:var(--color-primary)] hover:text-[color:var(--color-primary-hover)] underline-offset-4 hover:underline p-0 h-auto",
 };
 

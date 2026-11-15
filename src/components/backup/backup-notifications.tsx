@@ -1,3 +1,4 @@
+import { newNotification } from './backup-notifications-helpers';
 /**
  * Job editor pieces for result notifications (email, Telegram, XMPP, Slack,
  * Teams and webhooks with presets for Pushover, ntfy, Discord, PagerDuty and
@@ -5,25 +6,24 @@
  * system log). Channel passwords, bot tokens, webhook URLs and secret header
  * values go to the secure store under credential ids, never into the job.
  */
-import { useEffect, useState } from "react";
 import { tauriInvoke } from "@/hooks/use-tauri";
 import { inputCls } from "@/lib/backup-helpers";
+import { PRESETS,channelLabel,previewNotification,validHeaderName,webhookPreset,type NotificationPreview,type PresetParams,type Severity } from "@/stores/backup-notify";
 import {
-  errorText,
-  newLogFilter,
-  type BackupNotification,
-  type LogFilter,
-  type LogLevel,
-  type LogOutputs,
-  type NotificationChannel,
-  type ReportConfig,
-  type TlsMode,
-  type WebhookHeader,
-  type WebhookPreset,
+errorText,
+newLogFilter,
+type BackupNotification,
+type LogFilter,
+type LogLevel,
+type LogOutputs,
+type ReportConfig,
+type TlsMode,
+type WebhookHeader,
+type WebhookPreset
 } from "@/stores/backup-store";
-import { PRESETS, channelLabel, previewNotification, validHeaderName, webhookPreset, type NotificationPreview, type PresetParams, type Severity } from "@/stores/backup-notify";
-import { Banner, Btn, Check, Field, Section } from "./backup-ui";
+import { useEffect,useState } from "react";
 import { AdvancedOnly } from "./advanced-only";
+import { Banner,Btn,Check,Field,Section } from "./backup-ui";
 
 const RESULTS = ["success", "warning", "error"] as const;
 const LEVELS: LogLevel[] = ["info", "warning", "error"];
@@ -42,17 +42,6 @@ function secretLabel(n: BackupNotification): string {
     case "webhook":
       return PRESETS.find((p) => p.id === n.preset)?.secret ?? "Secret";
   }
-}
-
-type SimpleType = Exclude<NotificationChannel["type"], "webhook">;
-
-export function newNotification(type: SimpleType): BackupNotification {
-  const base = { send_on: ["warning", "error"], credential_id: crypto.randomUUID(), template: "", cert: { accept_invalid_certs: false, ca_pem: null, pinned_sha256: [] } };
-  if (type === "telegram") return { type, chat_id: "", api_base: "", ...base };
-  if (type === "xmpp") return { type, jid: "", to: "", host: "", port: null, tls: "start_tls", ...base };
-  if (type === "slack" || type === "teams") return { type, ...base };
-  // New mail channels send HTML (with a text part); older ones keep text only.
-  return { type: "email", host: "", port: null, tls: "start_tls", username: "", from: "", to: [], subject: "UFOP {{operation}} {{result}}: {{name}}", html: true, html_template: "", ...base };
 }
 
 const splitList = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);

@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader } from '@/components/ui/card';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { ROLE_LABELS, type Role } from '@/lib/types/auth';
 import { formatDateTime } from '@/lib/utils/format';
@@ -67,11 +67,11 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
 
   const usable = info?.status === 'pending';
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background-secondary p-4">
+    <main className="min-h-screen flex items-center justify-center bg-background-secondary p-4">
       <div className="w-full max-w-sm">
         <Card>
           <CardHeader className="flex-col items-start gap-1">
-            <CardTitle>Join {info?.organization || 'the organization'}</CardTitle>
+            <h1 className="text-lg font-semibold text-foreground">Join {info?.organization || 'the organization'}</h1>
             {info && (
               <CardDescription>
                 {info.email} is invited as {ROLE_LABELS[info.role]}. {usable ? `The invitation expires ${formatDateTime(info.expiresAt)}.` : `This invitation is ${info.status}.`}
@@ -81,11 +81,11 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
           <CardContent>
             {error && (
               <div role="alert" className="mb-3 rounded-md bg-error-bg border border-error/20 px-3 py-2">
-                <p className="text-sm text-error">{error}</p>
+                <p className="text-sm text-error-foreground">{error}</p>
               </div>
             )}
             {mfaNeeded ? null : !info ? null : !usable ? (
-              <Link href="/login" className="text-sm text-primary">
+              <Link href="/login" className="text-sm text-link">
                 Go to sign in
               </Link>
             ) : user ? (
@@ -105,7 +105,7 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
                 </Button>
                 <p className="text-xs text-foreground-tertiary">
                   Already have an account?{' '}
-                  <Link className="text-primary" href={`/login?redirect=${encodeURIComponent(`/invite/${encodeURIComponent(token)}`)}`}>
+                  <Link className="text-link" href={`/login?redirect=${encodeURIComponent(`/invite/${encodeURIComponent(token)}`)}`}>
                     Sign in first
                   </Link>
                   .
@@ -115,6 +115,6 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
           </CardContent>
         </Card>
       </div>
-    </div>
+    </main>
   );
 }

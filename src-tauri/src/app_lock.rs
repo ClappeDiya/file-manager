@@ -262,14 +262,17 @@ mod tests {
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
-        let call = |cmd: &str| {
+        // Match the platform's real packaged origin; modern Tauri correctly
+        // treats the Windows-only HTTP origin as remote on macOS/Linux.
+        let local_origin = if cfg!(any(windows, target_os = "android")) { "http://tauri.localhost" } else { "tauri://localhost" };
+        let call_from = |cmd: &str, origin: &str| {
             tauri::test::get_ipc_response(
                 &webview,
                 tauri::webview::InvokeRequest {
                     cmd: cmd.into(),
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
-                    url: "http://tauri.localhost".parse().unwrap(),
+                    url: origin.parse().unwrap(),
                     body: tauri::ipc::InvokeBody::default(),
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.to_string(),
@@ -277,6 +280,8 @@ mod tests {
             )
             .map(|b| b.deserialize::<String>().unwrap())
         };
+        let call = |cmd: &str| call_from(cmd, local_origin);
+        assert!(call_from("list_directory", "https://untrusted.example").is_err());
         assert_eq!(call("list_directory"), Ok("listing".to_string()));
         if let Ok(mut s) = lock.settings.write() {
             s.enabled = true;

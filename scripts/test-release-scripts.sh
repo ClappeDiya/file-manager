@@ -131,9 +131,14 @@ out="$(packaging/macos/generate-formula.sh --version 9.8.7 --url https://example
 expect_contains "homebrew formula" "$out" "class Ufop < Formula" "bash_completion.install" "zsh_completion.install" "fish_completion.install" "man1.install" 'sha256 "0000000000000000000000000000000000000000000000000000000000000007"'
 
 echo "==> SHA256SUMS signing and verification"
-if openssl list -digest-algorithms 2>/dev/null | grep -qi blake2b512; then
+if openssl list -digest-algorithms 2>/dev/null | grep -i blake2b512 >/dev/null; then
   # shellcheck source=lib/minisign-openssl.sh
   source scripts/lib/minisign-openssl.sh
+  # Keep the discovered OpenSSL when excluding optional verifier binaries.
+  # /usr/bin/openssl is LibreSSL on macOS even when OpenSSL 3 is on PATH.
+  mkdir -p "$T/verify-tools"
+  ln -s "$(command -v openssl)" "$T/verify-tools/openssl"
+  VERIFY_PATH="$T/verify-tools:/usr/bin:/bin"
   ms_keygen "$T/key"
   mkdir -p "$T/rel"
   printf 'one' > "$T/rel/FileManager-9.8.7-amd64.deb"
@@ -153,17 +158,17 @@ if openssl list -digest-algorithms 2>/dev/null | grep -qi blake2b512; then
   fi
   [[ "$(wc -l < "$T/rel/SHA256SUMS")" -eq 2 ]] && ok "SHA256SUMS lists every file" || bad "SHA256SUMS line count"
   [[ ${#gpg_args[@]} -eq 0 || -f "$T/rel/SHA256SUMS.asc" ]] && ok "GPG signature (when gpg is installed)" || bad "SHA256SUMS.asc missing"
-  if GNUPGHOME="${GH:-${GNUPGHOME:-}}" PATH=/usr/bin:/bin scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/key/minisign.pub" --quiet; then ok "verify-release.sh (openssl)"; else bad "verify-release.sh (openssl)"; fi
+  if GNUPGHOME="${GH:-${GNUPGHOME:-}}" PATH="$VERIFY_PATH" scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/key/minisign.pub" --quiet; then ok "verify-release.sh (openssl)"; else bad "verify-release.sh (openssl)"; fi
   if [[ -x cli/target/debug/ufop ]]; then
     if cli/target/debug/ufop verify-release "$T/rel/SHA256SUMS" --pubkey-file "$T/key/minisign.pub" >/dev/null; then ok "ufop verify-release"; else bad "ufop verify-release"; fi
   fi
   ms_keygen "$T/other"
-  if PATH=/usr/bin:/bin scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/other/minisign.pub" --quiet --no-gpg 2>/dev/null; then bad "a different key is rejected"; else ok "a different key is rejected"; fi
+  if PATH="$VERIFY_PATH" scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/other/minisign.pub" --quiet --no-gpg 2>/dev/null; then bad "a different key is rejected"; else ok "a different key is rejected"; fi
   printf 'tampered' > "$T/rel/FileManager-9.8.7-amd64.deb"
-  if PATH=/usr/bin:/bin scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/key/minisign.pub" --quiet --no-gpg 2>/dev/null; then bad "a tampered file is rejected"; else ok "a tampered file is rejected"; fi
+  if PATH="$VERIFY_PATH" scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/key/minisign.pub" --quiet --no-gpg 2>/dev/null; then bad "a tampered file is rejected"; else ok "a tampered file is rejected"; fi
   printf 'one' > "$T/rel/FileManager-9.8.7-amd64.deb"
   echo "0000000000000000000000000000000000000000000000000000000000000000  extra" >> "$T/rel/SHA256SUMS"
-  if PATH=/usr/bin:/bin scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/key/minisign.pub" --quiet --no-gpg 2>/dev/null; then bad "an edited SHA256SUMS is rejected"; else ok "an edited SHA256SUMS is rejected"; fi
+  if PATH="$VERIFY_PATH" scripts/verify-release.sh --dir "$T/rel" --pubkey-file "$T/key/minisign.pub" --quiet --no-gpg 2>/dev/null; then bad "an edited SHA256SUMS is rejected"; else ok "an edited SHA256SUMS is rejected"; fi
 else
   echo "  skip OpenSSL 3 with BLAKE2b-512 is not available"
 fi

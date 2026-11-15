@@ -850,6 +850,8 @@ pub struct AssumeRoleConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ConnectionExtras {
+    /// Organization workspace owner; local editing is guarded by the ownership record.
+    pub managed_by: Option<String>,
     pub assume_role: Option<AssumeRoleConfig>,
     /// rclone remote name (`gdrive:`) for rclone connections.
     pub rclone_remote: Option<String>,

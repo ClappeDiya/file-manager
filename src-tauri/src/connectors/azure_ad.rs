@@ -11,6 +11,7 @@
 //! `IDENTITY_ENDPOINT` / `IDENTITY_HEADER`, `AZURE_POD_IDENTITY_AUTHORITY_HOST`
 //! (instance metadata host).
 
+use rustls::pki_types::pem::PemObject;
 use super::aws_chain::ChainEnv;
 use crate::backup_engine::stores::http;
 use crate::core::error::AppError;
@@ -60,10 +61,8 @@ fn b64url(d: &[u8]) -> String {
 fn load_certificate(path: &str, password: Option<&str>) -> Result<(ring::signature::RsaKeyPair, Vec<u8>), AppError> {
     let data = std::fs::read(path).map_err(|e| AppError::Configuration { message: format!("Cannot read the certificate {path}: {e}"), advice: "Check the path and that the app may read it.".into() })?;
     let (key, cert) = if data.starts_with(b"-----") || data.windows(5).any(|w| w == b"-----") {
-        let mut rd = data.as_slice();
-        let cert = rustls_pemfile::certs(&mut rd).next().and_then(Result::ok).map(|c| c.to_vec()).ok_or_else(|| AppError::validation("The PEM file holds no certificate (it needs the private key and the certificate)"))?;
-        let mut rd = data.as_slice();
-        let key = rustls_pemfile::private_key(&mut rd).ok().flatten().ok_or_else(|| AppError::validation("The PEM file holds no private key"))?;
+        let cert = rustls::pki_types::CertificateDer::pem_slice_iter(&data).next().and_then(Result::ok).map(|c| c.to_vec()).ok_or_else(|| AppError::validation("The PEM file holds no certificate (it needs the private key and the certificate)"))?;
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&data).ok().ok_or_else(|| AppError::validation("The PEM file holds no private key"))?;
         (key.secret_der().to_vec(), cert)
     } else {
         let (chain, key) = crate::server::tls::load_pfx(std::path::Path::new(path), password.unwrap_or(""))?;

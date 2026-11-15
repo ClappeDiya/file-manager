@@ -102,7 +102,7 @@ describe("restore view", () => {
     });
     await open();
     fireEvent.click(screen.getByLabelText("Another folder"));
-    fireEvent.change(screen.getByTestId("restore-target"), { target: { value: "/r" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Restore folder" }), { target: { value: "/r" } });
     fireEvent.click(screen.getByLabelText(/Mirror: delete files/));
     fireEvent.click(screen.getByTestId("backup-restore-run"));
     const box = await screen.findByTestId("mirror-confirm");
@@ -125,7 +125,7 @@ describe("restore view", () => {
     backend({ backup_execute: () => ({ run_id: "r", status: "success", summary: "", report: { ...REPORT, planned: ["x"], planned_deletions: ["/r/x"] }, log: [] }) });
     await open();
     fireEvent.click(screen.getByLabelText("Another folder"));
-    fireEvent.change(screen.getByTestId("restore-target"), { target: { value: "/r" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Restore folder" }), { target: { value: "/r" } });
     fireEvent.click(screen.getByLabelText(/Mirror: delete files/));
     fireEvent.click(screen.getByTestId("backup-restore-run"));
     await screen.findByTestId("mirror-confirm");

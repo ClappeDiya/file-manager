@@ -1,14 +1,14 @@
 /** OpenPGP UI: dialog modes, recipients vs passphrase, results, keys, menu. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { beforeEach,describe,expect,it,vi } from "vitest";
 
 const mockInvoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
+import { getFileContextMenuItems } from '@/components/context-menu-helpers';
 import { GpgDialog } from "@/components/gpg-dialog";
 import { GpgKeysSection } from "@/components/gpg-keys-section";
-import { getFileContextMenuItems } from "@/components/context-menu";
-import { daysToExpiry, useGpgDialog, type GpgKey } from "@/stores/gpg-store";
+import { daysToExpiry,useGpgDialog,type GpgKey } from "@/stores/gpg-store";
 
 const now = Math.floor(Date.now() / 1000);
 const key = (over: Partial<GpgKey>): GpgKey => ({
@@ -78,7 +78,7 @@ describe("GpgDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Encrypt" }));
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("gpg_encrypt_files", expect.objectContaining({ options: expect.objectContaining({ recipients: [] }), passphrase: "s3cret" })));
     // The passphrase is cleared once used.
-    expect((screen.getByLabelText("Passphrase") as HTMLInputElement).value).toBe("");
+    await waitFor(() => expect((screen.getByLabelText("Passphrase") as HTMLInputElement).value).toBe(""));
   });
 
   it("decrypts and reports the signature", async () => {

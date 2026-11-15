@@ -116,7 +116,7 @@ export default function DashboardPage() {
         }
       />
 
-      {Object.keys(issues).length > 0 && <div role="alert" className="mb-4 rounded-md border border-error/20 bg-error-bg p-3 text-sm text-error">
+      {Object.keys(issues).length > 0 && <div role="alert" className="mb-4 rounded-md border border-error/20 bg-error-bg p-3 text-sm text-error-foreground">
         Some sections could not refresh. Their data is unavailable or last known; other sections remain usable.
         <ul className="mt-2">{Object.entries(issues).map(([key, message]) => <li key={key} className="capitalize">{key}: {message}</li>)}</ul>
         <Button variant="outline" size="sm" onClick={handleRefresh} loading={refreshing}>Retry unavailable sections</Button>
@@ -175,7 +175,7 @@ export default function DashboardPage() {
                   className="flex items-start gap-3 py-3 border-b border-border last:border-0"
                 >
                   <div className="shrink-0 p-2 rounded-lg bg-warning-bg">
-                    <Clock size={16} className="text-warning" />
+                    <Clock size={16} className="text-warning-foreground" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-foreground truncate">
@@ -223,9 +223,9 @@ export default function DashboardPage() {
                   'bg-info-bg'
                 }`}>
                   {entry.severity === 'warning' || entry.severity === 'error' ? (
-                    <AlertTriangle size={16} className={entry.severity === 'warning' ? 'text-warning' : 'text-error'} />
+                    <AlertTriangle size={16} className={entry.severity === 'warning' ? 'text-warning-foreground' : 'text-error-foreground'} />
                   ) : (
-                    <Activity size={16} className="text-info" />
+                    <Activity size={16} className="text-info-foreground" />
                   )}
                 </div>
                 <div className="flex-1 min-w-0">

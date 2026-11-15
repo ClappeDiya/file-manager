@@ -1,11 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import {
-  ContextMenu,
-  getFileContextMenuItems,
-  getTabContextMenuItems,
-  type ContextMenuItem,
-} from "@/components/context-menu";
+import { ContextMenu } from '@/components/context-menu';
+import { getFileContextMenuItems,getTabContextMenuItems,type ContextMenuItem } from '@/components/context-menu-helpers';
+import { fireEvent,render,screen } from "@testing-library/react";
+import { describe,expect,it,vi } from "vitest";
 
 describe("T-013: ContextMenu", () => {
   const mockItems: ContextMenuItem[] = [

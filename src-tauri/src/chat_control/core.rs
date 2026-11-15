@@ -200,7 +200,7 @@ impl RateLimiter {
             self.warned.remove(sender);
             return Rate::Allowed;
         }
-        let notify = self.warned.get(sender).map_or(true, |w| now.duration_since(*w) >= self.window);
+        let notify = self.warned.get(sender).is_none_or(|w| now.duration_since(*w) >= self.window);
         if notify {
             self.warned.insert(sender.to_string(), now);
         }
@@ -256,7 +256,7 @@ pub fn resolve(jobs: &[JobInfo], query: &str) -> Resolved {
         Some(("rule", n)) => (Some(JobKind::Rule), n.trim()),
         _ => (None, q),
     };
-    let candidates = || jobs.iter().filter(|j| kind.map_or(true, |k| k == j.kind));
+    let candidates = || jobs.iter().filter(|j| kind.is_none_or(|k| k == j.kind));
     let by_id: Vec<&JobInfo> = candidates().filter(|j| j.id == name).collect();
     let matches = if by_id.len() == 1 { by_id } else { candidates().filter(|j| j.name.eq_ignore_ascii_case(name) || j.name.to_lowercase() == name.to_lowercase()).collect() };
     match matches.len() {
