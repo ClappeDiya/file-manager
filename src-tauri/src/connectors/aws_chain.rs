@@ -141,7 +141,7 @@ pub struct CredentialProvider {
 
 impl CredentialProvider {
     pub fn new(source: CredentialSource, static_keys: Option<BaseKeys>, assume: Option<AssumeRoleOptions>, region: &str, env: ChainEnv) -> Result<Self, AppError> {
-        if source.is_static() && static_keys.as_ref().map_or(true, |k| k.access_key_id.trim().is_empty() || k.secret_access_key.trim().is_empty()) {
+        if source.is_static() && static_keys.as_ref().is_none_or(|k| k.access_key_id.trim().is_empty() || k.secret_access_key.trim().is_empty()) {
             return Err(AppError::validation("Enter the access key id and the secret access key"));
         }
         if let Some(a) = &assume {
@@ -162,7 +162,7 @@ impl CredentialProvider {
     pub async fn keys(&self) -> Result<BaseKeys, AppError> {
         let mut cache = self.cache.lock().await;
         if let Some(c) = cache.as_ref() {
-            let fresh = c.expires.map_or(true, |e| e - chrono::Duration::from_std(REFRESH_EARLY).unwrap_or_default() > Utc::now());
+            let fresh = c.expires.is_none_or(|e| e - chrono::Duration::from_std(REFRESH_EARLY).unwrap_or_default() > Utc::now());
             if fresh {
                 return Ok(c.keys.clone());
             }

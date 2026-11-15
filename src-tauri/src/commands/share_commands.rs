@@ -47,7 +47,7 @@ impl SharingPolicy {
         if o.allow_edit && !self.allow_edit {
             return refuse("links can't allow editing");
         }
-        if o.scope == ShareScope::Anyone && self.require_password && o.password.as_deref().map_or(true, str::is_empty) {
+        if o.scope == ShareScope::Anyone && self.require_password && o.password.as_deref().is_none_or(str::is_empty) {
             return refuse("links anyone can open need a password");
         }
         match (o.expires_in_secs, self.max_expiry_days) {

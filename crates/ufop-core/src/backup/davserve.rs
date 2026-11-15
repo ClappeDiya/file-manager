@@ -423,7 +423,7 @@ fn send_file(w: &mut dyn Write, content: &DavContent, e: &FileEntry, name: &str,
     if req.headers.get("if-none-match").is_some_and(|v| v.split(',').any(|t| t.trim() == tag || t.trim() == "*")) {
         return respond(w, 304, "Not Modified", &[("ETag", tag)], b"", true, false);
     }
-    let if_range_ok = req.headers.get("if-range").map_or(true, |v| *v == tag);
+    let if_range_ok = req.headers.get("if-range").is_none_or(|v| *v == tag);
     let range = if if_range_ok { webdav::parse_range(req.headers.get("range").map(String::as_str), len) } else { None };
     let (code, reason, start, count) = match range {
         Some(Err(())) => return respond(w, 416, "Range Not Satisfiable", &[("Content-Range", format!("bytes */{len}"))], b"", false, false),

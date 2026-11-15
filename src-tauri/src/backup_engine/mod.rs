@@ -1612,7 +1612,7 @@ impl BackupManager {
     pub async fn test_secret_providers(&self, provider_id: Option<String>, probe: Vec<String>) -> Result<Vec<secrets::ProviderTest>, AppError> {
         let settings = self.secret_settings().await?;
         let mut out = Vec::new();
-        for p in settings.providers.iter().filter(|p| provider_id.as_deref().map_or(true, |id| id == p.id)) {
+        for p in settings.providers.iter().filter(|p| provider_id.as_deref().is_none_or(|id| id == p.id)) {
             let mut t = secrets::ProviderTest { provider_id: p.id.clone(), provider: p.name.clone(), kind: p.kind.label().into(), ..Default::default() };
             let cred = if p.kind.needs_credential() { self.destination_secret(&p.credential_id).await? } else { None };
             t.has_credential = !p.kind.needs_credential() || cred.as_deref().is_some_and(|c| !c.is_empty());
@@ -1944,7 +1944,7 @@ impl BackupManager {
             for r in j.replicas.iter().filter(|r| r.enabled) {
                 if let ReplicaSchedule::Interval { minutes } = r.schedule {
                     let last = r.last_run.as_deref().and_then(parse_ts);
-                    if last.map_or(true, |l| now - l >= chrono::Duration::minutes(minutes as i64)) {
+                    if last.is_none_or(|l| now - l >= chrono::Duration::minutes(minutes as i64)) {
                         out.push((j.id.clone(), r.id.clone()));
                     }
                 }
@@ -2484,7 +2484,7 @@ impl BackupManager {
                 run_core(&job2, op, backend.as_ref(), &db_path, &dbo, pass.as_deref(), kdf, cache, &ctx)
             })
             .await?;
-            let clean = v.get("errors").and_then(|e| e.as_array()).map_or(true, |a| a.is_empty()) && v.get("dry_run") != Some(&serde_json::Value::Bool(true));
+            let clean = v.get("errors").and_then(|e| e.as_array()).is_none_or(|a| a.is_empty()) && v.get("dry_run") != Some(&serde_json::Value::Bool(true));
             if clean {
                 let mut reps = Vec::new();
                 for id in after {

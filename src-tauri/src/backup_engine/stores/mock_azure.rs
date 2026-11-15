@@ -6,6 +6,7 @@
 //! federated assertion, or the RS256 certificate assertion's signature,
 //! thumbprint and audience; managed-identity endpoints check their headers.
 
+use rustls::pki_types::pem::PemObject;
 use crate::connectors::azure_rest::{DEV_ACCOUNT, DEV_KEY};
 use crate::connectors::azure_tests::expected_signature;
 use axum::body::Bytes;
@@ -53,9 +54,9 @@ fn test_cert() -> (Vec<u8>, Vec<u8>) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/backup_engine/stores/testdata");
     let key_pem = std::fs::read(format!("{dir}/test-rsa-key.pem")).unwrap();
     let cert_pem = std::fs::read(format!("{dir}/test-rsa-cert.pem")).unwrap();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice()).unwrap().unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).unwrap();
     let kp = ring::signature::RsaKeyPair::from_pkcs8(key.secret_der()).unwrap();
-    let cert = rustls_pemfile::certs(&mut cert_pem.as_slice()).next().unwrap().unwrap().to_vec();
+    let cert = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem).next().unwrap().unwrap().to_vec();
     (kp.public().as_ref().to_vec(), cert)
 }
 

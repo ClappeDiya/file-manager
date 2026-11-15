@@ -13,6 +13,7 @@ case "$SERVICE" in admin|marketing) SERVICES=("$SERVICE");; all) SERVICES=(admin
 SHA="$(git rev-parse HEAD)"
 PLATFORM="${BUILD_PLATFORM:-linux/amd64}"
 if [[ "$DRY" == true ]]; then
+  echo "Security gates: pnpm audit --prod; cargo audit for desktop, core and CLI"
   echo "Local gate: bash scripts/verify.sh --ci"
   for service in "${SERVICES[@]}"; do echo "Build ${service}/Dockerfile for $PLATFORM -> ghcr.io/clappediya/filemanager-${service}:sha-${SHA}"; done
   exit 0
@@ -24,6 +25,12 @@ assert_source_unchanged() {
   fi
 }
 assert_source_unchanged
+# Publishing is online and must never inherit the local developer gates' offline skips.
+command -v cargo-audit >/dev/null || { echo "Install cargo-audit before publishing (cargo install cargo-audit --locked)." >&2; exit 1; }
+pnpm audit --prod
+for lockfile in src-tauri/Cargo.lock crates/ufop-core/Cargo.lock cli/Cargo.lock; do
+  cargo audit --file "$lockfile"
+done
 bash scripts/verify.sh --ci
 assert_source_unchanged
 command -v gh >/dev/null

@@ -5,7 +5,7 @@ description = "Unified File Operations Platform - CLI"
 authors = ["UFOP Team"]
 license-file = "../LICENSE"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.100"
 
 [[bin]]
 name = "ufop"
@@ -17,7 +17,7 @@ ufop-core = { path = "../crates/ufop-core", features = ["backup", "agent", "gate
 clap = { version = "4", features = ["derive", "env", "color"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yaml = { package = "serde-saphyr", version = "2.1" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "native-tls", "stream"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -41,6 +41,6 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 [dev-dependencies]
 tempfile = "3"
 # Synthetic Photos libraries in tests (same version ufop-core already links).
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 # Reading archives written by `restore --archive` in tests (same version ufop-core links).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.5", default-features = false, features = ["deflate"] }

@@ -1931,7 +1931,7 @@ mod tests {
                 let mut best: Option<live_files::LiveFiles> = None;
                 for _ in 0..20_000 {
                     if let Some(snap) = mgr.live_files(id, 50) {
-                        if snap.finished_total > 0 && best.as_ref().map_or(true, |b| snap.finished_total > b.finished_total) {
+                        if snap.finished_total > 0 && best.as_ref().is_none_or(|b| snap.finished_total > b.finished_total) {
                             best = Some(snap);
                         }
                     }

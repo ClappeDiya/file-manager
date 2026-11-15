@@ -631,7 +631,7 @@ async fn bug_report_is_sanitized_and_diagnostics_detect_problems() {
         let text = String::from_utf8_lossy(&b).into_owned();
         for leak in ["alicesecret", "budgetzz", "tok3n", "k3y", "alice@example.com", "bob@example.com", t.path().to_str().unwrap()] {
             let at = text.find(leak).map(|p| &text[p.saturating_sub(60)..(p + 60).min(text.len())]);
-            assert!(at.is_none(), "{leak} leaked into {}: {at:?}", f.name());
+            assert!(at.is_none(), "{leak} leaked into {}: {at:?}", f.name().unwrap());
         }
         all.push_str(&text);
     }

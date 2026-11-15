@@ -337,7 +337,7 @@ pub fn read_block_volume(payload: &[u8]) -> Result<HashMap<String, Vec<u8>>, App
             // Sizes come from the (possibly damaged) file: never trust them for allocation.
             let mut v = Vec::with_capacity((f.size() as usize).min(payload.len().saturating_mul(4)).min(64 << 20));
             f.read_to_end(&mut v).map_err(|_| AppError::transfer("ZIP block volume is corrupt", "Run Verify and Repair on this backup."))?;
-            out.insert(f.name().to_string(), v);
+            out.insert(f.name().map_err(corrupt)?.into_owned(), v);
         }
         return Ok(out);
     }
@@ -413,7 +413,7 @@ pub fn list_block_volume(payload: &[u8]) -> Result<Vec<StoredBlock>, AppError> {
         let mut out = Vec::with_capacity(a.len());
         for i in 0..a.len() {
             let f = a.by_index_raw(i).map_err(corrupt)?;
-            out.push(StoredBlock { hash: f.name().to_string(), codec: f.compression().to_string().to_ascii_lowercase(), stored_size: f.compressed_size(), size: f.size() });
+            out.push(StoredBlock { hash: f.name().map_err(corrupt)?.into_owned(), codec: f.compression().to_string().to_ascii_lowercase(), stored_size: f.compressed_size(), size: f.size() });
         }
         return Ok(out);
     }

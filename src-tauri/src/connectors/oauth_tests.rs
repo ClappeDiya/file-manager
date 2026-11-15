@@ -24,7 +24,7 @@ fn token_endpoint(r: &Seen, refreshes: &AtomicU32) -> Response {
     let f = r.form();
     match f.get("grant_type").map(String::as_str) {
         Some("authorization_code") if f.get("code").map(String::as_str) == Some("c1") => {
-            if f.get("code_verifier").map_or(true, |v| v.len() < 43) {
+            if f.get("code_verifier").is_none_or(|v| v.len() < 43) {
                 return status(400, r#"{"error":"invalid_request","error_description":"PKCE verifier missing"}"#);
             }
             json(j!({ "access_token": "a1", "refresh_token": "r1", "expires_in": 3600, "token_type": "Bearer" }))

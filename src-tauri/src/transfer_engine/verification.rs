@@ -334,7 +334,7 @@ fn sync_to_disk_blocking(path: &str) -> Result<(), AppError> {
 pub fn should_fsync(tier: VerifyTier, chunk_index: u32, fsync_interval: u32) -> bool {
     match tier {
         VerifyTier::Fast => false, // fsync once at the end
-        VerifyTier::Verified => (chunk_index + 1) % fsync_interval == 0,
+        VerifyTier::Verified => (chunk_index + 1).is_multiple_of(fsync_interval),
         VerifyTier::MissionCritical => true, // every chunk
     }
 }
@@ -490,7 +490,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, AppError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(AppError::Transfer {
             message: "Invalid hex string length".to_string(),
             advice: "Internal error.".to_string(),

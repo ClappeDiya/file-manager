@@ -89,7 +89,7 @@ fn type_name(name: &str) -> &str {
 
 /// A body whose fields are all optional may be left out.
 fn body_optional(schema: &Value) -> bool {
-    schema["type"] == "object" && schema["required"].as_array().map_or(true, |r| r.is_empty())
+    schema["type"] == "object" && schema["required"].as_array().is_none_or(|r| r.is_empty())
 }
 
 // ── TypeScript ──

@@ -39,10 +39,15 @@ export default function PrivacyPage() {
 
       <h2 className="text-xl font-bold text-foreground mt-8">Your credentials</h2>
       <p>
-        Cloud-storage API tokens, SSH keys, and OAuth refresh tokens you configure in the desktop app are stored
-        in your operating system's keychain. They never reach our servers and never appear in our logs. If our
-        infrastructure were fully compromised tomorrow, your credentials would not be exposed because we do not
-        have them.
+        Credentials entered in a personal desktop connection are not automatically uploaded to our hosted
+        console. The desktop uses the operating system's credential store or an encrypted portable vault for
+        supported saved secrets.
+      </p>
+      <p>
+        If your organization provisions a managed connector, its chosen admin console also stores an encrypted
+        copy of that credential and delivers it to enrolled desktops that an organization administrator has
+        explicitly granted access. Removing a grant removes the managed connection and delivered secret when
+        the desktop next synchronizes successfully. The storage provider controls its own account permissions.
       </p>
 
       <h2 className="text-xl font-bold text-foreground mt-8">Business / Enterprise plans</h2>

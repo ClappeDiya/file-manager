@@ -10,7 +10,7 @@ The `ufop` command-line interface provides scriptable access to the Unified File
 
 ### Installation
 
-The CLI is distributed as a standalone binary. It requires Rust 1.77 or later to build from source.
+The CLI is distributed as a standalone binary. Source builds use the repository’s pinned Rust 1.100 toolchain, including the patched database and archive dependencies.
 
 ```bash
 # Build from source

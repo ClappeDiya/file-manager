@@ -4,6 +4,7 @@
 //! storage calls need a token it issued, and writes need a token whose
 //! scope allows writing (as GCS enforces).
 
+use rustls::pki_types::pem::PemObject;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -37,7 +38,7 @@ fn b64url(s: &str) -> Vec<u8> {
 
 fn jwt_ok(jwt: &str, aud: &str) -> Option<String> {
     let pem = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backup_engine/stores/testdata/test-rsa-key.pem")).ok()?;
-    let key = rustls_pemfile::private_key(&mut pem.as_slice()).ok()??;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&pem).ok()?;
     let public = ring::signature::RsaKeyPair::from_pkcs8(key.secret_der()).ok()?.public().as_ref().to_vec();
     let p: Vec<&str> = jwt.split('.').collect();
     let claims: serde_json::Value = serde_json::from_slice(&b64url(p.get(1)?)).ok()?;

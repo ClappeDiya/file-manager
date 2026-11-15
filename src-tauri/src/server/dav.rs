@@ -185,7 +185,7 @@ async fn send_file(path: &Path, m: &std::fs::Metadata, name: &str, headers: &Hea
     if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).is_some_and(|v| v.split(',').any(|t| t.trim() == tag || t.trim() == "*")) {
         return StatusCode::NOT_MODIFIED.into_response();
     }
-    let if_range_ok = headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()).map_or(true, |v| v == tag);
+    let if_range_ok = headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()).is_none_or(|v| v == tag);
     let range = if if_range_ok { byte_range(headers, len) } else { None };
     let (status, start, count) = match range {
         Some(Err(())) => {

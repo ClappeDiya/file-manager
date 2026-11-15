@@ -1161,7 +1161,7 @@ mod tests {
                 let mut f = z.by_index(i).unwrap();
                 let mut v = Vec::new();
                 std::io::Read::read_to_end(&mut f, &mut v).unwrap();
-                out.push((f.name().to_string(), v));
+                out.push((f.name().unwrap().into_owned(), v));
             }
         } else {
             let r: Box<dyn std::io::Read> = if n.ends_with(".tar") { Box::new(std::fs::File::open(path).unwrap()) } else { Box::new(flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())) };

@@ -70,7 +70,7 @@ pub fn extract_text(path: &Path, max_chars: usize) -> Result<Option<String>, Str
         _ => {
             let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
             let mut zip = zip::ZipArchive::new(f).map_err(|e| format!("not a valid {ext} file: {e}"))?;
-            let names: Vec<String> = zip.file_names().map(String::from).collect();
+            let names: Vec<String> = zip.file_names().map(|name| name.map(|name| name.into_owned())).collect::<Result<_, _>>().map_err(|e| format!("invalid {ext} archive filename: {e}"))?;
             let mut entry = |name: &str| -> Result<Option<String>, String> {
                 let Ok(mut e) = zip.by_name(name) else { return Ok(None) };
                 let mut s = String::new();

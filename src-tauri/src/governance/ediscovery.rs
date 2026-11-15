@@ -139,7 +139,7 @@ pub async fn export(req: &EDiscoveryRequest, mgr: &BackupManager, ledger: &Opera
         return Err(AppError::validation("Give the matter or case reference"));
     }
     let output = PathBuf::from(req.output.trim());
-    if output.as_os_str().is_empty() || output.extension().map_or(true, |e| !e.eq_ignore_ascii_case("zip")) {
+    if output.as_os_str().is_empty() || output.extension().is_none_or(|e| !e.eq_ignore_ascii_case("zip")) {
         return Err(AppError::validation("Choose where to save the export (a .zip file)"));
     }
     if output.exists() {

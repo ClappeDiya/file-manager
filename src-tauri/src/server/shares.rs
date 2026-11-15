@@ -790,11 +790,11 @@ async fn create_share(State(st): State<ServerState>, Json(n): Json<NewShare>) ->
     if policy.locked && n.kind.uploads() {
         return Err(bad("This folder is locked: it takes no upload links").into());
     }
-    if policy.require_link_password && n.password.as_deref().map_or(true, str::is_empty) {
+    if policy.require_link_password && n.password.as_deref().is_none_or(str::is_empty) {
         return Err(bad("Links to this folder need a password").into());
     }
     if let Some(max) = policy.max_link_days {
-        if n.expires_in_days.map_or(true, |d| d > max) {
+        if n.expires_in_days.is_none_or(|d| d > max) {
             return Err(bad(format!("Links to this folder must expire within {max} days")).into());
         }
     }

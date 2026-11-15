@@ -64,10 +64,10 @@ pub fn parse_envelope(text: &str) -> Envelope {
             if kind == "events_api" {
                 event_id = v["payload"]["event_id"].as_str().map(str::to_string);
                 let e = &v["payload"]["event"];
-                let is_message = e["type"] == "message" && e.get("subtype").map_or(true, Value::is_null);
+                let is_message = e["type"] == "message" && e.get("subtype").is_none_or(Value::is_null);
                 let is_mention = e["type"] == "app_mention";
                 // Not our own or another bot's messages: that is how reply loops start.
-                if (is_message || is_mention) && e.get("bot_id").map_or(true, Value::is_null) {
+                if (is_message || is_mention) && e.get("bot_id").is_none_or(Value::is_null) {
                     if let (Some(user), Some(channel), Some(text)) = (e["user"].as_str(), e["channel"].as_str(), e["text"].as_str()) {
                         message_key = e["ts"].as_str().map(|ts| format!("{channel}:{ts}"));
                         incoming = Some(Incoming { dialect: Dialect::Slack, sender: user.to_string(), chat: channel.to_string(), text: text.to_string() });
@@ -138,8 +138,8 @@ impl Seen {
 /// or the other event type of the same post (same channel and timestamp).
 /// Both are remembered either way.
 fn is_repeat(seen: &mut Seen, event_id: Option<&str>, message_key: Option<&str>) -> bool {
-    let new_event = event_id.map_or(true, |id| seen.first_time(id));
-    let new_message = message_key.map_or(true, |key| seen.first_time(&format!("msg:{key}")));
+    let new_event = event_id.is_none_or(|id| seen.first_time(id));
+    let new_message = message_key.is_none_or(|key| seen.first_time(&format!("msg:{key}")));
     !(new_event && new_message)
 }
 

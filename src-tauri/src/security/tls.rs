@@ -9,6 +9,7 @@
 //! These helpers are used by connectors to verify and configure transport
 //! security before establishing connections.
 
+use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 
 use crate::core::error::AppError;
@@ -463,7 +464,7 @@ pub fn client_config(accept_invalid: bool, ca_pem: Option<&str>, pins: &[String]
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut exact: Vec<Vec<u8>> = Vec::new();
     if let Some(pem) = ca_pem.filter(|p| !p.trim().is_empty()) {
-        for c in rustls_pemfile::certs(&mut pem.as_bytes()).flatten() {
+        for c in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()).flatten() {
             exact.push(c.as_ref().to_vec());
             let _ = roots.add(c);
         }
@@ -680,7 +681,7 @@ mod pinning_tests {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let app = axum::Router::new().route("/", axum::routing::get(|| async { "pinned-ok" }));
-        tokio::spawn(axum_server::from_tcp_rustls(l, cfg).serve(app.into_make_service()));
+        tokio::spawn(axum_server::from_tcp_rustls(l, cfg).unwrap().serve(app.into_make_service()));
 
         assert_eq!(fetch_fingerprint("localhost", port, std::time::Duration::from_secs(5)).await.unwrap(), fp);
         let url = format!("https://localhost:{port}/");

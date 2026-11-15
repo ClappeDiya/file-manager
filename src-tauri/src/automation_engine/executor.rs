@@ -349,7 +349,7 @@ pub fn action_kind(action: &RuleAction) -> &'static str {
 pub(crate) fn hands_on_path(action: &RuleAction) -> bool {
     match action {
         // A download sent straight to a remote leaves no local file to hand on.
-        RuleAction::DownloadUrl { destination_connection_id, .. } => destination_connection_id.as_deref().map_or(true, |c| c.trim().is_empty()),
+        RuleAction::DownloadUrl { destination_connection_id, .. } => destination_connection_id.as_deref().is_none_or(|c| c.trim().is_empty()),
         _ => matches!(action, RuleAction::MoveFile { .. } | RuleAction::RenameFile { .. } | RuleAction::ConvertImage { .. } | RuleAction::ConvertDocument { .. }),
     }
 }

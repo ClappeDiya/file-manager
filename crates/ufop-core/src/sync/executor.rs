@@ -942,7 +942,7 @@ fn step_result_in_place(pair: &SyncPair, checkpoint: &SyncCheckpoint, entry: &Sy
     }
     let slack = chrono::Duration::seconds(2);
     match (mtime, step.done_at) {
-        (Some(m), Some(done)) => m <= done + slack && checkpoint.started_at.map_or(true, |s| m >= s - slack),
+        (Some(m), Some(done)) => m <= done + slack && checkpoint.started_at.is_none_or(|s| m >= s - slack),
         _ => false,
     }
 }
