@@ -8,7 +8,7 @@
 import { PasswordInput } from "@/components/password-input";
 import { fieldValue, isSecret, optionExamples, visibleOptions, type RcloneOption, type RcloneProvider } from "@/lib/rclone";
 
-const input = "w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900";
+const input = "w-full text-sm px-2 py-1.5 rounded border border-[var(--color-border)] bg-[var(--color-input-bg)]";
 
 /** First paragraph of rclone's help text. */
 function shortHelp(help: string): string {
@@ -33,12 +33,12 @@ function OptionField({
   const label = (
     <label htmlFor={id} className="block text-xs font-medium mb-1">
       {option.name}
-      {option.required && <span className="text-red-500"> *</span>}
-      {option.advanced && <span className="ml-1 text-[10px] text-gray-400">advanced</span>}
+      {option.required && <span className="text-[color:var(--color-error-foreground)]"> *</span>}
+      {option.advanced && <span className="ml-1 text-[10px] text-[color:var(--color-text-secondary)]">advanced</span>}
     </label>
   );
   const hint = (
-    <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5" title={option.help}>
+    <p className="text-[10px] text-[color:var(--color-text-secondary)] mt-0.5" title={option.help}>
       {shortHelp(option.help)}
       {isSecret(option) && secretSet && " — stored; leave blank to keep it."}
     </p>
@@ -136,10 +136,10 @@ export function RcloneSchemaForm({
   );
   return (
     <div className="space-y-2" data-testid="rclone-schema-form">
-      {basic.length === 0 && <p className="text-xs text-gray-500">This backend needs no settings.</p>}
+      {basic.length === 0 && <p className="text-xs text-[color:var(--color-text-secondary)]">This backend needs no settings.</p>}
       {basic.map(field)}
       {extra.length > 0 && (
-        <details className="rounded border border-gray-200 dark:border-gray-700 p-2" data-testid="rclone-advanced-options">
+        <details className="rounded border border-[var(--color-border)] p-2" data-testid="rclone-advanced-options">
           <summary className="text-xs font-medium cursor-pointer">Advanced options ({extra.length})</summary>
           <div className="space-y-2 mt-2">{extra.map(field)}</div>
         </details>

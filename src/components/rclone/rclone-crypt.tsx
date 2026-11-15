@@ -64,11 +64,11 @@ export function CryptNamesDialog({ remote, onClose }: { remote: string; onClose:
   };
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40" role="dialog" aria-modal="true" aria-label="Encrypt or decrypt names" onClick={onClose}>
-      <div className="w-[min(560px,92vw)] rounded-lg bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+      <div className="w-[min(560px,92vw)] rounded-lg bg-[var(--color-input-bg)] border border-[var(--color-border)] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
         <h3 className="text-sm font-semibold">
           File names of <span className="font-mono">{remote}</span>
         </h3>
-        <p className="text-xs text-gray-500">Translated offline with this remote's keys; nothing on the storage is read or changed.</p>
+        <p className="text-xs text-[color:var(--color-text-secondary)]">Translated offline with this remote's keys; nothing on the storage is read or changed.</p>
         <div className="flex gap-3 text-xs" role="radiogroup" aria-label="Direction">
           <label className="flex items-center gap-1">
             <input type="radio" checked={!reverse} onChange={() => setReverse(false)} /> Decrypt (encrypted → real names)
@@ -83,10 +83,10 @@ export function CryptNamesDialog({ remote, onClose }: { remote: string; onClose:
           onChange={(e) => setText(e.target.value)}
           rows={5}
           placeholder={reverse ? "Documents/report.pdf" : "1tbpm0eqlu3hsb7bfd5fcn16c8/eq7kknqitracs7oj959q9alb5c"}
-          className="w-full text-xs font-mono px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-950"
+          className="w-full text-xs font-mono px-2 py-1.5 rounded border border-[var(--color-border)] bg-[var(--color-input-bg)]"
         />
         {error && (
-          <p className="text-xs text-red-600" role="alert">
+          <p className="text-xs text-[color:var(--color-error-foreground)]" role="alert">
             {error}
           </p>
         )}
@@ -94,19 +94,19 @@ export function CryptNamesDialog({ remote, onClose }: { remote: string; onClose:
           <table className="w-full text-xs font-mono" data-testid="crypt-results">
             <tbody>
               {results.map((r) => (
-                <tr key={r.input} className="border-t border-gray-100 dark:border-gray-800">
+                <tr key={r.input} className="border-t border-[var(--color-border)]">
                   <td className="py-0.5 pr-2 break-all">{r.input}</td>
-                  <td className={`py-0.5 break-all ${r.error ? "text-red-600" : ""}`}>{r.output ?? r.error}</td>
+                  <td className={`py-0.5 break-all ${r.error ? "text-[color:var(--color-error-foreground)]" : ""}`}>{r.output ?? r.error}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
         <div className="flex justify-end gap-2">
-          <button type="button" className="text-xs px-3 py-1 rounded border border-gray-300 dark:border-gray-600" onClick={onClose}>
+          <button type="button" className="text-xs px-3 py-1 rounded border border-[var(--color-border)]" onClick={onClose}>
             Close
           </button>
-          <button type="button" className="text-xs px-3 py-1 rounded bg-blue-500 text-white disabled:opacity-50" disabled={busy || !text.trim()} onClick={() => void go()}>
+          <button type="button" className="text-xs px-3 py-1 rounded bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] disabled:opacity-50" disabled={busy || !text.trim()} onClick={() => void go()}>
             {busy ? "Working…" : reverse ? "Encrypt names" : "Decrypt names"}
           </button>
         </div>

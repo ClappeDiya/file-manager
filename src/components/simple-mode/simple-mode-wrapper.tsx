@@ -372,9 +372,11 @@ function SimpleSettingsView({
   }, [settingsRequest]);
   const fullSettingsRef = useRef<HTMLButtonElement>(null);
   const openSettingsRef = useRef<HTMLButtonElement>(null);
+  const wasAllSettings = useRef(allSettings);
   useEffect(() => {
     if (allSettings) fullSettingsRef.current?.focus();
-    else openSettingsRef.current?.focus();
+    else if (wasAllSettings.current) openSettingsRef.current?.focus();
+    wasAllSettings.current = allSettings;
   }, [allSettings]);
   const appMode = useUIStore((s) => s.appMode);
   const setAppMode = useUIStore((s) => s.setAppMode);
@@ -413,15 +415,6 @@ function SimpleSettingsView({
       </h2>
 
       <div className="space-y-6">
-        <div className="space-y-2">
-          <Button ref={openSettingsRef} onClick={() => setAllSettings(true)}>
-            All settings
-          </Button>
-          <p className="text-xs text-[color:var(--color-text-secondary)]">
-            Connections, console enrollment, privacy, startup, notifications and
-            diagnostics.
-          </p>
-        </div>
         <fieldset className="space-y-3">
           <legend className="text-sm font-medium">Sidebar layout</legend>
           <p
@@ -468,20 +461,6 @@ function SimpleSettingsView({
               </label>
             ))}
           </div>
-          <div
-            className="rounded-md border border-[var(--color-border)] p-3 text-xs text-[color:var(--color-text-secondary)]"
-            aria-label="Sidebar preview"
-          >
-            <p className="font-medium text-[color:var(--color-text)] mb-1">
-              {draftMode === "simple" ? "Basic" : "Advanced"} preview
-            </p>
-            <p>Files · Search · Favorites · All features</p>
-            <p>Transfers · Backups & Restore · Sync · Cloud & Servers</p>
-            {draftMode === "advanced" && (
-              <p>Automation & AI · Security & Sharing · Tools & Diagnostics</p>
-            )}
-            <p>Activity · Settings</p>
-          </div>
           <div className="flex flex-wrap items-center gap-3">
             <Button
               disabled={draftMode === appMode}
@@ -515,6 +494,21 @@ function SimpleSettingsView({
                 ? `Current layout: ${appMode === "simple" ? "Basic" : "Advanced"}.`
                 : "Preview only. Apply to update the sidebar.")}
           </p>
+          <details
+            className="rounded-md border border-[var(--color-border)] p-3 text-xs text-[color:var(--color-text-secondary)]"
+            aria-label="Sidebar preview"
+          >
+            <summary className="cursor-pointer font-medium text-[color:var(--color-text)] mb-1">
+              Preview {draftMode === "simple" ? "Basic" : "Advanced"} sidebar
+              items
+            </summary>
+            <p>Files · Search · Favorites · All features</p>
+            <p>Transfers · Backups & Restore · Sync · Cloud & Servers</p>
+            {draftMode === "advanced" && (
+              <p>Automation & AI · Security & Sharing · Tools & Diagnostics</p>
+            )}
+            <p>Activity · Settings</p>
+          </details>
         </fieldset>
 
         {/* Theme */}
@@ -546,6 +540,15 @@ function SimpleSettingsView({
           </div>
         </div>
 
+        <div className="space-y-2">
+          <Button ref={openSettingsRef} onClick={() => setAllSettings(true)}>
+            All settings
+          </Button>
+          <p className="text-xs text-[color:var(--color-text-secondary)]">
+            Connections, console enrollment, privacy, startup, notifications and
+            diagnostics.
+          </p>
+        </div>
         {/* Getting Started */}
         {onOpenOnboarding && (
           <div className="space-y-2">

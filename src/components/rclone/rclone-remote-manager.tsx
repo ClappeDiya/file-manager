@@ -45,9 +45,9 @@ import {
 } from "@/lib/rclone";
 import { useUIStore } from "@/stores/ui-store";
 
-const input = "w-full text-sm px-2 py-1.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900";
-const btn = "text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50";
-const primary = "text-xs px-3 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50";
+const input = "w-full text-sm px-2 py-1.5 rounded border border-[var(--color-border)] bg-[var(--color-input-bg)]";
+const btn = "text-xs px-2 py-1 rounded border border-[var(--color-border)] hover:bg-[var(--color-hover-bg)] disabled:opacity-50";
+const primary = "text-xs px-3 py-1 rounded bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:bg-[var(--color-primary-hover)] disabled:opacity-50";
 
 type Mode =
   | { kind: "list" }
@@ -214,7 +214,7 @@ export function RcloneRemoteManager({
       {setupOpen && <div className="fixed inset-0 z-[100] bg-[var(--color-bg-overlay)] p-3 flex items-center justify-center" onClick={() => setSetupOpen(false)}><div ref={setupRef} role="dialog" aria-modal="true" aria-labelledby="rclone-setup-heading" className="w-full max-w-xl max-h-full overflow-auto rounded-xl border border-[var(--color-border)] bg-[var(--color-bg)] p-5" onClick={e => e.stopPropagation()}><h2 id="rclone-setup-heading" className="font-semibold text-lg">Set up rclone</h2><p className="text-sm text-[color:var(--color-text-secondary)] mt-1">Install rclone below, or choose a program already on this computer.</p><RcloneSettingsSection /><Button className="mt-4" onClick={() => { setSetupOpen(false); void load(); }}>Back to remotes and check</Button></div></div>}
 
       {error && (
-        <p className="text-xs text-red-600 dark:text-red-400" role="alert">
+        <p className="text-xs text-[color:var(--color-error-foreground)]" role="alert">
           {error}
         </p>
       )}
@@ -314,17 +314,17 @@ export function RcloneRemoteManager({
       )}
 
       {mode.kind === "signing-in" && (
-        <div className="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 p-3 space-y-2" data-testid="rclone-signing-in">
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-info-bg)] p-3 space-y-2" data-testid="rclone-signing-in">
           <p className="text-sm">Finish signing in to {mode.type} in your browser. This window updates when you are done.</p>
           {mode.url ? (
             <p className="text-xs">
               Browser did not open?{" "}
-              <a href={mode.url} target="_blank" rel="noreferrer" className="text-blue-600 dark:text-blue-400 underline break-all">
+              <a href={mode.url} target="_blank" rel="noreferrer" className="text-[color:var(--color-link)] underline break-all">
                 Open the sign-in page
               </a>
             </p>
           ) : (
-            <p className="text-xs text-gray-500">Starting rclone's sign-in…</p>
+            <p className="text-xs text-[color:var(--color-text-secondary)]">Starting rclone's sign-in…</p>
           )}
           <button type="button" className={btn} onClick={() => void cancelRcloneSignIn(mode.name)}>
             Cancel sign-in
@@ -333,7 +333,7 @@ export function RcloneRemoteManager({
       )}
 
       {mode.kind === "done" && (
-        <div className="rounded border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 p-3 space-y-2" data-testid="rclone-done">
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-success-bg)] p-3 space-y-2" data-testid="rclone-done">
           <p className="text-sm">
             Remote <span className="font-mono">{mode.name}:</span> {mode.created ? "was created" : "was updated"}.
           </p>
@@ -372,13 +372,13 @@ export function RcloneRemoteManager({
 
 function TestResult({ result }: { result: RcloneRemoteTest | "running" | undefined }) {
   if (!result) return null;
-  if (result === "running") return <p className="text-xs text-gray-500">Testing…</p>;
+  if (result === "running") return <p className="text-xs text-[color:var(--color-text-secondary)]">Testing…</p>;
   return result.ok ? (
-    <p className="text-xs text-green-600 dark:text-green-400" data-testid="rclone-test-ok">
+    <p className="text-xs text-[color:var(--color-success-foreground)]" data-testid="rclone-test-ok">
       Works: {result.entries} item{result.entries === 1 ? "" : "s"} at the top ({result.millis} ms)
     </p>
   ) : (
-    <p className="text-xs text-red-600 dark:text-red-400" data-testid="rclone-test-failed">
+    <p className="text-xs text-[color:var(--color-error-foreground)]" data-testid="rclone-test-failed">
       Failed: {result.error}
     </p>
   );
@@ -403,19 +403,19 @@ function RemoteList({
   onAddConnection?: (name: string) => void;
   onCryptNames: (name: string) => void;
 }) {
-  if (remotes === null) return <p className="text-xs text-gray-400">Loading…</p>;
+  if (remotes === null) return <p className="text-xs text-[color:var(--color-text-secondary)]">Loading…</p>;
   if (remotes.length === 0)
-    return <p className="text-xs text-gray-500">No rclone remotes yet. Create one with “New remote”; it is saved in rclone.conf.</p>;
+    return <p className="text-xs text-[color:var(--color-text-secondary)]">No rclone remotes yet. Create one with “New remote”; it is saved in rclone.conf.</p>;
   return (
-    <ul className="divide-y divide-gray-200 dark:divide-gray-700 border border-gray-200 dark:border-gray-700 rounded">
+    <ul className="divide-y divide-[var(--color-border)] border border-[var(--color-border)] rounded">
       {remotes.map((r) => {
         const name = bare(r.name);
         return (
           <li key={r.name} className="px-2 py-1.5 space-y-1" data-testid={`rclone-remote-${name}`}>
             <div className="flex items-center gap-2">
               <span className="font-mono text-sm truncate">{r.name}</span>
-              <span className="text-[10px] uppercase text-gray-400">{r.backend}</span>
-              {r.backend === "crypt" && <span className="text-[10px] rounded bg-amber-100 dark:bg-amber-900/40 px-1">encrypted</span>}
+              <span className="text-[10px] uppercase text-[color:var(--color-text-secondary)]">{r.backend}</span>
+              {r.backend === "crypt" && <span className="text-[10px] rounded bg-[var(--color-warning-bg)] px-1">encrypted</span>}
               <div className="ml-auto flex gap-1">
                 <button type="button" className={btn} onClick={() => onTest(name)}>
                   Test
@@ -433,7 +433,7 @@ function RemoteList({
                     Names…
                   </button>
                 )}
-                <button type="button" className={`${btn} text-red-600`} onClick={() => onDelete(name)}>
+                <button type="button" className={`${btn} text-[color:var(--color-error-foreground)]`} onClick={() => onDelete(name)}>
                   Delete
                 </button>
               </div>
@@ -501,11 +501,11 @@ function CreateRemote({
           All storage types ({list.length})
         </label>
         <input id="rclone-type-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search, e.g. sftp, s3, drive" className={input} />
-        <ul className="max-h-64 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded divide-y divide-gray-100 dark:divide-gray-800">
+        <ul className="max-h-64 overflow-y-auto border border-[var(--color-border)] rounded divide-y divide-[var(--color-border)]">
           {list.map((p) => (
             <li key={p.name}>
-              <button type="button" className="w-full text-left px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800" onClick={() => onType(p.name)}>
-                <span className="font-mono">{p.name}</span> <span className="text-gray-500">— {p.description}</span>
+              <button type="button" className="w-full text-left px-2 py-1 text-xs hover:bg-[var(--color-hover-bg)]" onClick={() => onType(p.name)}>
+                <span className="font-mono">{p.name}</span> <span className="text-[color:var(--color-text-secondary)]">— {p.description}</span>
               </button>
             </li>
           ))}
@@ -530,7 +530,7 @@ function CreateRemote({
     <form className="space-y-2" onSubmit={submit} data-testid="rclone-create-form">
       <div className="flex items-center gap-2">
         <span className="text-xs">
-          Type: <span className="font-mono">{provider.name}</span> <span className="text-gray-500">— {provider.description}</span>
+          Type: <span className="font-mono">{provider.name}</span> <span className="text-[color:var(--color-text-secondary)]">— {provider.description}</span>
         </span>
         <button type="button" className={`${btn} ml-auto`} onClick={() => onType(null)}>
           Change
@@ -549,7 +549,7 @@ function CreateRemote({
           Passwords above are already obscured (<span className="font-mono">rclone obscure</span>); store them as typed
         </label>
       )}
-      {problem && <p className="text-xs text-red-600 dark:text-red-400">{problem}</p>}
+      {problem && <p className="text-xs text-[color:var(--color-error-foreground)]">{problem}</p>}
       <button type="submit" className={primary} disabled={busy}>
         {busy ? "Creating…" : "Create remote"}
       </button>
@@ -583,9 +583,9 @@ function EditRemote({
       (e) => setProblem(errorText(e)),
     );
   }, [name]);
-  if (!details) return <p className="text-xs text-gray-400">{problem ?? "Loading…"}</p>;
+  if (!details) return <p className="text-xs text-[color:var(--color-text-secondary)]">{problem ?? "Loading…"}</p>;
   const provider = findProvider(providers, details.type);
-  if (!provider) return <p className="text-xs text-red-600">This rclone has no “{details.type}” backend; edit the remote with `rclone config`.</p>;
+  if (!provider) return <p className="text-xs text-[color:var(--color-error-foreground)]">This rclone has no “{details.type}” backend; edit the remote with `rclone config`.</p>;
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     const options = visibleOptions(provider, values, advanced);
@@ -608,7 +608,7 @@ function EditRemote({
           New passwords are already obscured
         </label>
       )}
-      {problem && <p className="text-xs text-red-600 dark:text-red-400">{problem}</p>}
+      {problem && <p className="text-xs text-[color:var(--color-error-foreground)]">{problem}</p>}
       <button type="submit" className={primary} disabled={busy}>
         {busy ? "Saving…" : "Save"}
       </button>
@@ -636,8 +636,8 @@ function Question({
   useEffect(() => setAnswer(mode.step.option?.default ?? ""), [mode.step]);
   const oauth = isOAuthQuestion(mode.step) && !mode.manual;
   return (
-    <div className="space-y-2 rounded border border-gray-200 dark:border-gray-700 p-3" data-testid="rclone-question">
-      {mode.step.error && <p className="text-xs text-red-600 dark:text-red-400">{mode.step.error}</p>}
+    <div className="space-y-2 rounded border border-[var(--color-border)] p-3" data-testid="rclone-question">
+      {mode.step.error && <p className="text-xs text-[color:var(--color-error-foreground)]">{mode.step.error}</p>}
       {oauth ? (
         <>
           <p className="text-sm">
@@ -662,9 +662,9 @@ function Question({
         >
           <label className="block text-xs font-medium" htmlFor="rclone-answer">
             {o.name}
-            {o.required && <span className="text-red-500"> *</span>}
+            {o.required && <span className="text-[color:var(--color-error-foreground)]"> *</span>}
           </label>
-          <p className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap">{o.help}</p>
+          <p className="text-xs text-[color:var(--color-text-secondary)] whitespace-pre-wrap">{o.help}</p>
           {o.examples.length > 0 && o.exclusive ? (
             <select id="rclone-answer" value={answer} onChange={(e) => setAnswer(e.target.value)} className={input}>
               {o.examples.map((ex) => (
@@ -686,7 +686,7 @@ function Question({
         <p className="text-xs">rclone is waiting for more input but sent no question; finish with `rclone config`.</p>
       )}
       {mode.created && (
-        <button type="button" className={`${btn} text-red-600`} onClick={onDiscard} disabled={busy}>
+        <button type="button" className={`${btn} text-[color:var(--color-error-foreground)]`} onClick={onDiscard} disabled={busy}>
           Discard this remote
         </button>
       )}

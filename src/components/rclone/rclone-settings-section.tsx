@@ -21,8 +21,8 @@ import {
   type RcloneStatus,
 } from "@/lib/rclone";
 
-const input = "flex-1 min-w-0 px-2 py-1 text-xs rounded border border-gray-200 dark:border-gray-700 bg-transparent font-mono";
-const btn = "text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50";
+const input = "flex-1 min-w-0 px-2 py-1 text-xs rounded border border-[var(--color-border)] bg-transparent font-mono";
+const btn = "text-xs px-2 py-1 rounded border border-[var(--color-border)] hover:bg-[var(--color-hover-bg)] disabled:opacity-50";
 
 export function RcloneSettingsSection() {
   const [view, setView] = useState<RcloneSettingsView | null>(null);
@@ -58,8 +58,8 @@ export function RcloneSettingsSection() {
     }
   };
 
-  if (!isTauriAvailable()) return <p className="pt-3 text-xs text-gray-400">Available in the desktop app.</p>;
-  if (!view) return <p className="pt-3 text-xs text-gray-400">{error ?? "Loading…"}</p>;
+  if (!isTauriAvailable()) return <p className="pt-3 text-xs text-[color:var(--color-text-secondary)]">Available in the desktop app.</p>;
+  if (!view) return <p className="pt-3 text-xs text-[color:var(--color-text-secondary)]">{error ?? "Loading…"}</p>;
   const s = view.status;
 
   return (
@@ -70,17 +70,17 @@ export function RcloneSettingsSection() {
             Using rclone <span className="font-mono">{s.version}</span> at <span className="font-mono break-all">{s.path}</span> ({s.managed ? "managed copy" : SOURCE_LABEL[s.source]})
           </p>
         ) : (
-          <p className="text-red-600 dark:text-red-400">
+          <p className="text-[color:var(--color-error-foreground)]">
             rclone is not installed{s.source !== "none" ? ` or does not run (${s.path}: ${s.error ?? "no version"})` : ""}. Install it from rclone.org, choose its path below
             {view.platform_supported ? ", or install the managed copy below" : ""}.
           </p>
         )}
         {s.meets_minimum === false && (
-          <p className="text-amber-600 dark:text-amber-400" role="alert" data-testid="rclone-min-warning">
+          <p className="text-[color:var(--color-warning-foreground)]" role="alert" data-testid="rclone-min-warning">
             This rclone is older than {s.min_version}; creating remotes in the app and some features need {s.min_version} or newer. Update rclone.
           </p>
         )}
-        <p className="text-gray-500">Config file: <span className="font-mono break-all">{s.config_path ?? view.default_config_path ?? "rclone's default"}</span></p>
+        <p className="text-[color:var(--color-text-secondary)]">Config file: <span className="font-mono break-all">{s.config_path ?? view.default_config_path ?? "rclone's default"}</span></p>
       </div>
 
       <div className="space-y-1">
@@ -120,13 +120,13 @@ export function RcloneSettingsSection() {
           </button>
         </div>
         {candidates && (
-          <ul className="border border-gray-200 dark:border-gray-700 rounded divide-y divide-gray-100 dark:divide-gray-800" data-testid="rclone-candidates">
-            {candidates.length === 0 && <li className="px-2 py-1 text-gray-500">No rclone found on this computer.</li>}
+          <ul className="border border-[var(--color-border)] rounded divide-y divide-[var(--color-border)]" data-testid="rclone-candidates">
+            {candidates.length === 0 && <li className="px-2 py-1 text-[color:var(--color-text-secondary)]">No rclone found on this computer.</li>}
             {candidates.map((c) => (
               <li key={c.path} className="px-2 py-1 flex items-center gap-2">
                 <span className="font-mono break-all">{c.path}</span>
-                <span className="text-gray-500">{c.version ?? c.error}</span>
-                {c.meets_minimum === false && <span className="text-amber-600">too old</span>}
+                <span className="text-[color:var(--color-text-secondary)]">{c.version ?? c.error}</span>
+                {c.meets_minimum === false && <span className="text-[color:var(--color-warning-foreground)]">too old</span>}
                 <button type="button" className={`${btn} ml-auto`} disabled={!c.version} onClick={() => void save(c.path, config)}>
                   Use
                 </button>
@@ -155,28 +155,28 @@ export function RcloneSettingsSection() {
       </div>
 
       <div className="flex items-center gap-2">
-        <button type="button" className="text-xs px-3 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50" disabled={busy !== null} onClick={() => void save()}>
+        <button type="button" className="text-xs px-3 py-1 rounded bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:bg-[var(--color-primary-hover)] disabled:opacity-50" disabled={busy !== null} onClick={() => void save()}>
           {busy === "save" ? "Saving…" : "Save"}
         </button>
-        {notice && <span className="text-green-600">{notice}</span>}
+        {notice && <span className="text-[color:var(--color-success-foreground)]">{notice}</span>}
       </div>
       {error && (
-        <p className="text-red-600 dark:text-red-400" role="alert">
+        <p className="text-[color:var(--color-error-foreground)]" role="alert">
           {error}
         </p>
       )}
 
-        <div className="space-y-1 border-t border-gray-200 dark:border-gray-700 pt-2" data-testid="rclone-managed">
-          <h4 className="font-semibold">Managed rclone</h4>
-          <p className="text-gray-500">
+        <div className="space-y-1 border-t border-[var(--color-border)] pt-2" data-testid="rclone-managed">
+          <h3 className="font-semibold">Managed rclone</h3>
+          <p className="text-[color:var(--color-text-secondary)]">
             Downloads rclone {view.pinned_version} from downloads.rclone.org, checks it against the release's SHA256SUMS and installs it into{" "}
             <span className="font-mono break-all">{view.managed_dir}</span>. A rclone you installed elsewhere is never replaced.
           </p>
           {view.managed_version && (
             <p>
               Installed: <span className="font-mono">{view.managed_version}</span>
-              {view.update_available && <span className="text-amber-600"> — update to {view.pinned_version} available</span>}
-              {s.managed && <span className="text-gray-500"> (in use)</span>}
+              {view.update_available && <span className="text-[color:var(--color-warning-foreground)]"> — update to {view.pinned_version} available</span>}
+              {s.managed && <span className="text-[color:var(--color-text-secondary)]"> (in use)</span>}
             </p>
           )}
           {/* Installed but another binary chosen: one click back to it. */}
@@ -208,7 +208,7 @@ export function RcloneSettingsSection() {
           >
             {busy === "install" ? "Downloading…" : view.managed_version ? (view.update_available ? `Update to ${view.pinned_version}` : "Up to date") : `Install rclone ${view.pinned_version}`}
           </button>
-          {!view.platform_supported && <p className="text-gray-500">No rclone build is published for this platform.</p>}
+          {!view.platform_supported && <p className="text-[color:var(--color-text-secondary)]">No rclone build is published for this platform.</p>}
         </div>
     </div>
   );
