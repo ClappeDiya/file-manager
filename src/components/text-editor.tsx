@@ -118,9 +118,6 @@ export function TextEditor({
         setShowFind(true);
         requestAnimationFrame(() => findInputRef.current?.focus());
       }
-      if (e.key === "Escape" && showFind) {
-        setShowFind(false);
-      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -184,7 +181,13 @@ export function TextEditor({
   const lineCount = content.split("\n").length;
 
   return (
-    <div className="flex flex-col h-full bg-surface-primary">
+    <div className="flex flex-col h-full bg-surface-primary" onKeyDown={(event) => {
+      if (event.key === "Escape" && showFind) {
+        event.stopPropagation();
+        setShowFind(false);
+        textareaRef.current?.focus();
+      }
+    }}>
       {/* Toolbar */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border-primary bg-surface-secondary text-xs">
         <div className="flex items-center gap-2">
@@ -209,6 +212,7 @@ export function TextEditor({
             onClick={onClose}
             className="p-0.5 rounded text-text-tertiary hover:bg-surface-hover"
             title="Close editor"
+            aria-label="Close editor"
           >
             <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M18 6L6 18M6 6l12 12" />
@@ -226,6 +230,7 @@ export function TextEditor({
             value={findQuery}
             onChange={(e) => setFindQuery(e.target.value)}
             placeholder="Find..."
+            aria-label="Find text"
             className="flex-1 text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
           />
           {!readOnly && (
@@ -235,6 +240,7 @@ export function TextEditor({
                 value={replaceQuery}
                 onChange={(e) => setReplaceQuery(e.target.value)}
                 placeholder="Replace..."
+                aria-label="Replace with"
                 className="flex-1 text-xs px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900"
               />
               <button
@@ -269,6 +275,7 @@ export function TextEditor({
           {/* Text area */}
           <textarea
             ref={textareaRef}
+            aria-label="File contents"
             value={content}
             onChange={(e) => {
               setContent(e.target.value);

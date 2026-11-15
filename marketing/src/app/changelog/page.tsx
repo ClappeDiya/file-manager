@@ -24,7 +24,9 @@ async function loadChangelog(): Promise<string> {
 }
 
 export default async function ChangelogPage() {
-  const markdown = await loadChangelog();
+  // The page header already supplies the document title. Keep release headings
+  // at their original levels without publishing a second h1 from the source.
+  const markdown = (await loadChangelog()).replace(/^# Changelog\s*\n/, '');
 
   return (
     <div className="container-prose py-16">

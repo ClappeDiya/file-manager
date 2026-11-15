@@ -1,5 +1,5 @@
 import { useFeatureNavigation } from "@/stores/feature-navigation-store";
-import { useFocusTrap } from "@/hooks/use-focus-trap";
+import { WorkspaceDialog } from "./workspace-dialog";
 import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
 import { useClearFilterOnNavigate } from "@/hooks/use-clear-filter-on-navigate";
 import { useDirectoryActivity,useRecentlyTouchedSet } from "@/hooks/use-directory-activity";
@@ -518,7 +518,6 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
   // `batchRenameFiles`: the keyboard handler in the useEffect
   // below needs the setter in scope.
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const settingsDialogRef = useFocusTrap<HTMLDivElement>({ active: settingsOpen, onEscape: () => setSettingsOpen(false) });
   /** Settings section to open on (`"rclone"` from the palette), else none. */
   const [settingsFocus, setSettingsFocus] = useState<string | null>(null);
   // Two more orphaned panels surfaced the same way as Connections/Sync:
@@ -3077,13 +3076,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           `closePreview`). Backdrop click and the component's
           own toggle both route through `closePreview`. */}
       {previewPanelOpen && previewFilePath && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="File Preview"
           data-testid="preview-backdrop"
-          onClick={() => useUIStore.getState().closePreview()}
+          onClose={() => useUIStore.getState().closePreview()}
         >
           <div
             className="w-[min(720px,92vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3095,7 +3092,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               onToggle={() => useUIStore.getState().closePreview()}
             />
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Iter 28: Sync Panel modal. Hosts the long-orphaned
@@ -3107,13 +3104,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           backdrop-click-to-close + stopPropagation pattern
           as every other iter-17/25/26/27 overlay. */}
       {syncOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Sync Panel"
           data-testid="sync-backdrop"
-          onClick={() => setSyncOpen(false)}
+          onClose={() => setSyncOpen(false)}
         >
           <div
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3138,20 +3133,18 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               <SyncPanel />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Backups modal: versioned, deduplicated, encrypted backup jobs
           with restore, maintenance and run history. Same
           backdrop-click-to-close pattern as the Sync panel. */}
       {backupOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Backups"
           data-testid="backup-backdrop"
-          onClick={() => setBackupOpen(false)}
+          onClose={() => setBackupOpen(false)}
         >
           <div
             className="w-[min(1100px,95vw)] h-[min(820px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3168,7 +3161,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               <BackupPanel />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Mounts: the list of saved and mounted drives, and the mount dialog
@@ -3179,13 +3172,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           sending the chosen items. Received files go to Downloads, or to
           the active folder with "Save here". */}
       {nearbyOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex justify-end bg-black/30"
-          role="dialog"
-          aria-modal="true"
           aria-label="Nearby computers"
           data-testid="nearby-backdrop"
-          onClick={() => setNearbyOpen(false)}
+          onClose={() => setNearbyOpen(false)}
         >
           <div
             className="relative w-[min(380px,95vw)] h-full pt-9 shadow-2xl border-l border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3203,7 +3194,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               receiveDir={localPaths([activeFolder])[0] || undefined}
             />
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* In-app log viewer (Advanced) */}
@@ -3215,13 +3206,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
       {/* Schedules & holiday calendars (Advanced): shared by sync pairs,
           automation rules and backup jobs. */}
       {schedulesOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Schedules"
           data-testid="schedules-backdrop"
-          onClick={() => setSchedulesOpen(false)}
+          onClose={() => setSchedulesOpen(false)}
         >
           <div
             className="w-[min(820px,95vw)] max-h-[min(760px,92vh)] overflow-auto rounded-lg shadow-2xl border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3238,7 +3227,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               <ScheduleLibraryPanel />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Iter 30: Transfer History (Journal) modal. Hosts the
@@ -3255,13 +3244,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           (Connection Manager, Sync Panel) for visual
           consistency when the user bounces between them. */}
       {transferHistoryOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Transfer History"
           data-testid="transfer-history-backdrop"
-          onClick={() => setTransferHistoryOpen(false)}
+          onClose={() => setTransferHistoryOpen(false)}
         >
           <div
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3286,7 +3273,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               <TransferHistoryPanel />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Iter 36: Integrity Tools modal. Hosts the last clean
@@ -3305,13 +3292,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           iter-25..30 overlay; sized to match the other
           data-table modals for visual consistency. */}
       {integrityToolsOpen !== null && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Integrity Tools"
           data-testid="integrity-tools-backdrop"
-          onClick={() => setIntegrityToolsOpen(null)}
+          onClose={() => setIntegrityToolsOpen(null)}
         >
           <div
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3323,7 +3308,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               onClose={() => setIntegrityToolsOpen(null)}
             />
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Iter 31: Archive Browser modal. Opens the long-orphaned
@@ -3340,13 +3325,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           iter-17/25-30 overlay; sized to match the other data-
           table modals for visual consistency. */}
       {archiveBrowserPath && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Archive Browser"
           data-testid="archive-browser-backdrop"
-          onClick={() => setArchiveBrowserPath(null)}
+          onClose={() => setArchiveBrowserPath(null)}
         >
           <div
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3357,7 +3340,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               onClose={() => setArchiveBrowserPath(null)}
             />
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Iter 41: Create Archive dialog. The component itself already
@@ -3398,21 +3381,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           close button (which in a future iteration should
           prompt when `isDirty`). */}
       {textEditorFile && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Text Editor"
-          data-testid="text-editor-backdrop"
-        >
-          <div className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]">
-            <TextEditorModal
+        <TextEditorModal
               filePath={textEditorFile.path}
               fileSize={textEditorFile.size}
               onClose={() => setTextEditorFile(null)}
             />
-          </div>
-        </div>
       )}
 
       {/* Iter 27: Connection Manager modal. Hosts the
@@ -3423,13 +3396,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           backdrop-click-to-close + stopPropagation pattern as
           every other iter-17/25/26 overlay. */}
       {connectionsOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Connection Manager"
           data-testid="connections-backdrop"
-          onClick={() => setConnectionsOpen(false)}
+          onClose={() => setConnectionsOpen(false)}
         >
           <div
             className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3464,7 +3435,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Iter 26: Settings panel modal. Follows the same
@@ -3475,14 +3446,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           registered \u2014 iter 26 just wires it to the user-facing
           surface via Cmd+, and the command palette. */}
       {settingsOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Settings"
-          ref={settingsDialogRef}
           data-testid="settings-backdrop"
-          onClick={() => setSettingsOpen(false)}
+          onClose={() => setSettingsOpen(false)}
         >
           <div
             className="w-[min(900px,95vw)] h-[min(720px,90vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3507,7 +3475,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               <SettingsPanel focusSection={settingsFocus} />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Encrypted Vault — vault-panel.tsx (1421 LOC) was fully built
@@ -3515,13 +3483,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
           Connections/Sync/Settings. Surfaced via the command palette
           and the AI intent bar's "vault" action. */}
       {vaultOpen && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Encrypted Vault"
           data-testid="vault-backdrop"
-          onClick={() => setVaultOpen(false)}
+          onClose={() => setVaultOpen(false)}
         >
           <div
             className="w-[min(900px,95vw)] h-[min(720px,90vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]"
@@ -3546,7 +3512,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               <VaultPanel />
             </div>
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
 
       {/* Migration Wizard — migration-wizard.tsx (1626 LOC) was also an
@@ -3566,13 +3532,11 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
       />
 
       {batchRenameFiles && (
-        <div
+        <WorkspaceDialog
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
           aria-label="Batch rename files"
           data-testid="batch-rename-backdrop"
-          onClick={() => setBatchRenameFiles(null)}
+          onClose={() => setBatchRenameFiles(null)}
         >
           <div
             className="w-[min(900px,95vw)] h-[min(720px,90vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)]"
@@ -3593,7 +3557,7 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
               }}
             />
           </div>
-        </div>
+        </WorkspaceDialog>
       )}
     </div>
   );

@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 const mockInvoke = vi.fn();
+const confirmClose = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/prompt-dialog", () => ({ confirmText: confirmClose }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => mockInvoke(...a) }));
 
 import { AUTOSAVE_MS, DRAFT_DEBOUNCE_MS, TextEditorModal, type EditorDraft } from "@/components/text-editor-modal";
@@ -27,6 +29,7 @@ async function flush() {
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
+  confirmClose.mockReset().mockResolvedValue(false);
   disk = "on disk";
   mtime = "2026-01-01T00:00:00Z";
   draft = null;
@@ -136,4 +139,31 @@ describe("autosave", () => {
     await flush();
     expect(calls("write_text_file_full")).toHaveLength(2);
   });
+});
+
+it("keeps unsaved contents when Escape is cancelled and closes only after confirmation", async () => {
+  const close = vi.fn();
+  render(<TextEditorModal filePath="/n.txt" fileSize={10} onClose={close}/>);
+  await flush(); await flush();
+  type("unsaved"); await flush();
+  fireEvent.keyDown(screen.getByLabelText("File contents"), { key: "Escape" });
+  await flush();
+  expect(confirmClose).toHaveBeenCalledOnce(); expect(close).not.toHaveBeenCalled();
+  expect(screen.getByLabelText("File contents")).toHaveValue("unsaved"); expect(disk).toBe("on disk");
+  confirmClose.mockResolvedValueOnce(true);
+  fireEvent.keyDown(screen.getByLabelText("File contents"), { key: "Escape" }); await flush();
+  expect(close).toHaveBeenCalledOnce(); expect(disk).toBe("on disk");
+});
+
+it("closes Find with Escape before requesting to close the editor", async () => {
+  const close = vi.fn();
+  render(<TextEditorModal filePath="/n.txt" fileSize={10} onClose={close}/>);
+  await flush(); await flush();
+  const contents = screen.getByLabelText("File contents");
+  fireEvent.keyDown(contents, { key: "f", metaKey: true });
+  const find = screen.getByRole("textbox", { name: "Find text" });
+  fireEvent.keyDown(find, { key: "Escape" });
+  expect(screen.queryByRole("textbox", { name: "Find text" })).toBeNull();
+  expect(close).not.toHaveBeenCalled(); expect(confirmClose).not.toHaveBeenCalled();
+  expect(contents).toHaveFocus();
 });

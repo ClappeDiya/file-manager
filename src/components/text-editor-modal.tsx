@@ -48,6 +48,7 @@ import { TextEditor } from "./text-editor";
 import { errorText } from "@/lib/error-text";
 import { confirmText } from "@/lib/prompt-dialog";
 import { useUIStore } from "@/stores/ui-store";
+import { WorkspaceDialog } from "./workspace-dialog";
 
 /** Mirrors `EditorDraft` in editor_draft_commands.rs. */
 export interface EditorDraft {
@@ -422,6 +423,7 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
     onClose();
   }, [onClose, discardDraft]);
 
+  const renderContent = () => {
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-xs text-[color:var(--color-text-tertiary)]">
@@ -536,5 +538,19 @@ export function TextEditorModal({ filePath, fileSize, onClose }: TextEditorModal
         />
       </div>
     </div>
+  );
+  };
+  return (
+    <WorkspaceDialog
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      aria-label="Text Editor"
+      data-testid="text-editor-backdrop"
+      onClose={handleClose}
+      closeOnBackdrop={false}
+    >
+      <div className="w-[min(1100px,95vw)] h-[min(800px,92vh)] rounded-lg shadow-2xl overflow-hidden border border-[var(--color-border)] bg-[var(--color-surface)]">
+        {renderContent()}
+      </div>
+    </WorkspaceDialog>
   );
 }
