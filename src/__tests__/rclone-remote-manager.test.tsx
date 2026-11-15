@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor, within, act } from "@testing-librar
 import { RcloneRemoteManager } from "@/components/rclone/rclone-remote-manager";
 import { PromptDialogHost } from "@/components/prompt-dialog-host";
 import { useUIStore } from "@/stores/ui-store";
-import type { RcloneOption, RcloneProvider } from "@/lib/rclone";
+import type { RcloneConfigStep, RcloneOption, RcloneProvider } from "@/lib/rclone";
 
 const mockInvoke = vi.fn();
 let authListener: ((e: { payload: unknown }) => void) | null = null;
@@ -55,7 +55,7 @@ function backend(cmd: string, args: Record<string, unknown> | undefined): unknow
     case "rclone_config_continue":
       return { state: "", option: null, error: "", result: "", done: true };
     case "rclone_config_oauth":
-      return new Promise((resolve) => setTimeout(() => resolve({ state: "", option: null, error: "", result: "", done: true }), 50));
+      return { state: "", option: null, error: "", result: "", done: true };
     case "rclone_remote_get":
       return { name: "sec", type: "crypt", values: { remote: "al:vault" }, secrets_set: ["password"] };
     case "rclone_remote_test":
@@ -134,6 +134,13 @@ describe("RcloneRemoteManager", () => {
   });
 
   it("signs in to an OAuth backend through the browser", async () => {
+    // Keep OAuth pending until the sign-in-link assertion is complete. A fixed
+    // timer can finish before the test observes the link on a busy CI host.
+    let finishSignIn!: (step: RcloneConfigStep) => void;
+    const signIn = new Promise<RcloneConfigStep>((resolve) => { finishSignIn = resolve; });
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) =>
+      cmd === "rclone_config_oauth" ? signIn : Promise.resolve(backend(cmd, args)),
+    );
     const onAdd = vi.fn();
     render(<RcloneRemoteManager onAddConnection={onAdd} />);
     fireEvent.click(await screen.findByText("+ New remote"));
@@ -144,6 +151,7 @@ describe("RcloneRemoteManager", () => {
     await waitFor(() => expect(authListener).not.toBeNull());
     act(() => authListener?.({ payload: { name: "box", url: "http://127.0.0.1:53682/auth?state=x", opened: true } }));
     expect(await screen.findByText("Open the sign-in page")).toHaveAttribute("href", "http://127.0.0.1:53682/auth?state=x");
+    await act(async () => { finishSignIn({ state: "", option: null, error: "", result: "", done: true }); });
     const done = await screen.findByTestId("rclone-done");
     expect(calls("rclone_config_oauth")).toEqual([{ name: "box", state: "*oauth-islocal,choose,,", params: {}, openBrowser: true, obscure: "obscure" }]);
     // The remote was created through a question: the done screen still says so and offers Add as connection.
