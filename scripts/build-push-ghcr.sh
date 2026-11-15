@@ -19,7 +19,7 @@ if [[ "$DRY" == true ]]; then
 fi
 # Reject dirty source before and after gates so a concurrent edit cannot be tagged as tested.
 assert_source_unchanged() {
-  if [[ "$(git rev-parse HEAD)" != "$SHA" ]] || [[ -n "$(git status --porcelain --untracked-files=all -- package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc .pnpmfile.cjs src src-tauri crates cli admin marketing packages scripts ':!*.tsbuildinfo' ':!admin/*.tsbuildinfo' ':!marketing/*.tsbuildinfo')" ]]; then
+  if [[ "$(git rev-parse HEAD)" != "$SHA" ]] || [[ -n "$(git status --porcelain --untracked-files=all -- package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc .pnpmfile.cjs .dockerignore eslint.config.mjs rust-toolchain.toml CHANGELOG.md docs src src-tauri crates cli admin marketing packages scripts ':!*.tsbuildinfo' ':!admin/*.tsbuildinfo' ':!marketing/*.tsbuildinfo')" ]]; then
     echo "Commit source changes and keep the source unchanged while publishing an immutable SHA image." >&2; exit 1
   fi
 }
