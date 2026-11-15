@@ -173,7 +173,7 @@ export function SimpleSidebar({
             },
             {
               label: "File operations",
-              ids: ["transfers", "sync", "backups", "cloud"],
+              ids: ["transfers", "backups", "sync", "cloud"],
             },
             ...(appMode === "advanced"
               ? [
@@ -195,8 +195,11 @@ export function SimpleSidebar({
                   {group.label}
                 </h2>
               )}
-              {NAV_ITEMS.filter((item) => group.ids.includes(item.id)).map(
-                (item) => (
+              {NAV_ITEMS.filter((item) => group.ids.includes(item.id))
+                .sort(
+                  (a, b) => group.ids.indexOf(a.id) - group.ids.indexOf(b.id),
+                )
+                .map((item) => (
                   <button
                     key={item.id}
                     className={cn(
@@ -225,8 +228,7 @@ export function SimpleSidebar({
                       />
                     )}
                   </button>
-                ),
-              )}
+                ))}
             </section>
           ))}
         </div>

@@ -156,3 +156,14 @@ describe("fleet agent", () => {
     expect(mockInvoke).toHaveBeenCalledWith("fleet_agent_unregister", { force: false });
   });
 });
+
+it("opens organization tools in the connected console and reports browser failures", async () => {
+  w.__TAURI__ = {}; w.__TAURI_INTERNALS__ = {};
+  mockInvoke.mockReset().mockImplementation((cmd:string) => cmd === "open_server_in_browser" ? Promise.reject({message:"Could not open the browser",advice:"Copy the address and open it yourself."}) : Promise.resolve(registered));
+  useFleetAgentStore.setState({status:registered,busy:false,error:"",connect:null});
+  render(<FleetAgentSection/>);
+  fireEvent.click(await screen.findByRole("button",{name:"Open management console"}));
+  await waitFor(()=>expect(mockInvoke).toHaveBeenCalledWith("open_server_in_browser",{url:"https://console.example.com"}));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not open the browser");
+  delete w.__TAURI__; delete w.__TAURI_INTERNALS__;
+});

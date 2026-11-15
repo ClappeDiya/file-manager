@@ -36,7 +36,7 @@ export function AllFeatures({
           and Advanced layouts.
         </p>
       </div>
-      <div className="flex flex-wrap gap-3">
+      <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
         <div className="flex-1 min-w-0">
           <label htmlFor="feature-search" className="block text-sm mb-1">
             Find a feature

@@ -436,6 +436,14 @@ export const PLATFORM_FEATURES: PlatformFeature[] = [
     group: "Preferences & workspace",
     target: { settings: "advanced" },
   },
+  {
+    id: "administration",
+    label: "Organization administration",
+    description:
+      "Open your connected console for fleet, users, roles, devices, policies, credentials, shared workspaces, licenses, billing, compliance and AI governance. Console permissions apply.",
+    group: "Preferences & workspace",
+    target: { settings: "managed" },
+  },
   ...GUIDED_FLOW_IDS.map((id) => ({
     id: `guided-${id}`,
     label: GUIDED_FLOW_META[id].label,
