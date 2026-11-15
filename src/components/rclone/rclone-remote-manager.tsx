@@ -7,6 +7,9 @@
  * rclone asks are shown one at a time.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Button } from "@ufop/ui-components";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
+import { RcloneSettingsSection } from "./rclone-settings-section";
 import { PasswordInput } from "@/components/password-input";
 import { RcloneSchemaForm } from "@/components/rclone/rclone-schema-form";
 import { CryptNamesDialog } from "@/components/rclone/rclone-crypt";
@@ -90,6 +93,9 @@ export function RcloneRemoteManager({
   const [busy, setBusy] = useState(false);
   const [tests, setTests] = useState<Record<string, RcloneRemoteTest | "running">>({});
   const [cryptFor, setCryptFor] = useState<string | null>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const setupRef = useFocusTrap<HTMLDivElement>({ active: setupOpen, onEscape: () => setSetupOpen(false) });
 
   const refresh = useCallback(async () => {
     try {
@@ -101,19 +107,16 @@ export function RcloneRemoteManager({
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-    rcloneProviders().then(
-      (p) => {
-        setProviders(p ?? []);
-        setProvidersFailed(false);
-      },
-      (e) => {
-        setProvidersFailed(true);
-        setLoadError((prev) => prev ?? errorText(e));
-      },
-    );
-  }, [refresh]);
+  const load = useCallback(async () => {
+    setChecking(true);
+    const [listed, available] = await Promise.allSettled([listRcloneRemotes(), rcloneProviders()]);
+    setRemotes(listed.status === "fulfilled" ? listed.value : null);
+    setProviders(available.status === "fulfilled" ? available.value ?? [] : null);
+    setProvidersFailed(available.status === "rejected");
+    setLoadError(listed.status === "rejected" ? errorText(listed.reason) : available.status === "rejected" ? errorText(available.reason) : null);
+    setChecking(false);
+  }, []);
+  useEffect(() => { void load(); }, [load]);
 
   // The sign-in address, as soon as rclone prints it.
   useEffect(() => {
@@ -180,7 +183,7 @@ export function RcloneRemoteManager({
               type="button"
               className={primary}
               onClick={() => setMode({ kind: "create", type: null })}
-              disabled={!providers || providersFailed}
+              disabled={!providers || providersFailed || !!loadError || checking}
               title={providersFailed ? "rclone's storage types could not be loaded" : undefined}
             >
               + New remote
@@ -201,11 +204,14 @@ export function RcloneRemoteManager({
       </div>
 
       {loadError && (
-        <div className="rounded border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-2 space-y-1" role="alert" data-testid="rclone-load-error">
-          {isRcloneUnavailable(loadError) && <p className="text-sm font-medium">rclone is not installed or not working — Settings → rclone</p>}
-          <p className="text-xs text-red-600 dark:text-red-400">{loadError}</p>
+        <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-4 space-y-3" role="alert" data-testid="rclone-load-error">
+          <p className="text-sm font-semibold">{isRcloneUnavailable(loadError) ? "Set up rclone to use additional cloud providers" : "Could not load rclone remotes"}</p>
+          <p className="text-sm text-[color:var(--color-text-secondary)]">{isRcloneUnavailable(loadError) ? "rclone is missing or could not start. Install a verified copy in the app, or select an existing installation. Your other connections remain available." : "Check rclone’s program and configuration, then try again."}</p>
+          <div className="flex flex-wrap gap-2"><Button size="sm" onClick={() => setSetupOpen(true)}>Set up rclone</Button><Button size="sm" variant="outline" disabled={checking} onClick={() => void load()}>{checking ? "Checking…" : "Check again"}</Button></div>
+          <details className="text-xs text-[color:var(--color-text-secondary)]"><summary className="cursor-pointer">Technical details</summary><p className="mt-2 break-words">{loadError}</p></details>
         </div>
       )}
+      {setupOpen && <div className="fixed inset-0 z-[100] bg-[var(--color-bg-overlay)] p-3 flex items-center justify-center" onClick={() => setSetupOpen(false)}><div ref={setupRef} role="dialog" aria-modal="true" aria-labelledby="rclone-setup-heading" className="w-full max-w-xl max-h-full overflow-auto rounded-xl border border-[var(--color-border)] bg-[var(--color-bg)] p-5" onClick={e => e.stopPropagation()}><h2 id="rclone-setup-heading" className="font-semibold text-lg">Set up rclone</h2><p className="text-sm text-[color:var(--color-text-secondary)] mt-1">Install rclone below, or choose a program already on this computer.</p><RcloneSettingsSection /><Button className="mt-4" onClick={() => { setSetupOpen(false); void load(); }}>Back to remotes and check</Button></div></div>}
 
       {error && (
         <p className="text-xs text-red-600 dark:text-red-400" role="alert">

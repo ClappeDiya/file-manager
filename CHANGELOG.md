@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A searchable **All features** directory, grouped by task, with direct links to desktop tools, settings and all 18 guided workflows. It stays visible in both sidebar layouts.
+- Sidebar layout previews with **Apply sidebar layout**, Cancel, persistent Basic/Advanced navigation, and an accessible saved confirmation. Advanced adds labeled Automation & AI, Security & Sharing, and Tools & Diagnostics groups.
+- Missing-rclone recovery offers in-app setup, verified managed installation in either layout, retry, and expandable technical details.
+
 - **Interface (WS-G, RcloneView parity)**:
   - **Guided wizards do the work** (palette *… (guided)* for all 18; `src/lib/guided-actions.ts`): 14 of the 18 only added an Activity line on Finish (and their *Test* buttons always passed). Now: sync pairs are created, SMB/SFTP connections saved, signed in and listed, transfers copy or move (with optional checksum verification), interrupted transfers resume, retry or cancel, file names are checked against a destination and renamed reversibly (new `compat_profiles`, `compat_scan_folder`, `compat_fix_names`, `compat_list_renames`, `compat_restore_names` over the compat engine and its mapping table), reports are saved, folders are offered to another computer, drives are copied after a space check (and verified), and backup jobs are created and run. Wizard errors keep the wizard open with the reason.
   - **App lock** (Settings → App Lock, palette and tray *Lock UFOP*; `app_lock_*`): lock at start, after 1–60 idle minutes (idle timer in the backend, fed by every window) or now; unlock with the master password (created when the lock is first turned on; attempt limit of the password manager). While locked the IPC gate (`app_lock::gate`) refuses every command except the lock screen's, and the web view holds its calls (identical ones once) until the unlock; scheduled work keeps running; audited.
@@ -164,6 +168,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sizes are shown in decimal units by default (1 KB = 1,000 bytes; before, 1,024 bytes were labelled KB). Choose *Binary* in Settings → Appearance for KiB/MiB/GiB.
 
 ### Fixed
+
+- Updated Rust dependencies to patched SQLite, ZIP, TLS, HTTP/2, XML and Tauri/updater releases; migrated PEM parsing and replaced the unmaintained YAML serializer. Desktop, core and CLI require the pinned Rust 1.100 toolchain.
+- Fixed macOS OpenSSL release-signature tests to exercise real signing and tamper rejection instead of silently skipping when the system LibreSSL differs from the selected OpenSSL.
+- GHCR publishing requires current npm and Rust vulnerability scans and rejects modified source before and after the local CI gates.
 
 - Automation *Purge* step: only the target folder itself was checked for being a link; a linked folder among its parents led the purge elsewhere (another drive, the home folder) and deleted that. A path through a linked folder (below the top level) is refused, the home-folder check also judges the real location, and exactly that folder is removed.
 - Signing in to Google Drive, Dropbox or OneDrive: the new tokens were stored only after connecting with them worked, so a network error at that moment discarded them (and the one-time code), and you had to sign in again. They are now kept on any error other than a refused credential, and the sign-in says connecting to check it failed (a sign-in with your own app is remembered then too).

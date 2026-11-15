@@ -256,7 +256,7 @@ describe("RcloneRemoteManager", () => {
     );
     render(<RcloneRemoteManager />);
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("rclone is not installed or not working — Settings → rclone");
+    expect(alert).toHaveTextContent("Set up rclone to use additional cloud providers");
     expect(alert).toHaveTextContent("Could not start rclone");
     expect(screen.queryByText(/No rclone remotes yet/)).toBeNull();
     await waitFor(() => expect(screen.getByText("+ New remote")).toBeDisabled());
@@ -271,8 +271,41 @@ describe("RcloneRemoteManager", () => {
     render(<RcloneRemoteManager />);
     expect(await screen.findByRole("alert")).toHaveTextContent("unable to decrypt configuration");
     expect(screen.queryByText(/No rclone remotes yet/)).toBeNull();
-    // The providers loaded, so a new remote can still be started.
-    await waitFor(() => expect(screen.getByText("+ New remote")).not.toBeDisabled());
+    // Fix the unreadable configuration before creating another remote.
+    await waitFor(() => expect(screen.getByText("+ New remote")).toBeDisabled());
+  });
+
+  it("opens setup directly from the missing-rclone error and reloads providers after recovery", async () => {
+    let ready = false;
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (!ready && (cmd === "rclone_list_remotes" || cmd === "rclone_providers")) return Promise.reject({message:"Could not start rclone: No such file or directory", advice:""});
+      if (cmd === "rclone_settings_get") return Promise.resolve({settings:{binary_path:null,config_path:null},status:{path:"rclone",source:"none",found:false,version:null,meets_minimum:null,min_version:"1.56.0",config_path:null,managed:false,error:null},pinned_version:"1.69.1",managed_dir:"/fixture/rclone",managed_version:null,managed_binary:null,update_available:false,platform_supported:true,default_config_path:null});
+      return Promise.resolve(backend(cmd,args));
+    });
+    render(<RcloneRemoteManager/>);
+    fireEvent.click(await screen.findByRole("button",{name:"Set up rclone"}));
+    const setup = await screen.findByRole("dialog",{name:"Set up rclone"});
+    expect(await within(setup).findByRole("button",{name:"Install rclone 1.69.1"})).toBeVisible();
+    expect(useUIStore.getState().appMode).toBe("simple");
+    ready = true;
+    fireEvent.click(within(setup).getByRole("button",{name:"Back to remotes and check"}));
+    expect(await screen.findByTestId("rclone-remote-al")).toBeVisible();
+    expect(screen.queryByTestId("rclone-load-error")).toBeNull();
+    expect(screen.getByRole("button",{name:"+ New remote"})).toBeEnabled();
+  });
+
+  it("keeps a provider-load error visible when listing remotes succeeds later", async () => {
+    mockInvoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "rclone_providers") return Promise.reject(new Error("Could not start rclone providers"));
+      if (cmd === "rclone_list_remotes") return new Promise(resolve => setTimeout(()=>resolve(remotes),20));
+      return Promise.resolve(backend(cmd,args));
+    });
+    render(<RcloneRemoteManager/>);
+    expect(await screen.findByTestId("rclone-load-error")).toHaveTextContent("Could not start rclone providers");
+    expect(screen.getByRole("button",{name:"+ New remote"})).toBeDisabled();
+    fireEvent.click(screen.getByRole("button",{name:"Check again"}));
+    await waitFor(()=>expect(calls("rclone_providers")).toHaveLength(2));
+    expect(await screen.findByTestId("rclone-load-error")).toHaveTextContent("Could not start rclone providers");
   });
 
   it("edits a remote without sending stored secrets back", async () => {

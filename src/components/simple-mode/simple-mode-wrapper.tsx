@@ -1,22 +1,12 @@
 import SettingsPanel from "@/components/settings-panel";
-/**
- * Simple Mode Wrapper (T-054)
- *
- * This component wraps the entire app content in Simple mode.
- * When appMode === "simple", it:
- * - Uses SimpleSidebar navigation
- * - Hides advanced features (regex rename, checksums, detailed connections,
- *   automation, naming inspector, scripting, logs)
- * - Shows larger touch targets and more whitespace
- * - Provides "More options" for discoverability of advanced features
- *
- * When appMode === "advanced", renders children as-is.
- * Mode switch is instant -- no restart required.
- */
+/** Shared Files-first shell. Layout changes the navigation density, never access. */
 import { useEffect, useRef, useState } from "react";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { BackupPanel } from "@/components/backup/backup-panel";
+import { AllFeatures } from "./all-features";
+import type { FeatureTarget } from "./feature-catalog";
+import { useFeatureNavigation } from "@/stores/feature-navigation-store";
 import { SimpleSearchView } from "./simple-search-view";
 import { useFileManagerStore } from "@/stores/file-manager-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -74,6 +64,14 @@ export function SimpleModeWrapper({
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
   const [activeSection, setActiveSection] = useState<SimpleNavSection>("files");
   const [settingsRequest, setSettingsRequest] = useState(0);
+  const contentRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      if (!document.querySelector('[role="dialog"], [role="alertdialog"]'))
+        contentRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeSection]);
 
   useEffect(() => {
     const show = () => setActiveSection("files");
@@ -88,9 +86,13 @@ export function SimpleModeWrapper({
         document.querySelector('[role="dialog"], [role="alertdialog"]')
       )
         return;
-      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key === ",") {
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.shiftKey &&
+        event.key === ","
+      ) {
         event.preventDefault();
-        setSettingsRequest(value => value + 1);
+        setSettingsRequest((value) => value + 1);
         setActiveSection("settings");
         return;
       }
@@ -104,8 +106,35 @@ export function SimpleModeWrapper({
     return () => window.removeEventListener("keydown", openCommands);
   }, [activeSection]);
 
+  const openFeature = (target: FeatureTarget) => {
+    if ("section" in target) setActiveSection(target.section);
+    else {
+      useFeatureNavigation.getState().request(target);
+      setActiveSection("files");
+    }
+  };
+
   const renderSection = () => {
     switch (activeSection) {
+      case "features":
+      case "automation":
+      case "security":
+      case "tools":
+        return (
+          <AllFeatures
+            key={activeSection}
+            group={
+              activeSection === "automation"
+                ? "Automation & AI"
+                : activeSection === "security"
+                  ? "Security & sharing"
+                  : activeSection === "tools"
+                    ? "Tools & diagnostics"
+                    : undefined
+            }
+            onOpen={openFeature}
+          />
+        );
       case "files":
         return fileManager;
       case "transfers":
@@ -171,7 +200,10 @@ export function SimpleModeWrapper({
       case "settings":
         return (
           settingsPanel || (
-            <SimpleSettingsView settingsRequest={settingsRequest} onOpenOnboarding={onOpenOnboarding} />
+            <SimpleSettingsView
+              settingsRequest={settingsRequest}
+              onOpenOnboarding={onOpenOnboarding}
+            />
           )
         );
       default:
@@ -278,6 +310,7 @@ export function SimpleModeWrapper({
         )}
         {/* Content area */}
         <main
+          ref={contentRef}
           inert={(narrow && showSidebar) || undefined}
           id="main-content"
           tabIndex={-1}
@@ -336,7 +369,9 @@ function SimpleSettingsView({
   onOpenOnboarding?: () => void;
 }) {
   const [allSettings, setAllSettings] = useState(settingsRequest > 0);
-  useEffect(() => { if (settingsRequest > 0) setAllSettings(true); }, [settingsRequest]);
+  useEffect(() => {
+    if (settingsRequest > 0) setAllSettings(true);
+  }, [settingsRequest]);
   const fullSettingsRef = useRef<HTMLButtonElement>(null);
   const openSettingsRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -345,17 +380,34 @@ function SimpleSettingsView({
   }, [allSettings]);
   const appMode = useUIStore((s) => s.appMode);
   const setAppMode = useUIStore((s) => s.setAppMode);
+  const [draftMode, setDraftMode] = useState(appMode);
+  const [layoutNotice, setLayoutNotice] = useState("");
+  useEffect(() => {
+    setDraftMode(appMode);
+  }, [appMode]);
   const theme = useUIStore((s) => s.theme);
   const setTheme = useUIStore((s) => s.setTheme);
 
-  if (allSettings) return (
-    <section className="h-full min-h-0 flex flex-col" aria-label="All settings">
-      <div className="p-3 border-b border-[var(--color-border)]">
-        <Button ref={fullSettingsRef} variant="ghost" onClick={() => setAllSettings(false)}>Back to settings overview</Button>
-      </div>
-      <div className="flex-1 min-h-0"><SettingsPanel /></div>
-    </section>
-  );
+  if (allSettings)
+    return (
+      <section
+        className="h-full min-h-0 flex flex-col"
+        aria-label="All settings"
+      >
+        <div className="p-3 border-b border-[var(--color-border)]">
+          <Button
+            ref={fullSettingsRef}
+            variant="ghost"
+            onClick={() => setAllSettings(false)}
+          >
+            Back to settings overview
+          </Button>
+        </div>
+        <div className="flex-1 min-h-0">
+          <SettingsPanel />
+        </div>
+      </section>
+    );
   return (
     <div className="max-w-lg mx-auto p-8">
       <h2 className="text-xl font-semibold text-[color:var(--color-text)] mb-6">
@@ -364,59 +416,118 @@ function SimpleSettingsView({
 
       <div className="space-y-6">
         <div className="space-y-2">
-          <Button ref={openSettingsRef} onClick={() => setAllSettings(true)}>All settings</Button>
-          <p className="text-xs text-[color:var(--color-text-secondary)]">Connections, console enrollment, privacy, startup, notifications and diagnostics.</p>
-        </div>
-        {/* User Mode */}
-        <div className="space-y-2">
-          <label className="block text-sm font-medium text-[color:var(--color-text)]">
-            User Mode
-          </label>
+          <Button ref={openSettingsRef} onClick={() => setAllSettings(true)}>
+            All settings
+          </Button>
           <p className="text-xs text-[color:var(--color-text-secondary)]">
-            Simple mode shows a clean interface with essential features.
-            Advanced mode unlocks regex renaming, checksums, scripting, and
-            more.
+            Connections, console enrollment, privacy, startup, notifications and
+            diagnostics.
           </p>
-          <div className="flex gap-3 mt-2">
-            <button
-              className={cn(
-                "flex-1 px-4 py-3 rounded-lg border-2 text-center transition-all",
-                appMode === "simple"
-                  ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[color:var(--color-primary)]"
-                  : "border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:border-[var(--color-text-tertiary)]",
-              )}
-              aria-pressed={appMode === "simple"}
-              onClick={() => setAppMode("simple")}
-            >
-              <span className="text-sm font-medium block">Simple</span>
-              <span className="text-xs opacity-80 block mt-1">
-                Clean and easy
-              </span>
-            </button>
-            <button
-              className={cn(
-                "flex-1 px-4 py-3 rounded-lg border-2 text-center transition-all",
-                appMode === "advanced"
-                  ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[color:var(--color-primary)]"
-                  : "border-[var(--color-border)] text-[color:var(--color-text-secondary)] hover:border-[var(--color-text-tertiary)]",
-              )}
-              aria-pressed={appMode === "advanced"}
-              onClick={() => setAppMode("advanced")}
-            >
-              <span className="text-sm font-medium block">Advanced</span>
-              <span className="text-xs opacity-80 block mt-1">
-                All features
-              </span>
-            </button>
-          </div>
         </div>
+        <fieldset className="space-y-3">
+          <legend className="text-sm font-medium">Sidebar layout</legend>
+          <p
+            id="sidebar-layout-help"
+            className="text-sm text-[color:var(--color-text-secondary)]"
+          >
+            Choose how many task groups appear in the sidebar. All features
+            stays available in either layout.
+          </p>
+          <div
+            className="grid grid-cols-2 gap-3"
+            aria-describedby="sidebar-layout-help"
+          >
+            {(["simple", "advanced"] as const).map((mode) => (
+              <label
+                key={mode}
+                className={cn(
+                  "cursor-pointer rounded-lg border-2 p-3 text-sm",
+                  draftMode === mode
+                    ? "border-[var(--color-primary)] bg-[var(--color-selected-bg)]"
+                    : "border-[var(--color-border)]",
+                )}
+              >
+                <span className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="sidebar-layout"
+                    value={mode}
+                    checked={draftMode === mode}
+                    onChange={() => {
+                      setDraftMode(mode);
+                      setLayoutNotice("");
+                    }}
+                  />
+                  <span className="font-medium">
+                    {mode === "simple" ? "Basic" : "Advanced"}
+                  </span>
+                </span>
+                <span className="block mt-2 text-xs text-[color:var(--color-text-secondary)]">
+                  {mode === "simple"
+                    ? "Everyday tasks, fewer choices"
+                    : "Everyday tasks plus advanced groups"}
+                </span>
+              </label>
+            ))}
+          </div>
+          <div
+            className="rounded-md border border-[var(--color-border)] p-3 text-xs text-[color:var(--color-text-secondary)]"
+            aria-label="Sidebar preview"
+          >
+            <p className="font-medium text-[color:var(--color-text)] mb-1">
+              {draftMode === "simple" ? "Basic" : "Advanced"} preview
+            </p>
+            <p>Files · Search · Favorites · All features</p>
+            <p>Transfers · Backups & Restore · Sync · Cloud & Servers</p>
+            {draftMode === "advanced" && (
+              <p>Automation & AI · Security & Sharing · Tools & Diagnostics</p>
+            )}
+            <p>Activity · Settings</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              disabled={draftMode === appMode}
+              onClick={() => {
+                setAppMode(draftMode);
+                setLayoutNotice(
+                  `${draftMode === "simple" ? "Basic" : "Advanced"} sidebar applied. Saved on this device.`,
+                );
+              }}
+            >
+              Apply sidebar layout
+            </Button>
+            {draftMode !== appMode && (
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setDraftMode(appMode);
+                  setLayoutNotice("");
+                }}
+              >
+                Cancel
+              </Button>
+            )}
+          </div>
+          <p
+            role="status"
+            className="text-xs text-[color:var(--color-text-secondary)]"
+          >
+            {layoutNotice ||
+              (draftMode === appMode
+                ? `Current layout: ${appMode === "simple" ? "Basic" : "Advanced"}.`
+                : "Preview only. Apply to update the sidebar.")}
+          </p>
+        </fieldset>
 
         {/* Theme */}
         <div className="space-y-2">
           <label className="block text-sm font-medium text-[color:var(--color-text)]">
             Appearance
           </label>
-          <div className="flex gap-2">
+          <p className="text-xs text-[color:var(--color-text-secondary)]">
+            Appearance changes are saved immediately.
+          </p>
+          <div className="flex flex-wrap gap-2">
             {(["system", "light", "dark", "high-contrast"] as const).map(
               (t) => (
                 <button

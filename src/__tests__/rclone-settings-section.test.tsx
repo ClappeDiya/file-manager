@@ -93,12 +93,7 @@ describe("Settings → rclone", () => {
     expect(await screen.findByText(/rclone is not installed/)).toBeTruthy();
   });
 
-  it("offers the managed install only in Advanced mode", async () => {
-    const { unmount } = render(<RcloneSettingsSection />);
-    await screen.findByTestId("rclone-status");
-    expect(screen.queryByTestId("rclone-managed")).toBeNull();
-    unmount();
-    useUIStore.setState({ appMode: "advanced" });
+  it("offers a verified managed install in Basic mode without changing the sidebar layout", async () => {
     render(<RcloneSettingsSection />);
     fireEvent.click(await screen.findByText("Install rclone 1.69.1"));
     expect(await screen.findByText(/Installed rclone v1.69.1 \(SHA-256 verified\)/)).toBeTruthy();

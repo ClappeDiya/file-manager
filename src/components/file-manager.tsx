@@ -1,3 +1,4 @@
+import { useFeatureNavigation } from "@/stores/feature-navigation-store";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { RcloneEngineInfo } from "@/components/rclone/rclone-settings-section";
 import { useClearFilterOnNavigate } from "@/hooks/use-clear-filter-on-navigate";
@@ -2327,8 +2328,8 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
         onOpenMounts: () => useMountsUi.getState().openPanel(),
         onMountDrive: () => useMountsUi.getState().openDialog(),
         onSendToComputer: () => openNearby(getAllSelectedPaths()),
-        onOpenSchedules: appMode === "advanced" ? () => setSchedulesOpen(true) : undefined,
-        onOpenLogViewer: appMode === "advanced" ? () => useLogViewer.getState().setOpen(true) : undefined,
+        onOpenSchedules: () => setSchedulesOpen(true),
+        onOpenLogViewer: () => useLogViewer.getState().setOpen(true),
         onSendFeedback: () => useFeedbackDialog.getState().setOpen(true),
         onOpenTransferHistory: () => {
           setTransferHistoryOpen(true);
@@ -2511,8 +2512,34 @@ export function FileManager({ embedded = false }: { embedded?: boolean }) {
         keywords: ["connection", "cloud", "remote", "open in pane", c.protocol, c.name.toLowerCase()],
       })),
     ],
-    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, toggleAutomationPanel, toggleActivityTimeline, favorites, appMode, paletteConnections, getFirstSelectedPath, automationPanelOpen, openNearby, getAllSelectedPaths, handleJumpLastTouched, openConnectionInPane],
+    [quickflowCommands, toggleSidebar, handleUndo, handleRedo, handleSaveWorkspace, toggleAutomationPanel, toggleActivityTimeline, favorites, paletteConnections, getFirstSelectedPath, automationPanelOpen, openNearby, getAllSelectedPaths, handleJumpLastTouched, openConnectionInPane],
   );
+
+  const featureRequest = useFeatureNavigation(s => s.pending);
+  useEffect(() => {
+    if (!featureRequest || !useFeatureNavigation.getState().consume(featureRequest.token)) return;
+    const target = featureRequest.target;
+    if ("settings" in target) {
+      setSettingsFocus(target.settings);
+      setSettingsOpen(true);
+    } else if ("command" in target) {
+      const command = commands.find(c => c.id === target.command);
+      if (command) command.action();
+      else useUIStore.getState().addStructuredError({ what: "Tool could not open", why: "The requested command is unavailable", appDid: "Opened the Files workspace", userAction: "Try the command palette or report this problem" });
+    } else if (target.tool === "ai") {
+      if (!useAiStore.getState().panelOpen) useAiStore.getState().togglePanel();
+    } else if (target.tool === "terminal") {
+      const terminal = useTerminalStore.getState();
+      if (!terminal.panelOpen) terminal.togglePanel();
+      if (terminal.sessions.length === 0) terminal.createLocalSession();
+    } else if (target.tool === "lineage") {
+      const path = getFirstSelectedPath();
+      if (path) useLineageStore.getState().beginRequest(path);
+      else useUIStore.getState().addStructuredError({ what: "Select a file to view its history", why: "No file is selected", appDid: "Opened Files", userAction: "Select a file, then choose File history & lineage from All features" });
+    } else {
+      useUIStore.getState().addStructuredError({ what: "File tools are in the file menu", why: "Available actions depend on the selected files", appDid: "Opened Files", userAction: "Select files, then right-click or press Shift+F10 for archives, conversion, encryption and other actions" });
+    }
+  }, [featureRequest, commands, getFirstSelectedPath]);
 
   return (
     <div className="flex h-full flex-col" data-testid="file-manager">

@@ -1408,77 +1408,77 @@ export default function SettingsPanel({
         </Section>
 
         {/* Export */}
-        <Section title="Export Settings" defaultOpen>
+        <Section title="Export Settings" id="export" focus={focusSection === "export"} defaultOpen>
           <ExportSection summary={summary} />
         </Section>
 
         {/* AI / Local LLM */}
-        <Section title="AI &amp; Intent Bar">
+        <Section title="AI &amp; Intent Bar" id="ai" focus={focusSection === "ai"}>
           <OllamaSection />
         </Section>
 
         {/* Editor Mappings */}
-        <Section title="External Editors">
+        <Section title="External Editors" id="editors" focus={focusSection === "editors"}>
           <EditorMappingsSection />
         </Section>
 
         {/* Import */}
-        <Section title="Import Settings">
+        <Section title="Import Settings" id="import" focus={focusSection === "import"}>
           <ImportSection onImported={loadSummary} />
         </Section>
 
         {/* Sync */}
-        <Section title="Sync Settings Across Devices">
+        <Section title="Sync Settings Across Devices" id="settings-sync" focus={focusSection === "settings-sync"}>
           <SyncSection />
         </Section>
 
         {/* Notifications */}
-        <Section title={t("settings.notifications")}>
+        <Section title={t("settings.notifications")} id="notifications" focus={focusSection === "notifications"}>
           <NotificationSection />
         </Section>
 
         {/* Privacy */}
-        <Section title={t("settings.privacy")}>
+        <Section title={t("settings.privacy")} id="privacy" focus={focusSection === "privacy"}>
           <PrivacySection />
         </Section>
 
         {/* Where this installation keeps its data (portable mode) */}
-        <Section title="Storage &amp; Portable Mode">
+        <Section title="Storage &amp; Portable Mode" id="storage" focus={focusSection === "storage"}>
           <PortableModeDetails status={portable} />
         </Section>
 
         {/* Log Controls */}
-        <Section title={t("settings.logging")}>
+        <Section title={t("settings.logging")} id="logging" focus={focusSection === "logging"}>
           <LogControlsSection />
           <DiagnosticsSection />
         </Section>
 
         {/* Management console agent */}
-        <Section title="Managed by Console">
+        <Section title="Managed by Console" id="managed" focus={focusSection === "managed"}>
           <FleetAgentSection />
           <ManagedSettingsNotice />
           <FleetAgentLimits />
         </Section>
 
         {/* Tamper-evident security audit log */}
-        <Section title="Security Audit Log">
+        <Section title="Security Audit Log" id="audit" focus={focusSection === "audit"}>
           <SecurityAuditSection />
         </Section>
 
         {/* Folders indexed for subfolder and content search */}
-        <Section title="Search Index">
+        <Section title="Search Index" id="index" focus={focusSection === "index"}>
           <div className="pt-3">
             <SearchIndexFolders />
           </div>
         </Section>
 
         {/* Which names may be written where (enforced by the engines) */}
-        <Section title="Filename Policies">
+        <Section title="Filename Policies" id="names" focus={focusSection === "names"}>
           <FilenamePoliciesSection />
         </Section>
 
         {/* Proxy for every outbound connection */}
-        <Section title="Network Proxy">
+        <Section title="Network Proxy" id="proxy" focus={focusSection === "proxy"}>
           <ProxySection />
         </Section>
 
@@ -1488,32 +1488,32 @@ export default function SettingsPanel({
         </Section>
 
         {/* Which share links may be created from cloud connections */}
-        <Section title="Sharing">
+        <Section title="Sharing" id="sharing" focus={focusSection === "sharing"}>
           <SharingPolicySection />
         </Section>
 
         {/* GnuPG keyring for file encryption and signatures */}
-        <Section title="OpenPGP Keys">
+        <Section title="OpenPGP Keys" id="gpg" focus={focusSection === "gpg"}>
           <GpgKeysSection />
         </Section>
 
         {/* Persisted host keys (trust on first use) */}
-        <Section title="Trusted SSH Hosts">
+        <Section title="Trusted SSH Hosts" id="ssh" focus={focusSection === "ssh"}>
           <TrustedSshHostsSection />
         </Section>
 
         {/* Trusted SSH Host CAs */}
-        <Section title="Trusted SSH Host CAs">
+        <Section title="Trusted SSH Host CAs" id="ssh-cas" focus={focusSection === "ssh-cas"}>
           <TrustedHostCAsSection />
         </Section>
 
         {/* GSSAPI/Kerberos */}
-        <Section title="GSSAPI / Kerberos">
+        <Section title="GSSAPI / Kerberos" id="kerberos" focus={focusSection === "kerberos"}>
           <GssapiSection />
         </Section>
 
         {/* Advanced: local monitoring (Prometheus exporter, off by default) */}
-        <Section title={t("settings.advanced")}>
+        <Section title={t("settings.advanced")} id="advanced" focus={focusSection === "advanced"}>
           <div className="pt-3" />
           <AdvancedOnly hint>
             <h3 className="pt-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Prometheus metrics</h3>
@@ -1530,7 +1530,7 @@ export default function SettingsPanel({
         </Section>
 
         {/* Network Diagnostics */}
-        <Section title={t("settings.network")}>
+        <Section title={t("settings.network")} id="network" focus={focusSection === "network"}>
           <div className="pt-3">
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
               Run network diagnostics to troubleshoot connection issues.

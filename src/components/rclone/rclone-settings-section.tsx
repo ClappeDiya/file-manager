@@ -1,12 +1,11 @@
 /**
  * Settings → rclone: which rclone binary and rclone.conf every rclone
  * feature uses (connections, backups, mounts, the remote manager), with
- * Detect, the version check and the minimum-version warning. Advanced:
+ * Detect, the version check and the minimum-version warning. Both layouts can
  * install or update the app's own (managed) copy of rclone, verified
  * against the release's SHA256SUMS.
  */
 import { useCallback, useEffect, useState } from "react";
-import { AdvancedOnly } from "@/components/backup/advanced-only";
 import { isTauriAvailable } from "@/hooks/use-tauri";
 import { pickFiles } from "@/lib/folder-picker";
 import { errorText } from "@/lib/error-text";
@@ -73,7 +72,7 @@ export function RcloneSettingsSection() {
         ) : (
           <p className="text-red-600 dark:text-red-400">
             rclone is not installed{s.source !== "none" ? ` or does not run (${s.path}: ${s.error ?? "no version"})` : ""}. Install it from rclone.org, choose its path below
-            {view.platform_supported ? ", or install the managed copy (Advanced)" : ""}.
+            {view.platform_supported ? ", or install the managed copy below" : ""}.
           </p>
         )}
         {s.meets_minimum === false && (
@@ -167,7 +166,6 @@ export function RcloneSettingsSection() {
         </p>
       )}
 
-      <AdvancedOnly hint>
         <div className="space-y-1 border-t border-gray-200 dark:border-gray-700 pt-2" data-testid="rclone-managed">
           <h4 className="font-semibold">Managed rclone</h4>
           <p className="text-gray-500">
@@ -212,7 +210,6 @@ export function RcloneSettingsSection() {
           </button>
           {!view.platform_supported && <p className="text-gray-500">No rclone build is published for this platform.</p>}
         </div>
-      </AdvancedOnly>
     </div>
   );
 }
