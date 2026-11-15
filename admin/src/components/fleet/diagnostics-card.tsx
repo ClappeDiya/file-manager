@@ -66,7 +66,7 @@ export function DiagnosticsCard({ machineId, canRequest, canDelete, heartbeatSec
               <TableHead>Uploaded</TableHead>
               <TableHead>Client</TableHead>
               <TableHead>Size</TableHead>
-              <TableHead />
+              <TableHead><span className="sr-only">Actions</span></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>

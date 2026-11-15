@@ -235,7 +235,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
                 <TableHead className="hidden md:table-cell">Source</TableHead>
                 <TableHead className="hidden md:table-cell">Stored</TableHead>
                 <TableHead className="hidden md:table-cell">Versions</TableHead>
-                <TableHead />
+                <TableHead><span className="sr-only">Actions</span></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -413,7 +413,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
                   <TableHead>Sent</TableHead>
                   <TableHead>Command</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead />
+                  <TableHead><span className="sr-only">Actions</span></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

@@ -6,7 +6,7 @@ Each backup run creates a version. This page explains how to label versions, kee
 
 **Restore → Versions** shows a table under the version picker:
 
-| Column | |
+| Column | Description |
 |---|---|
 | Time | Click to select the version for browsing and restore. *(partial)* marks an interrupted run or a checkpoint. |
 | Items, Size | Files and folders in the version, and their total size |

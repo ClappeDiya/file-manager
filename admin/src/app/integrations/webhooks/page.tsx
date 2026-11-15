@@ -72,7 +72,7 @@ function Deliveries({ hook, canWrite, onError }: { hook: Row; canWrite: boolean;
               <TableHead>Status</TableHead>
               <TableHead>Attempts</TableHead>
               <TableHead>Response</TableHead>
-              <TableHead />
+              <TableHead><span className="sr-only">Actions</span></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>

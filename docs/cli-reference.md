@@ -569,7 +569,7 @@ ufop server shutdown [--grace 120]   # stop the server gracefully (running backu
 ufop backup run-all [--job Docs …] [--scheduled-only] [--wait]               # the same
 ```
 
-| Flag | Default | |
+| Flag | Default | Description |
 |---|---|---|
 | `--ignore-file NAME` | `.ufopignore` | Ignore-file name read in every folder (gitignore syntax; repeatable; replaces the default; `""` reads none) |
 | `--respect-gitignore` | off | Also `.gitignore` and `.git/info/exclude` |
@@ -600,7 +600,7 @@ ufop backup mount --dest /mnt/backup [--version latest | --time … | --all] [--
 ufop backup cache stats|clear [--cache-dir DIR]
 ```
 
-| Flag | Default | |
+| Flag | Default | Description |
 |---|---|---|
 | `--version` | `0` | A number (0 = newest), `latest`, `oldest`, or a version's timestamp / file-list name |
 | `--time` | none | The newest complete version made at or before this time (wins over `--version`) |
@@ -638,7 +638,7 @@ ufop backup schedule-preview --start-time 02:00 --interval-minutes 1440 --timezo
 
 `--timezone` (also `"timezone"` in a schedule, e.g. `template update … --settings '{"schedule":{"enabled":true,"cron":["30 1 * * *"],"timezone":"UTC"}}'`) takes `local` (default: the server's or this computer's zone, with daylight saving), `UTC`, or a fixed offset such as `+02:00`, `-0530` or `UTC+1`; see [backup-policies-and-schedules.md](backup-policies-and-schedules.md#time-zone).
 
-| Flag (`verify`) | Default | |
+| Flag (`verify`) | Default | Description |
 |---|---|---|
 | `--version` (repeatable) | all | A number (0 = newest), `latest`, `oldest` or a version's timestamp |
 | `--path` (repeatable) | all | A folder (everything below it) or a wildcard |
@@ -667,7 +667,7 @@ ufop backup notify-profile test "On call"
 ufop backup notify-profile delete Phone [--force]         # --force also removes it from jobs and templates
 ```
 
-| Flag (`create` / `update`) | |
+| Flag (`create` / `update`) | Description |
 |---|---|
 | `--name`, `--description` | Profile name and description |
 | `--notification JSON` | The channel (`{"type":"email",…}`, `{"type":"webhook",…}`, …) |
@@ -685,7 +685,7 @@ ufop backup run --dest /mnt/nas/backup --source ~/Documents --put-rate 5 --max-c
 ufop backup open-at Office --point-in-time 2026-10-01T08:00:00Z [--name "Office before the attack"]
 ```
 
-| Flag | Default | |
+| Flag | Default | Description |
 |---|---|---|
 | `--list-rate` / `--get-rate` / `--put-rate` / `--delete-rate` | 0 | Most listing / download / upload / delete requests per second |
 | `--max-concurrent-requests` | 0 | Most requests in flight at once |
@@ -706,7 +706,7 @@ ufop backup bench --print-options                          # just the recommende
 ufop --json backup bench                                   # the full report as JSON
 ```
 
-| Flag | Default | |
+| Flag | Default | Description |
 |---|---|---|
 | `--sample PATH` | generated | File or folder to read the sample from (files in name order, links not followed) |
 | `--size` | `16M` | Bytes to generate, or the most to read from `--sample` |
@@ -766,7 +766,7 @@ ufop verify-release SHA256SUMS --pubkey-file other.pub           # another key (
 ufop --json verify-release SHA256SUMS                            # {signature_ok, trusted_comment, files:[{name,status}], ok}
 ```
 
-| Flag | |
+| Flag | Description |
 |---|---|
 | `--pubkey KEY` / `--pubkey-file FILE` | Public key (default: the UFOP release key `RWQOqigyl5kY9Vj4LeRcZ2DMlAEY85jWjDqOZ94gBgYhSd1TOsJ0nxzZ`) |
 | `--dir DIR` | Folder with the downloads (default: the folder of `SHA256SUMS`) |

@@ -195,7 +195,7 @@ export default function AlertsPage() {
                   <TableHead>Severity</TableHead>
                   <TableHead className="hidden md:table-cell">Raised</TableHead>
                   <TableHead className="hidden md:table-cell">Notified</TableHead>
-                  <TableHead />
+                  <TableHead><span className="sr-only">Actions</span></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

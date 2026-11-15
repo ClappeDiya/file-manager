@@ -64,7 +64,7 @@ Jobs saved before templates existed have no `overrides` list (`null`). For them,
 
 ### Where to manage templates
 
-| Where | |
+| Where | Usage |
 |---|---|
 | App | *Settings → Policy templates*: create, edit (settings as JSON), delete, export all, import. Organization templates are listed read-only and can be copied. In the job editor's *General* step, *Based on templates* adds, reorders (↑ ↓) and removes templates. |
 | CLI | `ufop backup template list \| show T \| create --file t.json \| create --name N --settings '{…}' \| update T [--file …] [--name …] [--settings …] \| delete T \| apply T --job J \| export [--template T] [--out f.json] \| import f.json`. These commands use the signed-in `ufop-server` (`ufop server login`), like `ufop backup run-all`. `T` and `J` are an id or a name. |
@@ -98,7 +98,7 @@ The job editor's *General* step has an **Effective settings** panel in Advanced 
 - When a job is based on templates, the editor shows the effective values. Any setting you change becomes the job's own.
 - Warnings name templates that no longer exist. Their settings are skipped.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | CLI | `ufop backup effective <job>`: a table of setting, source and value. `--json` gives the full list. |
 | REST | `GET /api/v1/jobs/{id}/effective-settings` returns `{job_id, template_ids, overrides, settings: [{field_path, value, source: {type: built_in\|global\|template\|job\|managed, id?, name?}, inherited: {value, source} \| null}], warnings}` |
@@ -111,7 +111,7 @@ A schedule (`BackupSchedule`) works in one of two modes:
 - **Start time and repeat** (the default): a start time, a repeat interval and weekdays.
 - **Custom (cron)** (Advanced): one or more cron expressions in `cron`. When `cron` is not empty, it replaces the start time, interval and weekdays. The next run is the earliest match of any expression.
 
-| Form | Example | |
+| Form | Example | Description |
 |---|---|---|
 | 5 fields | `30 2 * * Mon-Fri` | `minute hour day month weekday`, as in crontab. Runs at second 0. |
 | 6 fields | `0 30 2 * * Mon-Fri` | With seconds first |
@@ -124,7 +124,7 @@ A schedule (`BackupSchedule`) works in one of two modes:
 - The editor shows the **next five runs** and strikes out runs that a holiday calendar skips.
 - The fleet console's overdue check uses the gap between the next two runs as the job's interval.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | Job JSON | `"schedule": {"enabled": true, "cron": ["30 2 * * Mon-Fri", "0 9 * * Sat"]}` (REST `POST`/`PUT /api/v1/jobs`, templates) |
 | Preview | `POST /api/v1/backup-schedule/preview` with `{schedule, count}` (needs the `read` scope); `ufop backup schedule-preview --cron "30 2 * * *" [--cron …] [--count 5]` (or `--start-time 03:00 --interval-minutes 60`); IPC `backup_schedule_preview { schedule, count }` |
@@ -194,7 +194,7 @@ Verification (`ufop_core::backup::verify`) checks at three levels. Each level in
 
 `VerifyOptions`:
 
-| Field | | |
+| Field | Default | Description |
 |---|---|---|
 | `scope.versions` | `[]` = all | Version selectors: a number (0 = newest), `latest`, `oldest`, or a timestamp / file-list name |
 | `scope.paths` | `[]` = all | Folders (everything below them) or wildcards (`*/Documents/*`) |
@@ -212,7 +212,7 @@ The report (`VerifyReport`) keeps the older fields `checked` (volumes downloaded
 - `versions_checked`, `files_in_scope`, `files_checked`, `blocks_referenced` and `volumes_in_scope`
 - `stop_reason`
 
-| Where | |
+| Where | Usage |
 |---|---|
 | App | *Maintenance → Integrity*: **Verify sample** and **Verify everything** work as before (Standard). In Advanced mode, **Custom check** sets the scope, volume sampling, file percentage, parallel downloads, error limit and cache use. |
 | CLI | `ufop backup verify --dest … [--version latest] [--path '*/Docs/*'] [--structure \| --samples N \| --percent N \| --full] [--files-percent N] [--parallel N] [--max-errors N] [--use-cache] [--json]`. Exit code 2 when problems are found. |

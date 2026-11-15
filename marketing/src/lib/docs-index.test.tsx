@@ -51,6 +51,24 @@ describe('published docs index', () => {
     for (const d of docs) expect(index.sections.filter((s) => s.slug === d.entry.slug).length, d.entry.slug).toBeGreaterThan(0);
   });
 
+  it('gives published tables named columns and code regions unique names', async () => {
+    for (const d of await loadAllDocs()) {
+      const html = renderToStaticMarkup(<DocMarkdown content={d.content} />);
+      for (const cell of html.matchAll(/<th(?:\s[^>]*)?>([\s\S]*?)<\/th>/g)) {
+        expect(cell[1].replace(/<[^>]*>/g, '').trim(), `${d.entry.slug}: empty table header`).not.toBe('');
+      }
+      const labels = [...html.matchAll(/<pre[^>]*aria-label="([^"]+)"/g)].map(m => m[1]);
+      expect(new Set(labels).size, `${d.entry.slug}: repeated code landmark`).toBe(labels.length);
+      expect(labels.length).toBe([...html.matchAll(/<pre[ >]/g)].length);
+      let previous = 0;
+      for (const heading of html.matchAll(/<h([1-6])[ >]/g)) {
+        const level = Number(heading[1]);
+        expect(level, `${d.entry.slug}: skipped heading level`).toBeLessThanOrEqual(previous + 1);
+        previous = level;
+      }
+    }
+  });
+
   it('only links to headings that exist on the rendered pages', async () => {
     const docs = await loadAllDocs();
     for (const d of docs) {

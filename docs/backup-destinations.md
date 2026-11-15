@@ -23,7 +23,7 @@ Every destination below is available for primaries, replicas and the destination
 
 The provider picker labels each entry with its verification level. Providers only tested against API mocks are marked *untested* until someone runs them against the live service. Box, pCloud and Movistar Cloud are hidden unless **Show untested providers** is on.
 
-### Filen
+## Filen
 
 Volumes are encrypted on this machine in Filen's own format, so they open in Filen's web, desktop and mobile apps. The format follows the official SDKs ([filen-sdk-ts](https://github.com/FilenCloudDienste/filen-sdk-ts), [filen-rs](https://github.com/FilenCloudDienste/filen-rs)):
 
@@ -32,7 +32,7 @@ Volumes are encrypted on this machine in Filen's own format, so they open in Fil
 - **File data:** written as version 2 (32-character file key, AES-256-GCM per 1 MiB chunk, `iv ‖ ciphertext ‖ tag`); versions 2 and 3 are read.
 - **Two-factor accounts:** store the credentials as JSON with an `api_key` (from `filen-cli`). The password is still required, because the master key is derived from it.
 
-### Drime Cloud and Movistar Cloud
+## Drime Cloud and Movistar Cloud
 
 Neither service publishes an API reference. Both stores follow Duplicati's backends ([DrimeCloud](https://github.com/duplicati/duplicati/tree/master/Duplicati/Library/Backend/DrimeCloud), [MovistarCloud](https://github.com/duplicati/duplicati/tree/master/Duplicati/Library/Backend/MovistarCloud)), which drive the same web APIs. Drime's quota comes from `user/space-usage`, as in [PyDrime](https://pypi.org/project/pydrime/).
 

@@ -209,7 +209,7 @@ scrape_configs:
     static_configs: [{ targets: ["backup.example.com:8200"] }]
 ```
 
-| Metric | Type | Labels | |
+| Metric | Type | Labels | Description |
 |---|---|---|---|
 | `ufop_build_info` | gauge | `version`, `os`, `arch` | Always 1 |
 | `ufop_uptime_seconds`, `ufop_shutting_down` | gauge | | Seconds since start; 1 while draining |
@@ -257,7 +257,7 @@ trace spans over **OTLP/HTTP with JSON** to `{endpoint}/v1/traces` (an endpoint 
 `/v1/traces` is used as is). Any OpenTelemetry Collector, Jaeger, Grafana Tempo, Honeycomb or another
 OTLP/HTTP receiver that accepts JSON works.
 
-| Option | Env | Default | |
+| Option | Env | Default | Description |
 |---|---|---|---|
 | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | off | Collector URL |
 | `--otlp-headers` | `OTEL_EXPORTER_OTLP_HEADERS` | none | `name=value,name2=value2` (values may be %-encoded), e.g. `x-honeycomb-team=…` or `authorization=Bearer%20…` |

@@ -18,7 +18,7 @@ Versions, notes and pins are in [backup-versions.md](backup-versions.md). Locks 
 
 **Restore → Restore as it was at** (Standard mode) takes a date and time in your local time zone. The app picks the newest **complete** version made at or before that time and shows which one ("Uses the version from 20 Oct 2026, 12:00"). If no complete version is that old, it says so. The restore then names the time instead of a version number, so a backup that finishes in the meantime does not change which version is used. Interrupted (partial) versions and checkpoints are skipped. In Advanced mode, *Allow interrupted (partial) versions* lets the time pick them too.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | Engine | `RestoreOptions.selector`: `{"type": "as_of", "time": "2026-10-01T09:00:00Z", "allow_partial": false}`, or `{"type": "latest"}`, `{"type": "oldest"}`, `{"type": "index", "index": 2}`, `{"type": "id", "id": "<timestamp or file-list name>"}`. When no selector is given, `version` (0 = newest) still applies. |
 | CLI | `ufop backup restore … --time "2026-10-01 09:00"` (local time), `--time 2026-10-01` (the end of that day), `--time 2026-10-01T09:00:00Z` (RFC 3339), `--version latest\|oldest\|N\|<timestamp>`, `--allow-partial` |
@@ -33,7 +33,7 @@ If two versions have exactly the same time, as can happen when several sources o
 
 Files are streamed into the archive block by block. The app keeps only a few unpacked volumes in memory, never a staging copy of the files. The archive is written as `<name>.partial` and renamed when it is complete. A failed or cancelled export leaves nothing behind. Each file's content is checked against its recorded hash. A file whose data is missing at the destination is left out and reported as an error.
 
-| | TAR / TAR.GZ | ZIP |
+| Feature | TAR / TAR.GZ | ZIP |
 |---|---|---|
 | Folders | yes | yes |
 | Files | yes | yes, ZIP64 when large |
@@ -67,7 +67,7 @@ Rules that keep it safe:
 - Symbolic links are deleted as links. Nothing is followed.
 - On Windows and macOS, names are compared without case, so a file whose name differs only in case is kept.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | Engine | `RestoreOptions.delete_extraneous = true` (needs `target`). A dry run lists the paths in `planned_deletions` (folders end in `/`). The report counts `files_deleted` and `folders_deleted`. |
 | Manager / REST | A mirror restore that is not a dry run is refused unless `overrides.confirm_delete` is `true`: `{"type": "restore", "options": {…, "delete_extraneous": true}, "overrides": {"confirm_delete": true}}` |
@@ -78,7 +78,7 @@ Rules that keep it safe:
 
 New backups record each entry's owner and group id on Linux and macOS (`uid`, `gid` in the entry metadata). On Windows the owner is the `O:` part of the recorded security descriptor, which is captured with *Back up ACLs*. Versions made before this have no owner and restore as before.
 
-| `restore_owner` | |
+| `restore_owner` | Description |
 |---|---|
 | `auto` (default) | Owners are restored when the restore runs with the privileges to do so: root or `CAP_CHOWN` on Linux, root on macOS, `SeRestorePrivilege` on Windows (an administrator; the app enables the privilege). Without them owners are skipped, and one warning says how many items were affected. |
 | `always` | As `auto`, but the restore refuses to start without the privileges. |
@@ -111,7 +111,7 @@ The file list in **Restore** has a **Preview** link next to each file (Standard)
 
 Only the volumes that hold the file are downloaded, through the volume cache. A range read downloads only the volumes holding that range.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | Engine | `access::BlockSource` (block → volume lookup, lazy download, bounded unpacked-volume memory) and `access::open_file(&source, &entry)`, which returns a `Read + Seek` reader with `read_range(offset, len)` |
 | IPC | `backup_read_file { id, path, version?, selector?, offset?, length?, source? }` returns base64 data (at most 10 MiB per call), with `size` and `truncated`. `backup_export_file { …, dest }` copies the file. `backup_preview_file` makes the temporary copy for the preview pane. |
@@ -127,7 +127,7 @@ Previews, drives, `cat` and repeated reads keep downloaded volumes in a local ca
 - Entries are written to a temporary file and renamed into place, so other threads and processes never see half an entry. Each repository (destination and prefix) has its own subfolder.
 - Full restores do not use the cache unless you turn it on (*Also use the cache for full restores*, `use_for_restore`, per restore `use_cache` or `--use-cache`). A large restore reads each volume once and would only push everything else out. Verification never reads from the cache, so it always checks the destination, but it keeps what it downloaded.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | App | **Settings → Volume cache**: usage and *Clear cache* (Standard). Folder, size limit (0 = off) and use for full restores (Advanced). |
 | IPC | `backup_cache_stats`, `backup_clear_cache`, `backup_get_cache_settings`, `backup_set_cache_settings { settings: {dir, max_bytes, use_for_restore} }` |
@@ -156,7 +156,7 @@ How it works:
 - The repository's shared lock is held while the drive is set up, not while it is open, so scheduled backups keep running. A compaction while a drive is open can make files of removed versions unreadable. Unmount and open the drive again.
 - The server code (`ufop_core::backup::davserve`) shares its WebDAV building blocks (`ufop_core::webdav`: ranges, `PROPFIND` XML, content types) with the server's `/dav` share.
 
-| Where | |
+| Where | Usage |
 |---|---|
 | IPC | `backup_open_drive { id, request: {version?, selector?, all_versions, source?, mount?, port?, idle_timeout_minutes?} }` returns `{id, url, username, password, mount_point, mounted_with, mount_error, …}`. `backup_close_drive { driveId }` and `backup_list_drives` |
 | CLI | `ufop backup mount --dest … [--version latest\|N] [--time …] [--all] [--bind 127.0.0.1] [--port 0]` serves until Ctrl-C and prints the address and password. Mount it with the commands above. |
