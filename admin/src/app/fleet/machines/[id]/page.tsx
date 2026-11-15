@@ -355,7 +355,7 @@ export default function MachineDetailPage({ params }: { params: Promise<{ id: st
                   <span>
                     {p.name} <span className="text-xs text-foreground-tertiary">v{p.version}</span>
                   </span>
-                  {p.applied === p.version ? <StatusBadge value="succeeded" /> : <span className="text-xs text-warning">{p.applied ? `applied v${p.applied}, update pending` : 'not applied yet'}</span>}
+                  {p.applied === p.version ? <StatusBadge value="succeeded" /> : <span className="text-xs text-warning-foreground">{p.applied ? `applied v${p.applied}, update pending` : 'not applied yet'}</span>}
                 </li>
               ))}
             </ul>

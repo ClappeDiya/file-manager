@@ -19,7 +19,7 @@ export function PasswordStrength({ password, email, name }: { password: string; 
       </div>
       <p className="text-xs text-foreground-secondary">{LABEL[c.score]}</p>
       {c.problems.map((p) => (
-        <p key={p} className="text-xs text-error">
+        <p key={p} className="text-xs text-error-foreground">
           {p}
         </p>
       ))}

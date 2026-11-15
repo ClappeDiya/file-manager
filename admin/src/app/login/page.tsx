@@ -116,7 +116,7 @@ function LoginForm() {
 
   const errorBox = error && (
     <div role="alert" className="rounded-md bg-error-bg border border-error/20 px-3 py-2">
-      <p className="text-sm text-error">{error}</p>
+      <p className="text-sm text-error-foreground">{error}</p>
     </div>
   );
 
@@ -189,7 +189,7 @@ function LoginForm() {
                     {t('login.passkey')}
                   </Button>
                 )}
-                <Link href="/reset-password" className="block text-center text-xs text-primary hover:underline">
+                <Link href="/reset-password" className="block text-center text-xs text-link hover:underline">
                   {t('login.forgot')}
                 </Link>
               </form>

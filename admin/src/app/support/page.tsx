@@ -26,7 +26,7 @@ export default function SupportPage() {
             {/* Statement Descriptor */}
             <div className="space-y-2">
               <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
-                <CreditCard size={16} className="text-primary" />
+                <CreditCard size={16} className="text-link" />
                 Statement Descriptor
               </h3>
               <p className="text-sm text-foreground-secondary">
@@ -42,7 +42,7 @@ export default function SupportPage() {
             {/* Payment Gateway */}
             <div className="space-y-2">
               <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
-                <ExternalLink size={16} className="text-primary" />
+                <ExternalLink size={16} className="text-link" />
                 Payment Gateway
               </h3>
               <p className="text-sm text-foreground-secondary">
@@ -57,7 +57,7 @@ export default function SupportPage() {
             {/* Affiliated Company */}
             <div className="space-y-2">
               <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
-                <HelpCircle size={16} className="text-primary" />
+                <HelpCircle size={16} className="text-link" />
                 Affiliated Company
               </h3>
               <p className="text-sm text-foreground-secondary">
@@ -73,7 +73,7 @@ export default function SupportPage() {
           <div className="mt-6 pt-6 border-t border-border">
             <div className="flex flex-wrap items-center gap-4">
               <div className="flex items-center gap-2 bg-background-tertiary rounded-lg px-4 py-2.5 border border-border">
-                <Lock size={16} className="text-success" />
+                <Lock size={16} className="text-success-foreground" />
                 <div className="flex flex-col">
                   <span className="text-xs font-semibold text-foreground">Payment data handling</span>
                   <span className="text-[10px] text-foreground-tertiary">Handled by your payment provider</span>
@@ -81,7 +81,7 @@ export default function SupportPage() {
               </div>
 
               <div className="flex items-center gap-2 bg-background-tertiary rounded-lg px-4 py-2.5 border border-border">
-                <Shield size={16} className="text-primary" />
+                <Shield size={16} className="text-link" />
                 <div className="flex flex-col">
                   <span className="text-xs font-semibold text-foreground">Processed by Stripe</span>
                   <span className="text-[10px] text-foreground-tertiary">Secure Payments</span>
@@ -89,7 +89,7 @@ export default function SupportPage() {
               </div>
 
               <div className="flex items-center gap-2 bg-background-tertiary rounded-lg px-4 py-2.5 border border-border">
-                <Shield size={16} className="text-warning" />
+                <Shield size={16} className="text-warning-foreground" />
                 <div className="flex flex-col">
                   <span className="text-xs font-semibold text-foreground">Card processing</span>
                   <span className="text-[10px] text-foreground-tertiary">Provider-managed payments</span>

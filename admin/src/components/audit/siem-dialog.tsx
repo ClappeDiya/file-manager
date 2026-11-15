@@ -104,7 +104,7 @@ export function SiemDialog({ open, onClose }: { open: boolean; onClose: () => vo
               {d.lastSuccessAt ? ` · last sent ${formatRelativeTime(d.lastSuccessAt)}` : ''}
             </p>
             {d.lastError && (
-              <p className="text-xs text-error">
+              <p className="text-xs text-error-foreground">
                 {d.lastError}
                 {d.nextAttemptAt ? ` · retrying ${formatRelativeTime(d.nextAttemptAt)}` : ''}
               </p>

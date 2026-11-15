@@ -135,7 +135,7 @@ export default function SsoSettingsPage() {
                 <div className="min-w-0">
                   <p className="font-semibold">
                     {p.name} <span className="text-xs font-normal text-foreground-tertiary">{p.kind.toUpperCase()}</span>
-                    {!p.enabled && <span className="ml-2 text-xs text-warning">disabled</span>}
+                    {!p.enabled && <span className="ml-2 text-xs text-warning-foreground">disabled</span>}
                   </p>
                   <p className="text-xs text-foreground-secondary">
                     Domains: {p.domains.join(', ') || 'any (no automatic account linking)'} · new accounts: {p.allowJit ? ROLE_LABELS[p.defaultRole] : 'invitation only'}
@@ -153,7 +153,7 @@ export default function SsoSettingsPage() {
                   {p.metadataUrl && (
                     <p className="text-xs text-foreground-tertiary">
                       SP metadata:{' '}
-                      <a className="break-all text-primary" href={p.metadataUrl} target="_blank" rel="noreferrer">
+                      <a className="break-all text-link" href={p.metadataUrl} target="_blank" rel="noreferrer">
                         {p.metadataUrl}
                       </a>
                     </p>

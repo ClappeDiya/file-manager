@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect } from 'react';
+import { usePathname } from 'next/navigation';
 import { useAuthStore } from '@/lib/stores/auth-store';
 import { useAdminStore } from '@/lib/stores/admin-store';
 import { Sidebar } from './sidebar';
@@ -18,6 +19,8 @@ interface AdminShellProps {
 
 export function AdminShell({ children }: AdminShellProps) {
   const { isAuthenticated, isValidating, validateSession } = useAuthStore();
+  const pathname = usePathname();
+  const publicPage = pathname === '/login' || pathname === '/reset-password' || pathname?.startsWith('/invite/');
   // Block rendering only for the first check; later refreshes (after sign-in,
   // switching organization) keep the page mounted.
   const [checkedOnce, setCheckedOnce] = React.useState(false);
@@ -58,7 +61,7 @@ export function AdminShell({ children }: AdminShellProps) {
     );
   }
 
-  if (!isAuthenticated) {
+  if (!isAuthenticated || publicPage) {
     return (
       <>
         {children}

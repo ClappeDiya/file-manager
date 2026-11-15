@@ -175,7 +175,7 @@ function BillingContent() {
               <ul className="mb-6 space-y-2">
                 {plan.features.map((f) => (
                   <li key={f} className="flex items-center gap-2 text-sm text-foreground-secondary">
-                    <Check size={14} className="shrink-0 text-success" />
+                    <Check size={14} className="shrink-0 text-success-foreground" />
                     {f}
                   </li>
                 ))}
@@ -225,12 +225,12 @@ function BillingContent() {
                   </span>
                   <span className="flex gap-2">
                     {i.url && (
-                      <a className="text-primary underline" href={i.url} target="_blank" rel="noopener noreferrer">
+                      <a className="text-link underline" href={i.url} target="_blank" rel="noopener noreferrer">
                         View
                       </a>
                     )}
                     {i.pdf && (
-                      <a className="text-primary underline" href={i.pdf} target="_blank" rel="noopener noreferrer">
+                      <a className="text-link underline" href={i.pdf} target="_blank" rel="noopener noreferrer">
                         PDF
                       </a>
                     )}

@@ -47,10 +47,10 @@ export default function AuditPage() {
 
   const severityIcon = (severity: AuditSeverity) => {
     switch (severity) {
-      case 'info': return <Info size={14} className="text-info" />;
-      case 'warning': return <AlertTriangle size={14} className="text-warning" />;
-      case 'error': return <AlertOctagon size={14} className="text-error" />;
-      case 'critical': return <AlertOctagon size={14} className="text-error" />;
+      case 'info': return <Info size={14} className="text-info-foreground" />;
+      case 'warning': return <AlertTriangle size={14} className="text-warning-foreground" />;
+      case 'error': return <AlertOctagon size={14} className="text-error-foreground" />;
+      case 'critical': return <AlertOctagon size={14} className="text-error-foreground" />;
     }
   };
 
@@ -132,7 +132,7 @@ export default function AuditPage() {
           <p className="text-sm text-info-foreground">{verificationResult}</p>
           <button
             onClick={() => setVerificationResult(null)}
-            className="text-xs text-info underline mt-1"
+            className="text-xs text-info-foreground underline mt-1"
           >
             Dismiss
           </button>

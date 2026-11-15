@@ -681,18 +681,22 @@ mod tests {
             let b = LocalBackend::new(d.path());
             let barrier = std::sync::Barrier::new(2);
             let wins = std::sync::atomic::AtomicUsize::new(0);
+            let attempts_finished = std::sync::Barrier::new(2);
             let held = Mutex::new(Vec::new());
             std::thread::scope(|s| {
                 for kind in [LockKind::Exclusive, LockKind::Exclusive] {
-                    let (b, barrier, wins, held) = (&b, &barrier, &wins, &held);
+                    let (b, barrier, wins, held, attempts_finished) = (&b, &barrier, &wins, &held, &attempts_finished);
                     s.spawn(move || {
                         barrier.wait();
-                        if let Ok(l) = RepoLock::acquire(b, "ufop", kind, "backup", &fast()) {
+                        let lock = RepoLock::acquire(b, "ufop", kind, "backup", &fast()).ok();
+                        if let Some(l) = &lock {
                             wins.fetch_add(1, Ordering::SeqCst);
-                            // Hold it until both tried.
                             held.lock().unwrap().push(l.info());
-                            std::thread::sleep(Duration::from_millis(150));
                         }
+                        // Keep the winner alive until both attempts finish. A fixed
+                        // sleep let a delayed contender acquire after its release.
+                        attempts_finished.wait();
+                        drop(lock);
                     });
                 }
             });

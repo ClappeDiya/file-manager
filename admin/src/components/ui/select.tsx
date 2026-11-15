@@ -44,7 +44,7 @@ export const Select = React.forwardRef<HTMLSelectElement, SelectProps>(
             </option>
           ))}
         </select>
-        {error && <p id={errorId} role="alert" className="text-xs text-error">{error}</p>}
+        {error && <p id={errorId} role="alert" className="text-xs text-error-foreground">{error}</p>}
       </div>
     );
   }

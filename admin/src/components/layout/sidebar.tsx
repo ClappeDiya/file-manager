@@ -218,7 +218,7 @@ export function Sidebar() {
                       className={cn(
                         baseClass,
                         isActive
-                          ? 'bg-primary/10 text-primary'
+                          ? 'bg-primary/10 text-link'
                           : 'text-sidebar-text hover:bg-background-tertiary hover:text-sidebar-text-active',
                       )}
                       title={tooltip}

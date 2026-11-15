@@ -119,7 +119,7 @@ export default function OrganizationsPage() {
                   <p className="flex flex-wrap items-center gap-2 font-medium text-foreground">
                     <Building2 size={14} aria-hidden="true" />
                     {o.name}
-                    {o.id === data?.currentOrgId && <span className="text-xs text-primary">current</span>}
+                    {o.id === data?.currentOrgId && <span className="text-xs text-link">current</span>}
                     {o.protected && <Lock size={12} aria-label="Protected" />}
                     {o.detached && <span className="inline-flex items-center gap-1 text-xs text-foreground-secondary"><Unlink size={12} aria-hidden="true" />detached</span>}
                     {o.status !== 'active' && <StatusBadge value={o.status} />}
@@ -157,7 +157,7 @@ export default function OrganizationsPage() {
                         </Button>
                       )}
                       {o.id !== 'org_default' && (
-                        <Button size="sm" variant="ghost" className="text-error" onClick={() => open('offboard', o)}>
+                        <Button size="sm" variant="ghost" className="text-error-foreground" onClick={() => open('offboard', o)}>
                           Offboard
                         </Button>
                       )}

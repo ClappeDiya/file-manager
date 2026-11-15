@@ -129,7 +129,7 @@ function AccountView() {
             </div>
           ) : mfa.data.enabled ? (
             <div className="space-y-3">
-              <p className="text-sm text-success">On · {mfa.data.recoveryCodesLeft} recovery code(s) left</p>
+              <p className="text-sm text-success-foreground">On · {mfa.data.recoveryCodesLeft} recovery code(s) left</p>
               <div className="flex flex-wrap items-end gap-2">
                 <Input label="Current code (to turn it off)" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} />
                 <Button variant="danger" onClick={() => void disable()} disabled={code.trim().length < 6}>

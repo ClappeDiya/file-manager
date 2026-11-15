@@ -15,6 +15,8 @@
   --color-primary: #2563eb;
   --color-primary-hover: #1d4ed8;
   --color-primary-active: #1e40af;
+  --color-link: #1d4ed8;
+  --color-link-hover: #1e40af;
   --color-primary-foreground: #ffffff;
 
   /* Accent */
@@ -52,6 +54,10 @@
   --color-error: #dc2626;
   --color-error-bg: #fef2f2;
   --color-error-foreground: #b91c1c;
+  /* Solid danger actions keep white text readable in every theme. */
+  --color-destructive: #b91c1c;
+  --color-destructive-hover: #991b1b;
+  --color-destructive-foreground: #ffffff;
   --color-info: #2563eb;
   --color-info-bg: #eff6ff;
   --color-info-foreground: #1d4ed8;
@@ -143,6 +149,8 @@
   --color-primary: #3b82f6;
   --color-primary-hover: #60a5fa;
   --color-primary-active: #93c5fd;
+  --color-link: #60a5fa;
+  --color-link-hover: #93c5fd;
   --color-primary-foreground: #0f172a;
 
   --color-accent: #a78bfa;
@@ -175,6 +183,10 @@
   --color-error: #ef4444;
   --color-error-bg: #450a0a;
   --color-error-foreground: #f87171;
+  /* Solid danger actions keep white text readable in every theme. */
+  --color-destructive: #b91c1c;
+  --color-destructive-hover: #991b1b;
+  --color-destructive-foreground: #ffffff;
   --color-info: #3b82f6;
   --color-info-bg: #172554;
   --color-info-foreground: #60a5fa;
@@ -206,6 +218,8 @@
   --color-primary: #1d4ed8;
   --color-primary-hover: #1e40af;
   --color-primary-active: #1e3a8a;
+  --color-link: #1e40af;
+  --color-link-hover: #1e3a8a;
   --color-primary-foreground: #ffffff;
 
   --color-accent: #7c3aed;
@@ -238,6 +252,10 @@
   --color-error: #b91c1c;
   --color-error-bg: #fee2e2;
   --color-error-foreground: #991b1b;
+  /* Solid danger actions keep white text readable in every theme. */
+  --color-destructive: #991b1b;
+  --color-destructive-hover: #7f1d1d;
+  --color-destructive-foreground: #ffffff;
   --color-info: #1d4ed8;
   --color-info-bg: #dbeafe;
   --color-info-foreground: #1e40af;
@@ -263,6 +281,8 @@
     --color-primary: #3b82f6;
     --color-primary-hover: #60a5fa;
     --color-primary-active: #93c5fd;
+    --color-link: #60a5fa;
+    --color-link-hover: #93c5fd;
     --color-primary-foreground: #0f172a;
 
     --color-accent: #a78bfa;
@@ -295,6 +315,10 @@
     --color-error: #ef4444;
     --color-error-bg: #450a0a;
     --color-error-foreground: #f87171;
+    /* Solid danger actions keep white text readable in every theme. */
+    --color-destructive: #b91c1c;
+    --color-destructive-hover: #991b1b;
+    --color-destructive-foreground: #ffffff;
     --color-info: #3b82f6;
     --color-info-bg: #172554;
     --color-info-foreground: #60a5fa;

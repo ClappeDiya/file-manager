@@ -273,7 +273,7 @@ export function ProvisioningPage({
         Credentials stay encrypted and are delivered only to granted desktops.
         Storage permissions come from the remote account. Offline desktops keep
         their last configuration until they reconnect.{" "}
-        <Link className="text-primary underline" href="/fleet/credentials">
+        <Link className="text-link underline" href="/fleet/credentials">
           Manage credentials
         </Link>
       </p>

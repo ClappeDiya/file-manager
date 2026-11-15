@@ -94,7 +94,7 @@ export function Header() {
               <p className="text-xs text-foreground-tertiary">{ROLE_LABELS[user.role]}</p>
             </div>
             <Link href="/account" aria-label={t('nav.account')} className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
-              <User size={16} className="text-primary" />
+              <User size={16} className="text-link" />
             </Link>
             <button
               onClick={logout}

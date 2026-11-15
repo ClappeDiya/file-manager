@@ -6,8 +6,8 @@ import { useToastStore, type ToastVariant } from '@/lib/stores/toast-store';
 import { cn } from '@/lib/utils/cn';
 
 const VARIANT_STYLES: Record<ToastVariant, { wrap: string; icon: React.ElementType }> = {
-  success: { wrap: 'border-success/40 bg-success/10 text-success', icon: CheckCircle },
-  error: { wrap: 'border-error/40 bg-error/10 text-error', icon: AlertCircle },
+  success: { wrap: 'border-success/40 bg-success/10 text-success-foreground', icon: CheckCircle },
+  error: { wrap: 'border-error/40 bg-error/10 text-error-foreground', icon: AlertCircle },
   info: { wrap: 'border-border bg-background-elevated text-foreground', icon: Info },
 };
 

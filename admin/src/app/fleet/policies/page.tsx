@@ -124,8 +124,8 @@ export default function FleetPoliciesPage() {
                 <div>
                   <h3 className="font-semibold text-foreground">
                     {p.name} <span className="text-xs font-normal text-foreground-tertiary">v{p.version}</span>
-                    {!p.enabled && <span className="ml-2 text-xs text-warning">disabled</span>}
-                    {p.inherit && <span className="ml-2 text-xs text-info">{p.locked ? 'locked for child organizations' : 'inherited by child organizations'}</span>}
+                    {!p.enabled && <span className="ml-2 text-xs text-warning-foreground">disabled</span>}
+                    {p.inherit && <span className="ml-2 text-xs text-info-foreground">{p.locked ? 'locked for child organizations' : 'inherited by child organizations'}</span>}
                   </h3>
                   {p.description && <p className="text-sm text-foreground-secondary">{p.description}</p>}
                   <div className="mt-2 flex flex-wrap items-center gap-1 text-xs text-foreground-secondary">
@@ -137,7 +137,7 @@ export default function FleetPoliciesPage() {
                   </p>
                 </div>
                 <div className="text-right">
-                  <p className={`text-sm font-medium ${p.upToDate === p.targeted ? 'text-success' : 'text-warning'}`}>
+                  <p className={`text-sm font-medium ${p.upToDate === p.targeted ? 'text-success-foreground' : 'text-warning-foreground'}`}>
                     {p.upToDate}/{p.targeted} up to date
                   </p>
                   {p.pending.length > 0 && <p className="text-xs text-foreground-tertiary">Pending: {p.pending.slice(0, 5).map((m) => m.name).join(', ')}{p.pending.length > 5 ? '…' : ''}</p>}
@@ -167,8 +167,8 @@ export default function FleetPoliciesPage() {
                 <div>
                   <h3 className="font-semibold text-foreground">
                     {i.policy.name} <span className="text-xs font-normal text-foreground-tertiary">v{i.policy.version} · from {i.sourceOrgName}</span>
-                    {i.policy.locked && <span className="ml-2 text-xs text-info">locked</span>}
-                    {i.optedOut && !i.policy.locked && <span className="ml-2 text-xs text-warning">{i.optedOutHere ? 'opted out' : 'opted out by a parent organization'}</span>}
+                    {i.policy.locked && <span className="ml-2 text-xs text-info-foreground">locked</span>}
+                    {i.optedOut && !i.policy.locked && <span className="ml-2 text-xs text-warning-foreground">{i.optedOutHere ? 'opted out' : 'opted out by a parent organization'}</span>}
                   </h3>
                   <div className="mt-2 flex flex-wrap items-center gap-1 text-xs text-foreground-secondary">
                     Targets: {i.policy.target.all ? 'every machine' : i.policy.target.tags.length ? i.policy.target.tags.map((t) => <TagChip key={t} tag={t} />) : 'specific machines'}

@@ -54,7 +54,7 @@ describe("AddressBar", () => {
     fireEvent.change(input, { target: { value: "/nope" } });
     expect(screen.queryByTestId("address-bar-error")).not.toBeInTheDocument();
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(await screen.findByTestId("address-bar-error")).toHaveTextContent("That folder does not exist");
+    await waitFor(() => expect(screen.getByTestId("address-bar-error")).toHaveTextContent("That folder does not exist"));
     expect(props.onNavigate).not.toHaveBeenCalled();
   });
 

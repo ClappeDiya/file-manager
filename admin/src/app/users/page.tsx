@@ -213,7 +213,7 @@ export default function UsersPage() {
       <div>
         <PageHeader title="Users & Roles" description="Manage user accounts, role assignments, and SSO configuration" />
         <div className="rounded-md bg-error-bg border border-error/20 px-4 py-3 mt-4">
-          <p className="text-sm text-error">Error: {error}</p>
+          <p className="text-sm text-error-foreground">Error: {error}</p>
         </div>
       </div>
     );
@@ -306,7 +306,7 @@ export default function UsersPage() {
                     <TableCell>
                       <div className="flex items-center gap-3">
                         <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
-                          <span className="text-xs font-medium text-primary">
+                          <span className="text-xs font-medium text-link">
                             {user.name.split(' ').map(n => n[0]).join('').toUpperCase()}
                           </span>
                         </div>
@@ -367,14 +367,14 @@ export default function UsersPage() {
                           className="p-1.5 rounded hover:bg-background-secondary"
                           title={user.expiresAt ? `Membership ends ${formatDate(user.expiresAt)}` : 'Set membership end'}
                         >
-                          <CalendarClock size={14} className={user.expiresAt ? 'text-warning' : 'text-foreground-secondary'} />
+                          <CalendarClock size={14} className={user.expiresAt ? 'text-warning-foreground' : 'text-foreground-secondary'} />
                         </button>
                         <button
                           onClick={() => setRemoving(user)}
                           className="p-1.5 rounded hover:bg-error-bg"
                           title="Remove"
                         >
-                          <Trash2 size={14} className="text-error" />
+                          <Trash2 size={14} className="text-error-foreground" />
                         </button>
                       </div>
                     </TableCell>
@@ -457,7 +457,7 @@ export default function UsersPage() {
                 <p className="text-sm text-foreground-secondary mb-4">
                   Identity providers, just-in-time accounts, group mapping and MFA requirements are configured per organization.
                 </p>
-                <Link href="/settings/sso" className="text-sm font-medium text-primary hover:underline">
+                <Link href="/settings/sso" className="text-sm font-medium text-link hover:underline">
                   Open SSO settings →
                 </Link>
               </CardContent>

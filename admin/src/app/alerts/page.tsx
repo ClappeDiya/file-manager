@@ -208,7 +208,7 @@ export default function AlertsPage() {
                         {a.machineId && (
                           <>
                             {' · '}
-                            <Link href={`/fleet/machines/${a.machineId}`} className="text-primary">
+                            <Link href={`/fleet/machines/${a.machineId}`} className="text-link">
                               machine
                             </Link>
                           </>
@@ -224,7 +224,7 @@ export default function AlertsPage() {
                     <TableCell className="hidden md:table-cell">{formatRelativeTime(a.createdAt)}</TableCell>
                     <TableCell className="hidden md:table-cell text-xs">
                       {a.notified.length === 0 ? '—' : `${a.notified.filter((n) => n.ok).length}/${a.notified.length} delivered`}
-                      {a.notified.some((n) => !n.ok) && <p className="text-error">{a.notified.filter((n) => !n.ok).slice(-1)[0]?.error}</p>}
+                      {a.notified.some((n) => !n.ok) && <p className="text-error-foreground">{a.notified.filter((n) => !n.ok).slice(-1)[0]?.error}</p>}
                     </TableCell>
                     <TableCell className="text-right">
                       {canWrite && !a.resolvedAt && (
@@ -272,7 +272,7 @@ export default function AlertsPage() {
                 <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                   <div>
                     <p className="font-medium">
-                      {r.name} {!r.enabled && <span className="text-xs text-warning">disabled</span>}
+                      {r.name} {!r.enabled && <span className="text-xs text-warning-foreground">disabled</span>}
                     </p>
                     <p className="text-xs text-foreground-secondary">
                       {KIND_LABEL[r.kind]} · {r.channelIds.length} channel(s) · re-notify after {r.cooldownMinutes} min
@@ -310,12 +310,12 @@ export default function AlertsPage() {
                 <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                   <div>
                     <p className="font-medium">
-                      {c.name} <span className="text-xs text-foreground-tertiary">{c.kind}</span> {!c.enabled && <span className="text-xs text-warning">disabled</span>}
+                      {c.name} <span className="text-xs text-foreground-tertiary">{c.kind}</span> {!c.enabled && <span className="text-xs text-warning-foreground">disabled</span>}
                     </p>
                     <p className="text-xs text-foreground-secondary">
                       {c.kind === 'email' ? `${(c.config as EmailConfig).host} → ${(c.config as EmailConfig).to?.join(', ')}` : c.kind === 'webhook' ? (c.config as WebhookConfig).url : c.kind === 'teams' ? 'Microsoft Teams workflow' : 'Slack incoming webhook'}
                     </p>
-                    {c.lastError ? <p className="text-xs text-error">Last error: {c.lastError}</p> : c.lastSentAt ? <p className="text-xs text-foreground-tertiary">Last sent {formatRelativeTime(c.lastSentAt)}</p> : null}
+                    {c.lastError ? <p className="text-xs text-error-foreground">Last error: {c.lastError}</p> : c.lastSentAt ? <p className="text-xs text-foreground-tertiary">Last sent {formatRelativeTime(c.lastSentAt)}</p> : null}
                   </div>
                   {canWrite && (
                     <div className="flex gap-2">

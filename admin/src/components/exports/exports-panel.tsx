@@ -52,7 +52,7 @@ export function ExportsPanel({ kind, formats, params = {} }: Props) {
               ) : e.status === 'succeeded' ? (
                 `${e.total} rows, ${formatBytes(e.size)} compressed`
               ) : e.status === 'failed' ? (
-                <span className="text-error">failed: {e.error}</span>
+                <span className="text-error-foreground">failed: {e.error}</span>
               ) : (
                 'expired'
               )}
