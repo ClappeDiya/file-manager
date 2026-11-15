@@ -30,7 +30,9 @@ if ssh "$TARGET" "test -f '$REMOTE/.env'"; then
 fi
 # Capture the rollback identity before replacing the compose/environment files.
 ssh "$TARGET" "set -eu; docker ps --filter label=com.docker.compose.project=filemanager-admin --format '{{.Image}}' > '$REMOTE/previous-image.txt'; if test -f '$REMOTE/compose.yml'; then cp '$REMOTE/compose.yml' '$REMOTE/compose.previous.yml'; fi; if test -f '$REMOTE/.env'; then cp '$REMOTE/.env' '$REMOTE/.env.previous'; chmod 600 '$REMOTE/.env.previous'; fi"
-rsync -a --chmod=F600 "$ENV_FILE" "${TARGET}:${REMOTE}/.env"
+chmod 600 "$ENV_FILE"
+rsync -a "$ENV_FILE" "${TARGET}:${REMOTE}/.env"
+ssh "$TARGET" "chmod 600 '$REMOTE/.env'"
 rsync -a docker-compose.admin.ghcr.yml "${TARGET}:${REMOTE}/compose.yml"
 GHCR_USER="$(gh api user --jq .login)"
 [[ "$GHCR_USER" =~ ^[A-Za-z0-9-]+$ ]] || { echo "Invalid registry user" >&2; exit 2; }

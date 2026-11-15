@@ -9,9 +9,9 @@ import { RemoteFolderPicker } from "@/components/remote-folder-picker";
 
 export function Section({ title, children, hint }: { title: string; children: ReactNode; hint?: string }) {
   return (
-    <section className="border border-zinc-200 dark:border-zinc-700 rounded-lg p-3 space-y-2">
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{title}</h3>
-      {hint && <p className="text-xs text-zinc-500 dark:text-zinc-400">{hint}</p>}
+    <section className="border border-[var(--color-border)] rounded-lg p-3 space-y-2">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--color-text-secondary)]">{title}</h3>
+      {hint && <p className="text-xs text-[color:var(--color-text-secondary)]">{hint}</p>}
       {children}
     </section>
   );
@@ -19,10 +19,10 @@ export function Section({ title, children, hint }: { title: string; children: Re
 
 export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return (
-    <label className="block text-xs text-zinc-700 dark:text-zinc-300 space-y-1">
+    <label className="block text-xs text-[color:var(--color-text)] space-y-1">
       <span className="font-medium">{label}</span>
       {children}
-      {hint && <span className="block text-[11px] text-zinc-500">{hint}</span>}
+      {hint && <span className="block text-[11px] text-[color:var(--color-text-secondary)]">{hint}</span>}
     </label>
   );
 }
@@ -30,10 +30,10 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 
 type Tone = "primary" | "neutral" | "danger" | "success";
 const toneCls: Record<Tone, string> = {
-  primary: "bg-blue-500 text-white hover:bg-blue-600",
-  success: "bg-green-500 text-white hover:bg-green-600",
-  danger: "bg-red-500 text-white hover:bg-red-600",
-  neutral: "bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700",
+  primary: "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:bg-[var(--color-primary-hover)]",
+  success: "bg-[var(--color-primary)] text-[color:var(--color-primary-foreground)] hover:bg-[var(--color-primary-hover)]",
+  danger: "bg-[var(--color-destructive)] text-[color:var(--color-destructive-foreground)] hover:bg-[var(--color-destructive-hover)]",
+  neutral: "bg-[var(--color-bg-secondary)] text-[color:var(--color-text)] hover:bg-[var(--color-hover-bg)]",
 };
 
 export function Btn({
@@ -56,7 +56,7 @@ export function Btn({
   return (
     <button
       type={type}
-      className={`px-2 py-1 text-xs rounded disabled:opacity-50 disabled:cursor-not-allowed ${toneCls[tone]}`}
+      className={`px-2 py-1 text-xs rounded focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus-ring)] disabled:opacity-50 disabled:cursor-not-allowed ${toneCls[tone]}`}
       onClick={onClick}
       disabled={disabled}
       title={title}
@@ -69,11 +69,11 @@ export function Btn({
 
 export function Check({ label, checked, onChange, hint }: { label: string; checked: boolean; onChange: (v: boolean) => void; hint?: string }) {
   return (
-    <label className="flex items-start gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+    <label className="flex items-start gap-2 text-xs text-[color:var(--color-text)]">
       <input type="checkbox" className="mt-0.5" checked={checked} onChange={(e) => onChange(e.target.checked)} />
       <span>
         {label}
-        {hint && <span className="block text-[11px] text-zinc-500">{hint}</span>}
+        {hint && <span className="block text-[11px] text-[color:var(--color-text-secondary)]">{hint}</span>}
       </span>
     </label>
   );
@@ -81,10 +81,10 @@ export function Check({ label, checked, onChange, hint }: { label: string; check
 
 export function Banner({ tone, children, onClose }: { tone: "error" | "info" | "success" | "warning"; children: ReactNode; onClose?: () => void }) {
   const cls = {
-    error: "text-red-700 bg-red-50 dark:bg-red-900/20 dark:text-red-300 border-red-200 dark:border-red-800",
-    info: "text-blue-700 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-300 border-blue-200 dark:border-blue-800",
-    success: "text-green-700 bg-green-50 dark:bg-green-900/20 dark:text-green-300 border-green-200 dark:border-green-800",
-    warning: "text-amber-700 bg-amber-50 dark:bg-amber-900/20 dark:text-amber-300 border-amber-200 dark:border-amber-800",
+    error: "text-[color:var(--color-error-foreground)] bg-[var(--color-error-bg)] border-[var(--color-border)]",
+    info: "text-[color:var(--color-info-foreground)] bg-[var(--color-info-bg)] border-[var(--color-border)]",
+    success: "text-[color:var(--color-success-foreground)] bg-[var(--color-success-bg)] border-[var(--color-border)]",
+    warning: "text-[color:var(--color-warning-foreground)] bg-[var(--color-warning-bg)] border-[var(--color-border)]",
   }[tone];
   return (
     <div className={`p-2 text-xs border rounded flex items-start justify-between gap-2 ${cls}`} role={tone === "error" ? "alert" : "status"}>
@@ -101,11 +101,11 @@ export function Banner({ tone, children, onClose }: { tone: "error" | "info" | "
 
 /** Text input with a "Browse…" folder picker button (native) and
  *  "Pick…" (the in-app picker, which can also create the folder). */
-export function PathInput({ value, onChange, placeholder, testId }: { value: string; onChange: (v: string) => void; placeholder?: string; testId?: string }) {
+export function PathInput({ value, onChange, placeholder, testId, ariaLabel }: { value: string; onChange: (v: string) => void; placeholder?: string; testId?: string; ariaLabel?: string }) {
   const [picking, setPicking] = useState(false);
   return (
     <div className="flex gap-1">
-      <input className={inputCls} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} data-testid={testId} />
+      <input className={inputCls} aria-label={ariaLabel} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} data-testid={testId} />
       <Btn
         onClick={async () => {
           const p = await pickFolder("Choose folder");

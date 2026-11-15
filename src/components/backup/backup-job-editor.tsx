@@ -216,6 +216,7 @@ export function BackupJobEditor({ initial, onDone }: { initial: BackupJob; onDon
                 rows={5}
                 value={job.sources.join("\n")}
                 onChange={(e) => patch({ sources: e.target.value.split("\n") })}
+                aria-label="Source folders and files"
                 data-testid="backup-sources"
               />
               <div className="flex gap-1">

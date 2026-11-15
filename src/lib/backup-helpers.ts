@@ -7,7 +7,7 @@ import { formatBytes } from "@/lib/format-bytes";
 import { formatBackupTime } from "@/lib/backup-time";
 
 export const inputCls =
-  "w-full px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-blue-500";
+  "w-full px-2 py-1 text-xs rounded border border-[var(--color-border)] bg-[var(--color-input-bg)] text-[color:var(--color-text)] placeholder:text-[color:var(--color-text-secondary)] focus:outline-2 focus:outline-[var(--color-focus-ring)]";
 
 /** Filter rules ↔ text (`+pattern` include, `-pattern` exclude; `[re]` regex, `{group}` group, `rclone:glob` rclone glob). */
 export function rulesToText(rules: FilterRule[]): string {
@@ -49,15 +49,15 @@ export function downloadText(name: string, text: string, mime = "application/jso
 export function statusColor(status: string | null | undefined): string {
   switch (status) {
     case "success":
-      return "text-green-600 dark:text-green-400";
+      return "text-[color:var(--color-success-foreground)]";
     case "warning":
-      return "text-amber-600 dark:text-amber-400";
+      return "text-[color:var(--color-warning-foreground)]";
     case "error":
-      return "text-red-600 dark:text-red-400";
+      return "text-[color:var(--color-error-foreground)]";
     case "cancelled":
-      return "text-zinc-500";
+      return "text-[color:var(--color-text-secondary)]";
     default:
-      return "text-zinc-400";
+      return "text-[color:var(--color-text-secondary)]";
   }
 }
 

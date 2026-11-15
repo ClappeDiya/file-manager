@@ -51,7 +51,7 @@ function TaskQueue() {
   const { status, cancel } = useBackupStore();
   if (status.tasks.length === 0) return null;
   return (
-    <div className="p-2 space-y-1 border-b border-zinc-200 dark:border-zinc-700" data-testid="backup-tasks">
+    <div className="p-2 space-y-1 border-b border-[var(--color-border)]" data-testid="backup-tasks">
       {status.tasks.map((t) => {
         const p = t.progress;
         const pct = p && p.files_total > 0 ? Math.round((p.files_processed / p.files_total) * 100) : null;
@@ -64,7 +64,7 @@ function TaskQueue() {
                 {t.state === "running" && t.bytes_per_sec > 0 && ` · ${formatBytes(t.bytes_per_sec)}/s`}
                 {t.state === "running" && t.eta_secs != null && ` · ${formatDuration(t.eta_secs)} left`}
               </span>
-              <button className="underline text-red-600 shrink-0" onClick={() => void cancel(t.task_id)}>
+              <button className="underline text-[color:var(--color-error-foreground)] shrink-0" onClick={() => void cancel(t.task_id)}>
                 Cancel
               </button>
             </div>
@@ -73,7 +73,7 @@ function TaskQueue() {
                 <div className="h-full bg-blue-500 transition-all" style={{ width: `${pct ?? 5}%` }} />
               </div>
             )}
-            {p?.current_path && <div className="truncate text-[11px] text-zinc-500 font-mono">{p.current_path}</div>}
+            {p?.current_path && <div className="truncate text-[11px] text-[color:var(--color-text-secondary)] font-mono">{p.current_path}</div>}
           </div>
         );
       })}
@@ -96,12 +96,12 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
     }
   };
   return (
-    <div className="border border-zinc-200 dark:border-zinc-700 rounded-lg p-3" data-testid="backup-job-card">
+    <div className="border border-[var(--color-border)] rounded-lg p-3" data-testid="backup-job-card">
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0">
-          <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">
+          <div className="text-sm font-medium text-[color:var(--color-text)] truncate">
             <span className={statusColor(job.stats.last_result)} title={job.stats.last_result ?? "never run"}>●</span> {job.name}
-            {job.encrypted && <span className="ml-1 text-[10px] text-zinc-500" title="Encrypted">🔒</span>}
+            {job.encrypted && <span className="ml-1 text-[10px] text-[color:var(--color-text-secondary)]" title="Encrypted">🔒</span>}
             {job.legal_hold && (
               <span className="ml-1 text-[10px] px-1 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" title={`Legal hold: ${job.legal_hold.matter}`} data-testid="legal-hold-badge">
                 Legal hold
@@ -113,11 +113,11 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
               </span>
             )}
           </div>
-          {job.description && <div className="text-xs text-zinc-500 truncate">{job.description}</div>}
+          {job.description && <div className="text-xs text-[color:var(--color-text-secondary)] truncate">{job.description}</div>}
         </div>
-        <span className="text-xs text-zinc-500 shrink-0">{job.stats.version_count} version(s)</span>
+        <span className="text-xs text-[color:var(--color-text-secondary)] shrink-0">{job.stats.version_count} version(s)</span>
       </div>
-      <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 grid grid-cols-1 sm:grid-cols-2 gap-x-3">
+      <div className="text-xs text-[color:var(--color-text-secondary)] mt-1 grid grid-cols-1 sm:grid-cols-2 gap-x-3">
         <div className="truncate" title={job.sources.join("\n")}>From: {job.sources.join(", ")}</div>
         <div className="truncate">To:{" "}
           {job.destination.type === "local"
@@ -132,8 +132,8 @@ function JobCard({ job, onView }: { job: BackupJob; onView: (v: View) => void })
         <div>Source: {formatBytes(job.stats.source_size)} · Stored: {formatBytes(job.stats.backend_size)}</div>
         <div className="truncate">{describeRetention(job.retention)}</div>
       </div>
-      {job.stats.last_error && <div className="text-xs text-red-600 mt-1 truncate" title={job.stats.last_error}>{job.stats.last_error}</div>}
-      {err && <div className="text-xs text-red-600 mt-1">{err}</div>}
+      {job.stats.last_error && <div className="text-xs text-[color:var(--color-error-foreground)] mt-1 truncate" title={job.stats.last_error}>{job.stats.last_error}</div>}
+      {err && <div className="text-xs text-[color:var(--color-error-foreground)] mt-1">{err}</div>}
       <div className="flex gap-1 mt-2 flex-wrap">
         <Btn tone="primary" disabled={busy || job.read_only} title={job.read_only ? "Read-only jobs never back up" : undefined} onClick={() => void start(false)} testId="backup-run-now">Run now</Btn>
         <Btn disabled={busy} onClick={() => void start(true)} title="Show what would be uploaded without changing anything">Dry run</Btn>
@@ -188,6 +188,7 @@ function ImportConfig({ onDone }: { onDone: (job: BackupJob | null) => void }) {
       <Section title="Import a backup configuration" hint="From an export file or a configuration read from a backup.">
         <input
           ref={fileRef}
+          aria-label="Backup configuration file"
           type="file"
           accept=".json,application/json"
           className="text-xs"
@@ -196,8 +197,8 @@ function ImportConfig({ onDone }: { onDone: (job: BackupJob | null) => void }) {
             if (f) setJson(await f.text());
           }}
         />
-        <textarea className={`${inputCls} font-mono`} rows={6} value={json} onChange={(e) => setJson(e.target.value)} placeholder="…or paste JSON" />
-        {encrypted && <input className={inputCls} type="password" placeholder="Export passphrase" value={pass} onChange={(e) => setPass(e.target.value)} />}
+        <textarea className={`${inputCls} font-mono`} rows={6} aria-label="Backup configuration JSON" value={json} onChange={(e) => setJson(e.target.value)} placeholder="…or paste JSON" />
+        {encrypted && <input className={inputCls} type="password" aria-label="Export passphrase" placeholder="Export passphrase" value={pass} onChange={(e) => setPass(e.target.value)} />}
         <label className="flex items-center gap-2 text-xs">
           <input type="checkbox" checked={stats} onChange={(e) => setStats(e.target.checked)} /> Import statistics (sizes, version count)
         </label>
@@ -234,7 +235,7 @@ function DesktopToggles() {
         <input type="checkbox" checked={s.start_at_login} onChange={(e) => void update({ ...s, start_at_login: e.target.checked })} />
         Start at login
       </label>
-      {err && <span className="text-red-600">{err}</span>}
+      {err && <span className="text-[color:var(--color-error-foreground)]">{err}</span>}
     </span>
   );
 }
@@ -274,17 +275,17 @@ export function BackupPanel() {
   ];
 
   return (
-    <div className="flex flex-col h-full bg-white dark:bg-zinc-900" data-testid="backup-panel">
-      <div className="flex items-center justify-between gap-2 p-3 border-b border-zinc-200 dark:border-zinc-700 flex-wrap">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+    <div className="flex flex-col h-full bg-[var(--color-bg)]" data-testid="backup-panel">
+      <div className="flex items-center justify-between gap-2 p-3 border-b border-[var(--color-border)] flex-wrap">
+        <h2 className="text-sm font-semibold text-[color:var(--color-text)]">
           Backups
-          {current && <span className="font-normal text-zinc-500"> / {current.name || "New backup"}</span>}
+          {current && <span className="font-normal text-[color:var(--color-text-secondary)]"> / {current.name || "New backup"}</span>}
         </h2>
         <div className="flex gap-1 flex-wrap">
           {tabs.map((t) => (
             <button
               key={t.kind}
-              className={`px-2 py-1 text-xs rounded ${view.kind === t.kind ? "bg-blue-500 text-white" : "bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300"}`}
+              className={`px-2 py-1 text-xs rounded ${view.kind === t.kind ? "bg-blue-500 text-white" : "bg-zinc-100 dark:bg-zinc-800 text-[color:var(--color-text)]"}`}
               onClick={() => setView({ kind: t.kind } as View)}
             >
               {t.label}
@@ -297,8 +298,8 @@ export function BackupPanel() {
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs border-b border-zinc-200 dark:border-zinc-700">
-        <span className={status.paused ? "text-amber-600" : "text-zinc-500"}>
+      <div className="flex items-center justify-between gap-2 px-3 py-1 text-xs border-b border-[var(--color-border)]">
+        <span className={status.paused ? "text-[color:var(--color-warning-foreground)]" : "text-[color:var(--color-text-secondary)]"}>
           {status.paused
             ? `Scheduler paused${status.paused_until ? ` until ${formatDate(status.paused_until)}` : ""}`
             : status.next_runs[0]
@@ -310,7 +311,7 @@ export function BackupPanel() {
           <Btn onClick={() => void resume()}>Resume</Btn>
         ) : (
           <select
-            className="text-xs rounded border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800"
+            className="text-xs rounded border border-[var(--color-border)] bg-[var(--color-input-bg)]"
             value=""
             onChange={(e) => {
               const v = e.target.value;
@@ -338,9 +339,9 @@ export function BackupPanel() {
       <div className="flex-1 overflow-y-auto">
         {view.kind === "jobs" && (
           <div className="p-2 space-y-2">
-            {loading && jobs.length === 0 && <div className="text-sm text-zinc-500 text-center py-6">Loading…</div>}
+            {loading && jobs.length === 0 && <div className="text-sm text-[color:var(--color-text-secondary)] text-center py-6">Loading…</div>}
             {!loading && jobs.length === 0 && (
-              <div className="text-center text-sm text-zinc-500 py-8 space-y-2">
+              <div className="text-center text-sm text-[color:var(--color-text-secondary)] py-8 space-y-2">
                 <p>No backups yet.</p>
                 <p className="text-xs">Versioned, deduplicated and encrypted backups to a folder, drive, NAS, SFTP, FTP, WebDAV or S3.</p>
                 <Btn tone="success" onClick={() => setView({ kind: "edit", job: newBackupJob() })}>Create your first backup</Btn>

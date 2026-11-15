@@ -49,7 +49,7 @@ function RestoreOptionsForm({ value, onChange, versionCount = 0 }: { value: Rest
       </div>
       {value.target !== null && (
         <>
-          <PathInput value={value.target} onChange={(t) => onChange({ ...value, target: t })} placeholder="/path/to/restore" testId="restore-target" />
+          <PathInput value={value.target} onChange={(t) => onChange({ ...value, target: t })} placeholder="/path/to/restore" ariaLabel="Restore folder" testId="restore-target" />
           <Check label="Keep the full original folder structure" checked={value.preserve_full_paths} onChange={(v) => onChange({ ...value, preserve_full_paths: v })} />
         </>
       )}
@@ -113,9 +113,9 @@ function ReportView({ report }: { report: RestoreReport }) {
       {report.planned.length > 0 && (report.planned_deletions ?? []).length > 0 && <div>Mirror: would delete {report.planned_deletions.length} item(s).</div>}
       {(report.owners_restored ?? 0) > 0 && <div>Restored the owner of {report.owners_restored} item(s).</div>}
       {(report.sparse_files ?? 0) > 0 && <div>{report.sparse_files} file(s) written with holes (sparse).</div>}
-      {report.stop_reason && <div className="text-red-600">{report.stop_reason}</div>}
+      {report.stop_reason && <div className="text-[color:var(--color-error-foreground)]">{report.stop_reason}</div>}
       {report.errors.slice(0, 20).map((e) => (
-        <div key={e} className="text-red-600">{e}</div>
+        <div key={e} className="text-[color:var(--color-error-foreground)]">{e}</div>
       ))}
       {report.warnings.slice(0, 10).map((w) => (
         <div key={w}>{w}</div>
@@ -135,7 +135,7 @@ function SourcePicker({ job, source, onChange }: { job: BackupJob; source: strin
   if (sources.length < 2) return null;
   return (
     <div className="flex gap-1 items-center text-xs" data-testid="backup-source-picker">
-      <span className="text-zinc-500">Versions of</span>
+      <span className="text-[color:var(--color-text-secondary)]">Versions of</span>
       <select className={`${inputCls} w-auto`} value={source ?? ""} onChange={(e) => onChange(e.target.value || null)} aria-label="Source">
         <option value="">This job</option>
         {sources
@@ -246,7 +246,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
 
   if (versions.length === 0) {
     return (
-      <div className="p-4 text-sm text-zinc-500 space-y-2" data-testid="backup-no-versions">
+      <div className="p-4 text-sm text-[color:var(--color-text-secondary)] space-y-2" data-testid="backup-no-versions">
         {picker}
         {error ? <Banner tone="error">{error}</Banner> : "This job has no versions yet. Run a backup first."}
         <AdvancedOnly>
@@ -266,7 +266,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
       {preview && <BackupFilePreview job={job} version={versionRef} source={source} path={preview} onClose={() => setPreview(null)} />}
       <Section title="Versions">
         {picker}
-        <select className={inputCls} value={version} onChange={(e) => pickVersion(Number(e.target.value))} data-testid="backup-version-select">
+        <select className={inputCls} value={version} onChange={(e) => pickVersion(Number(e.target.value))} aria-label="Backup version" data-testid="backup-version-select">
           {versions.map((v, i) => (
             <option key={v.id} value={i}>
               {i === 0 ? "Latest — " : ""}
@@ -317,13 +317,13 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
         {cmp && (
           <div className="text-xs space-y-1">
             <div>
-              {formatDate(cmp.base)} → {formatDate(cmp.compare)}: <span className="text-green-600">+{cmp.added.length}</span>{" "}
-              <span className="text-amber-600">~{cmp.modified.length}</span> <span className="text-red-600">−{cmp.deleted.length}</span>
+              {formatDate(cmp.base)} → {formatDate(cmp.compare)}: <span className="text-[color:var(--color-success-foreground)]">+{cmp.added.length}</span>{" "}
+              <span className="text-[color:var(--color-warning-foreground)]">~{cmp.modified.length}</span> <span className="text-[color:var(--color-error-foreground)]">−{cmp.deleted.length}</span>
             </div>
             <ul className="max-h-28 overflow-y-auto font-mono text-[11px]">
-              {cmp.added.map((p) => <li key={`a${p}`} className="text-green-600 truncate">+ {p}</li>)}
-              {cmp.modified.map((p) => <li key={`m${p}`} className="text-amber-600 truncate">~ {p}</li>)}
-              {cmp.deleted.map((p) => <li key={`d${p}`} className="text-red-600 truncate">− {p}</li>)}
+              {cmp.added.map((p) => <li key={`a${p}`} className="text-[color:var(--color-success-foreground)] truncate">+ {p}</li>)}
+              {cmp.modified.map((p) => <li key={`m${p}`} className="text-[color:var(--color-warning-foreground)] truncate">~ {p}</li>)}
+              {cmp.deleted.map((p) => <li key={`d${p}`} className="text-[color:var(--color-error-foreground)] truncate">− {p}</li>)}
             </ul>
           </div>
         )}
@@ -331,7 +331,7 @@ export function BackupRestoreView({ job }: { job: BackupJob }) {
 
       <Section title="Search all versions">
         <div className="flex gap-1">
-          <input className={inputCls} value={search} placeholder="name or wildcard, e.g. *.docx" onChange={(e) => setSearch(e.target.value)} />
+          <input className={inputCls} value={search} aria-label="Search all backup versions" placeholder="name or wildcard, e.g. *.docx" onChange={(e) => setSearch(e.target.value)} />
           <Btn disabled={!search || busy} onClick={() => run(async () => setHits(await tauriInvoke<FoundFile[]>("backup_search", { id: job.id, pattern: search, version: null, ...src })))}>
             Search
           </Btn>

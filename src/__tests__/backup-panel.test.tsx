@@ -148,7 +148,7 @@ describe("BackupPanel", () => {
     fireEvent.change(screen.getByTestId("backup-name"), { target: { value: "Photos" } });
     fireEvent.change(screen.getByTestId("backup-passphrase"), { target: { value: "correct horse battery staple" } });
     fireEvent.click(screen.getByText("Sources"));
-    fireEvent.change(screen.getByTestId("backup-sources"), { target: { value: "/home/me/Photos" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Source folders and files" }), { target: { value: "/home/me/Photos" } });
     fireEvent.click(screen.getByText("Destination"));
     fireEvent.change(screen.getByTestId("backup-dest-path"), { target: { value: "/mnt/usb" } });
     fireEvent.click(screen.getByTestId("backup-save"));
@@ -172,7 +172,7 @@ describe("BackupPanel", () => {
     fireEvent.change(screen.getByTestId("backup-name"), { target: { value: "Viewer" } });
     fireEvent.change(screen.getByTestId("backup-passphrase"), { target: { value: "correct horse battery staple" } });
     fireEvent.click(screen.getByText("Sources"));
-    fireEvent.change(screen.getByTestId("backup-sources"), { target: { value: "/home/me/Photos" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Source folders and files" }), { target: { value: "/home/me/Photos" } });
     fireEvent.click(screen.getByText("Destination"));
     fireEvent.change(screen.getByTestId("backup-dest-path"), { target: { value: "/mnt/usb" } });
     fireEvent.click(screen.getByLabelText(/Read-only \(restore and browse only\)/));
@@ -187,7 +187,7 @@ describe("BackupPanel", () => {
     fireEvent.click(screen.getByTestId("backup-open-restore"));
     const list = await screen.findByTestId("backup-file-list");
     await waitFor(() => expect(list.textContent).toContain("a.txt"));
-    fireEvent.change(screen.getByTestId("backup-version-select"), { target: { value: "1" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Backup version" }), { target: { value: "1" } });
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_list_files", expect.objectContaining({ id: "job-1", version: 1, prefix: null })));
     const box = await screen.findByRole("checkbox", { name: "Select /home/me/Docs/a.txt" });
     fireEvent.click(box);

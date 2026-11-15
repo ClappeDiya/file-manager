@@ -103,7 +103,7 @@ describe("photos source section", () => {
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("backup_photos_libraries", undefined));
     expect(screen.queryByTestId("photos-candidates")).toBeNull();
     expect(screen.getByTestId("photos-add")).toBeDisabled();
-    fireEvent.change(screen.getByTestId("photos-path"), { target: { value: "/Volumes/Ext/Old.photoslibrary" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Photos library path" }), { target: { value: "/Volumes/Ext/Old.photoslibrary" } });
     fireEvent.click(screen.getByTestId("photos-add"));
     expect(latest().sources).toEqual(["photos:///Volumes/Ext/Old.photoslibrary"]);
     expect(screen.getByLabelText(/Include Recently Deleted/)).not.toBeChecked();

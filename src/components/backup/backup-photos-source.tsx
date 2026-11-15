@@ -110,6 +110,7 @@ export function PhotosSourceSection({
           placeholder="/Users/me/Pictures/Photos Library.photoslibrary"
           value={path}
           onChange={(e) => setPath(e.target.value)}
+          aria-label="Photos library path"
           data-testid="photos-path"
         />
         <Btn onClick={choose}>Choose…</Btn>
