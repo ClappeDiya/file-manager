@@ -60,6 +60,7 @@ export function useFocusTrap<T extends HTMLElement>({
       branch = branch.parentElement;
     }
 
+    let addedTabIndex = false;
     const focusFirst = () => {
       if (!isTop()) return;
       const target =
@@ -67,8 +68,15 @@ export function useFocusTrap<T extends HTMLElement>({
         (initialFocusSelector
           ? container?.querySelector<HTMLElement>(initialFocusSelector)
           : null) ??
-        container?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
-      target?.focus();
+        container?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR) ??
+        container;
+      // A loading/empty modal still needs a stable focus target. Keep focus
+      // on its container when asynchronous content has no controls yet.
+      if (target === container && !container.hasAttribute("tabindex")) {
+        container.setAttribute("tabindex", "-1");
+        addedTabIndex = true;
+      }
+      target.focus();
     };
 
     // Defer one frame so portal-mounted children are present.
@@ -121,6 +129,7 @@ export function useFocusTrap<T extends HTMLElement>({
           inertOwners.delete(sibling);
         }
       }
+      if (addedTabIndex) container.removeAttribute("tabindex");
       if (previouslyFocused?.isConnected) previouslyFocused.focus();
     };
   }, [active, initialFocusRef, initialFocusSelector]);

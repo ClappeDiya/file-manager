@@ -20,7 +20,13 @@ export function WorkspaceDialog({
       {...props}
       role="dialog"
       aria-modal="true"
-      onClick={closeOnBackdrop ? onClose : undefined}
+      onClick={
+        closeOnBackdrop
+          ? (event) => {
+              if (event.target === event.currentTarget) onClose();
+            }
+          : undefined
+      }
     >
       {children}
     </div>

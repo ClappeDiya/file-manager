@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { WorkspaceDialog } from "./workspace-dialog";
 import {
   setPromptListener,
   setConfirmListener,
@@ -25,7 +26,9 @@ export function PromptDialogHost() {
   }, []);
 
   useEffect(() => {
-    if (req) requestAnimationFrame(() => inputRef.current?.select());
+    if (!req) return;
+    const id = requestAnimationFrame(() => inputRef.current?.select());
+    return () => cancelAnimationFrame(id);
   }, [req]);
 
   if (confirmReq) {
@@ -34,17 +37,21 @@ export function PromptDialogHost() {
       setConfirmReq(null);
     };
     return (
-      <div
+      <WorkspaceDialog
+        key="confirm"
         className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50"
-        role="dialog"
-        aria-modal="true"
+        aria-labelledby="confirm-dialog-message"
+        onClose={() => finish(false)}
+        closeOnBackdrop={false}
         onMouseDown={(e) => e.target === e.currentTarget && finish(false)}
       >
-        <div
-          className="w-[420px] rounded-lg border border-border bg-background p-4 shadow-xl"
-          onKeyDown={(e) => e.key === "Escape" && finish(false)}
-        >
-          <p className="mb-3 whitespace-pre-wrap text-sm">{confirmReq.message}</p>
+        <div className="w-[min(420px,90vw)] max-h-[90vh] overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] text-[color:var(--color-text)] p-4 shadow-xl">
+          <p
+            id="confirm-dialog-message"
+            className="mb-3 whitespace-pre-wrap break-words text-sm"
+          >
+            {confirmReq.message}
+          </p>
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -55,11 +62,10 @@ export function PromptDialogHost() {
             </button>
             <button
               type="button"
-              autoFocus
               className={
                 confirmReq.danger
-                  ? "rounded bg-red-600 px-3 py-1 text-sm text-white hover:bg-red-500"
-                  : "rounded bg-blue-600 px-3 py-1 text-sm text-white hover:bg-blue-500"
+                  ? "rounded bg-[var(--color-destructive)] px-3 py-1 text-sm text-[color:var(--color-destructive-foreground)] hover:bg-[var(--color-destructive-hover)]"
+                  : "rounded bg-[var(--color-primary)] px-3 py-1 text-sm text-[color:var(--color-primary-foreground)] hover:bg-[var(--color-primary-hover)]"
               }
               onClick={() => finish(true)}
             >
@@ -67,7 +73,7 @@ export function PromptDialogHost() {
             </button>
           </div>
         </div>
-      </div>
+      </WorkspaceDialog>
     );
   }
 
@@ -79,40 +85,52 @@ export function PromptDialogHost() {
   };
 
   return (
-    <div
+    <WorkspaceDialog
+      key="prompt"
       className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50"
-      role="dialog"
-      aria-modal="true"
+      aria-label="Enter a value"
+      aria-describedby="prompt-dialog-label"
+      onClose={() => finish(null)}
+      closeOnBackdrop={false}
       onMouseDown={(e) => e.target === e.currentTarget && finish(null)}
     >
       <form
-        className="w-[420px] rounded-lg border border-border bg-background p-4 shadow-xl"
+        className="w-[min(420px,90vw)] max-h-[90vh] overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] text-[color:var(--color-text)] p-4 shadow-xl"
         onSubmit={(e) => {
           e.preventDefault();
           finish(value);
         }}
-        onKeyDown={(e) => e.key === "Escape" && finish(null)}
       >
-        <label className="mb-2 block text-sm font-medium" htmlFor="prompt-dialog-input">
+        <label
+          id="prompt-dialog-label"
+          className="mb-2 block break-words text-sm font-medium"
+          htmlFor="prompt-dialog-input"
+        >
           {req.message}
         </label>
         <input
           id="prompt-dialog-input"
           ref={inputRef}
-          autoFocus
           value={value}
           onChange={(e) => setValue(e.target.value)}
           className="w-full rounded border border-border bg-transparent px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-blue-500"
         />
         <div className="mt-3 flex justify-end gap-2">
-          <button type="button" className="rounded px-3 py-1 text-sm hover:bg-muted" onClick={() => finish(null)}>
+          <button
+            type="button"
+            className="rounded px-3 py-1 text-sm hover:bg-muted"
+            onClick={() => finish(null)}
+          >
             Cancel
           </button>
-          <button type="submit" className="rounded bg-blue-600 px-3 py-1 text-sm text-white hover:bg-blue-500">
+          <button
+            type="submit"
+            className="rounded bg-[var(--color-primary)] px-3 py-1 text-sm text-[color:var(--color-primary-foreground)] hover:bg-[var(--color-primary-hover)]"
+          >
             OK
           </button>
         </div>
       </form>
-    </div>
+    </WorkspaceDialog>
   );
 }
